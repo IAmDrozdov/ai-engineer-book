@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="ru" data-chapter="05">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Демо компонентов — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../../assets/book.css">
+<script src="../../assets/manifest.js" defer></script>
+<script src="../../assets/vendor/highlight.min.js" defer></script>
+<script src="../../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../../assets/vendor/mermaid.min.js" defer></script>
+<script src="../../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 5</b> из 17, часть «Протоколы»</p>
+  <h1>MCP: Model Context Protocol</h1>
+  <p class="lead">Ты подключил к агенту четыре MCP-сервера, и до первого сообщения пользователя в контексте уже лежит 40 тысяч токенов описаний инструментов. Эта глава о том, почему так выходит и что с этим делают.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="handshake">
+<h2>Рукопожатие</h2>
+<aside class="margin"><p><b>JSON-RPC 2.0</b> — формат сообщений. Транспорт может быть любым, спецификация описывает два.</p></aside>
+<p>Клиент открывает соединение и первым делом отправляет <code>initialize</code>. В ответе сервер сообщает версию протокола и свои <dfn>capabilities</dfn> — что он вообще умеет<a class="cite" href="#src-1">1</a>. Дальше стороны разговаривают только о том, что обе заявили. Это <mark>единственное место</mark>, где согласуется версия.</p>
+<figure class="fig wide" id="fig-handshake">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant H as Хост (Claude Code)
+  participant C as MCP-клиент
+  participant S as MCP-сервер
+  H->>C: запускает сервер
+  C->>S: initialize {protocolVersion, capabilities}
+  S-->>C: result {protocolVersion, capabilities, serverInfo}
+  C-)S: notifications/initialized
+  Note over C,S: дальше — обычная работа
+  C->>S: tools/list
+  S-->>C: список инструментов с JSON Schema
+  H->>C: модель просит вызвать tool
+  C->>S: tools/call {name, arguments}
+  S-->>C: content[] или isError
+</script>
+<figcaption>Жизненный цикл соединения: версия и возможности согласуются один раз, в начале.</figcaption>
+</figure>
+<script type="text/plain" class="code" data-lang="json" data-title="Запрос initialize" data-hl="5,6-8">
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2025-11-25",
+    "capabilities": { "elicitation": {} },
+    "clientInfo": { "name": "demo", "version": "0.1.0" }
+  }
+}
+</script>
+<div class="note key"><p>Сервер не знает о модели ничего. Он отвечает клиенту, а что из ответа попадёт в контекст, решает хост.</p></div>
+<div class="note warn"><p>Описания инструментов едут в контекст целиком, при каждом запросе. Сервер с 90 тулами стоит десятки тысяч токенов ещё до первого вопроса.</p></div>
+<div class="note field"><blockquote>We removed three MCP servers and the agent got noticeably better at picking the right tool.<footer>— пользователь HN, <a href="https://news.ycombinator.com/">тред от июля 2026</a></footer></blockquote><p>Таких отчётов много, и цифры в них похожи.</p></div>
+<div class="note practice"><p>Раз в месяц открывай <code>/context</code> и смотри, сколько занимают MCP-тулы.</p></div>
+<div class="note debate"><p>Нужен ли MCP вообще, если есть CLI и skills — вопрос открытый.</p></div>
+<details class="deep"><summary>как устроен Streamable HTTP</summary><p>Один эндпоинт, POST для запросов, опциональный SSE для ответа.</p></details>
+</section>
+
+<section id="flow">
+<h2>Поток и схемы</h2>
+<figure class="fig wide" id="fig-flow">
+<script type="text/x-mermaid">
+flowchart LR
+  U[Пользователь] --> H[Хост]
+  H --> M{{Модель}}
+  M -- tool_use --> H
+  H --> C1[Клиент A]:::accent
+  H --> C2[Клиент B]
+  C1 --> S1[(Сервер GitHub)]:::ok
+  C2 --> S2[(Сервер Postgres)]:::warn
+  S2 -.-> X[Недоверенные данные]:::mute
+</script>
+<figcaption>Один хост, по клиенту на сервер.</figcaption>
+</figure>
+<figure class="fig" id="fig-state">
+<script type="text/x-mermaid">
+stateDiagram-v2
+  [*] --> submitted
+  submitted --> working
+  working --> input_required: нужен ввод
+  input_required --> working
+  working --> completed
+  working --> failed
+  completed --> [*]
+  failed --> [*]
+</script>
+<figcaption>Состояния задачи.</figcaption>
+</figure>
+<figure class="fig wide" id="fig-svg">
+<svg class="diagram" viewBox="0 0 760 220" role="img" aria-label="Окно контекста">
+  <rect class="box--soft" x="20" y="40" width="150" height="70" rx="6"/>
+  <text class="t-title" x="95" y="70" text-anchor="middle">Системный промпт</text>
+  <text class="t-sub" x="95" y="90" text-anchor="middle">3–12 тыс. токенов</text>
+  <rect class="box--accent" x="210" y="40" width="150" height="70" rx="6"/>
+  <text class="t-title" x="285" y="70" text-anchor="middle">Описания тулов</text>
+  <text class="t-sub" x="285" y="90" text-anchor="middle">до 60 тыс.</text>
+  <rect class="box" x="400" y="40" width="150" height="70" rx="6"/>
+  <text class="t-title" x="475" y="70" text-anchor="middle">История</text>
+  <rect class="box--warn" x="590" y="40" width="150" height="70" rx="6"/>
+  <text class="t-title" x="665" y="70" text-anchor="middle">Результаты тулов</text>
+  <path class="arrow" d="M170,75 L208,75"/>
+  <path class="arrow arrow--pen" d="M360,75 L398,75"/>
+  <path class="arrow arrow--red arrow--dash" d="M550,75 L588,75"/>
+  <rect class="box--ghost" x="20" y="130" width="340" height="50" rx="6"/>
+  <text class="t-mono t-mute" x="36" y="160">этот префикс кешируется</text>
+</svg>
+<figcaption>Рукописная SVG-схема с классами книги.</figcaption>
+</figure>
+<figure class="fig" id="fig-pipe">
+<ol class="pipeline">
+  <li><b>Парсинг</b><span>Docling, VLM-OCR</span></li>
+  <li><b>Чанкинг</b><span>по структуре</span></li>
+  <li data-tone="accent"><b>Эмбеддинг</b><span>+ BM25</span></li>
+  <li><b>Поиск</b><span>RRF</span></li>
+  <li data-tone="ok"><b>Реранк</b><span>топ-5</span></li>
+</ol>
+<figcaption>Конвейер на HTML: текст переносится сам.</figcaption>
+</figure>
+<figure class="fig" id="fig-layers">
+<div class="layers">
+  <div class="layer" data-tone="soft"><b>Хост</b><span>Приложение с моделью: Claude Code, Cursor, ChatGPT</span></div>
+  <div class="layer"><b>Клиент</b><span>Держит одно соединение с одним сервером</span></div>
+  <div class="layer" data-tone="accent"><b>Сервер</b><span>Отдаёт инструменты, ресурсы и промпты</span></div>
+  <div class="layer" data-tone="mute"><b>Внешняя система</b><span>API, база, файловая система</span></div>
+</div>
+<figcaption>Слои.</figcaption>
+</figure>
+<figure class="fig" id="fig-versus">
+<div class="versus">
+  <div data-tone="warn"><h4>stdio</h4><ul><li>Локальный процесс</li><li>Секреты в env</li></ul></div>
+  <div data-tone="ok"><h4>Streamable HTTP</h4><ul><li>Удалённый сервер</li><li>OAuth 2.1</li></ul></div>
+</div>
+<figcaption>Сравнение двух вариантов.</figcaption>
+</figure>
+</section>
+
+<section id="numbers">
+<h2>Числа</h2>
+<div class="stats">
+  <div class="stat"><b>55 тыс.</b><span>токенов занимают описания тулов пяти серверов</span></div>
+  <div class="stat"><b>85%</b><span>экономии даёт отложенная загрузка</span></div>
+  <div class="stat"><b>4</b><span>ревизии спецификации за два года</span></div>
+</div>
+<figure class="fig" id="fig-hbar">
+<script type="application/json" class="chart">
+{"type":"hbar","title":"Токены на описания инструментов","unit":"токенов","emphasis":["GitHub"],"rows":[["GitHub",26000,"35 тулов"],["Slack",21000,"11 тулов"],["Sentry",3000],["Grafana",3000],["Splunk",2000]],"note":"Данные для демо."}
+</script>
+<figcaption>Горизонтальные столбцы с акцентом.</figcaption>
+</figure>
+<figure class="fig" id="fig-hbar2">
+<script type="application/json" class="chart">
+{"type":"hbar","unit":"%","categories":["Opus 4","Opus 4.5"],"series":[{"name":"Без tool search","values":[49,79.5]},{"name":"С tool search","values":[74,88.1]}]}
+</script>
+<figcaption>Сгруппированные столбцы.</figcaption>
+</figure>
+<figure class="fig" id="fig-stack">
+<script type="application/json" class="chart">
+{"type":"stack","unit":"тыс.","normalize":true,"categories":["Сессия Claude Code, 200K"],"series":[{"name":"Системный промпт","values":[3]},{"name":"Тулы","values":[17]},{"name":"MCP","values":[40]},{"name":"Память","values":[5]},{"name":"Сообщения","values":[60]},{"name":"Свободно","values":[75],"tone":"muted"}]}
+</script>
+<figcaption>Состав окна контекста.</figcaption>
+</figure>
+<figure class="fig" id="fig-line">
+<script type="application/json" class="chart">
+{"type":"line","title":"Точность при росте контекста","unit":"%","x":["1K","10K","50K","100K","200K","500K","1M"],"series":[{"name":"Модель A","values":[98,97,94,90,84,76,70]},{"name":"Модель B","values":[97,95,90,83,74,null,null]},{"name":"Модель C","values":[95,94,93,91,88,82,79]}]}
+</script>
+<figcaption>Линии с перекрестием.</figcaption>
+</figure>
+<table>
+<thead><tr><th>Ревизия</th><th>Что добавили</th><th class="num">Тулов</th></tr></thead>
+<tbody>
+<tr><th>2025-03-26</th><td>Streamable HTTP, OAuth 2.1</td><td class="num">12</td></tr>
+<tr><th>2025-06-18</th><td>Elicitation, structured output <span class="yes">да</span> <span class="no">нет</span></td><td class="num">14</td></tr>
+</tbody>
+</table>
+<ol class="timeline">
+  <li class="is-major"><time>25 ноября 2024</time><p>Anthropic публикует MCP.</p></li>
+  <li><time>26 марта 2025</time><p>Streamable HTTP заменяет HTTP+SSE.</p></li>
+</ol>
+<ol class="steps">
+  <li><b>Поставь инспектор.</b> <code>npx @modelcontextprotocol/inspector</code></li>
+  <li><b>Подключись к серверу.</b> Проверь список тулов.</li>
+</ol>
+<div class="tabs">
+  <section data-tab="Python">
+  <script type="text/plain" class="code" data-lang="python" data-title="server.py">
+  from mcp.server.fastmcp import FastMCP
+
+  mcp = FastMCP("demo")
+
+  @mcp.tool()
+  def add(a: int, b: int) -> int:
+      """Сложить два числа. Пример тега: <instructions>"""
+      return a + b
+  </script>
+  </section>
+  <section data-tab="Запрос">
+  <script type="text/plain" class="code" data-lang="http">
+  POST /mcp HTTP/1.1
+  Content-Type: application/json
+  Accept: application/json, text/event-stream
+  </script>
+  </section>
+</div>
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>Кто решает, какая версия протокола будет использоваться?</summary><p>Клиент предлагает, сервер отвечает своей; если клиент её не поддерживает — отключается.</p></details>
+<details><summary>Почему много тулов — это дорого?</summary><p>Их описания попадают в каждый запрос.</p></details>
+</section>
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу по памяти нарисовать рукопожатие MCP</li>
+  <li>Поднимал сервер на FastMCP и отлаживал его инспектором</li>
+</ul>
+</section>
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://modelcontextprotocol.io/specification/2025-11-25">Model Context Protocol Specification, revision 2025-11-25</a>. Agentic AI Foundation, ноябрь 2025.</li>
+</ol>
+</section>
+</main>
+</body>
+</html>

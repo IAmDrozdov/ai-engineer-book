@@ -1,0 +1,985 @@
+<!doctype html>
+<html lang="ru" data-chapter="03">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Проектирование инструментов агента — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 3</b> из 17, часть «Основа»</p>
+  <h1>Проектирование инструментов агента</h1>
+  <p class="lead">Два MCP-сервера для одного и того же списка дел, одна модель, одни и те же 40 запросов, у обоих пройдено 90% тестов. Один из них потратил в пять раз больше входных токенов. Вся разница в том, как написаны инструменты: сколько их, что они возвращают и какой следующий шаг навязывают модели.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="two-servers">
+<h2>Куда ушли два с половиной миллиона токенов</h2>
+<p>В июне 2026 года пользователь Hacker News под ником JohnnyZhang483 выложил сравнение двух MCP-серверов для одного приложения списка дел<a class="cite" href="#src-1">1</a>. Возможности у них одинаковые. Первый, MCP-A, он написал сам. Второй, MCP-B, позже выпустил разработчик приложения. Оба ходили в один и тот же бэкенд. Автор прогнал через каждый 40 типичных запросов с одной моделью, одним системным промптом и одним агентным фреймворком, а аккаунт сбрасывал после каждого теста.</p>
+<p>Оба сервера прошли 36 тестов из 40. На это MCP-A потратил 637 тыс. входных токенов, а MCP-B — 3,17 млн.</p>
+<figure class="fig" id="fig-mcp-ab">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Во сколько раз MCP-B расходует больше, чем MCP-A", "unit": "×", "decimals": 2, "emphasis": ["Входные токены"],
+ "rows": [["Входные токены", 4.98, "3 174 329 против 637 244"], ["Выходные токены", 1.34, "23 238 против 17 301"], ["Шаги агента", 1.29, "157 против 122"], ["Время", 1.13, "676 с против 597 с"], ["Пройдено тестов", 1.00, "36 из 40 у обоих"], ["Длина описаний", 0.32, "3 682 против 11 464"]],
+ "note": "40 запросов, одна модель и один фреймворк. Замер JohnnyZhang483, Hacker News, 5 июня 2026."}
+</script>
+<figcaption>Одинаковое качество при пятикратной разнице во входных токенах. Нижняя строка неожиданная: у экономного сервера описания инструментов втрое длиннее.</figcaption>
+</figure>
+<p>Автор разобрал логи и нашёл три причины. Первая — поиск. Задачу в списке находил тул <code>search</code>, и у MCP-B он возвращал вот такой объект:</p>
+<div class="tabs">
+  <section data-tab="MCP-B: search">
+  <script type="text/plain" class="code" data-lang="json" data-title="Ответ поиска MCP-B">
+{
+  "id": "6a1916b48f08cb3a4c857ed0",
+  "title": "buy some groceries",
+  "url": "https://todo.example.com/tasks/6a1916b48f08cb3a4c857ed0"
+}
+  </script>
+  </section>
+  <section data-tab="MCP-A: query_tasks">
+  <script type="text/plain" class="code" data-lang="text" data-title="Ответ поиска MCP-A" data-hl="4">
+Task 1:
+ID: 6a19143e8f084a8c8101612f
+Title: buy some groceries
+Project ID: 6a1914378f084a8c810160a9
+Start Date: 2025-07-19 10:00:00
+Priority: Medium
+Status: Active
+  </script>
+  </section>
+</div>
+<p>Всем остальным операциям над задачей нужен <code>project_id</code>, а поиск MCP-B его не отдаёт. Поэтому после каждого поиска агент вызывал ещё и <code>get_task_by_id</code>, и на 40 задачах набежало 35 лишних итераций цикла. Вторая причина — сырые ответы API. Тул <code>create_task</code> у MCP-B возвращал объект прямо из бэкенда, с полями <code>createdTime</code>, <code>modifiedTime</code> и <code>focusSummaries: null</code>. Автор пишет об этом так: «These 600+ characters mean nothing to the Agent's task, but are still dumped into the Agent's context». Третья причина — количество: у MCP-B 47 инструментов, у MCP-A 14, и возможности у них одинаковые.</p>
+<p>Самая интересная строка графика — нижняя. Описания инструментов у MCP-A суммарно в три раза длиннее, 11 464 символа против 3 682. Описания лежат в каждом запросе один раз, а результаты вызовов копятся в истории и уходят в модель снова на каждом следующем шаге цикла. Поэтому лишнее поле в ответе обходится дороже лишнего предложения в описании. Как вычищать отработавшие результаты из истории, разобрано в <a href="../02-context-engineering/index.html">главе 2</a>.</p>
+<p>Замер — скорее иллюстрация, чем бенчмарк. Один автор, одна неназванная модель, 40 запросов, и MCP-A написан самим автором, который заодно продвигает свой инструмент для таких сравнений, <code>mcp-eval</code>. Но причины, которые он нашёл, повторяются во всех источниках этой главы, от документации Anthropic до академических обзоров MCP-серверов.</p>
+
+<h3>Что модель получает на самом деле</h3>
+<p>Модель не видит твой код. Когда ты передаёшь в Claude API массив <code>tools</code>, API собирает из него отдельный системный промпт по такому шаблону<a class="cite" href="#src-2">2</a>:</p>
+<script type="text/plain" class="code" data-lang="prompt" data-title="Шаблон системного промпта для инструментов, Claude API" data-hl="5,6">
+In this environment you have access to a set of tools you can use to answer the user's question.
+{{ FORMATTING INSTRUCTIONS }}
+String and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.
+Here are the functions available in JSONSchema format:
+{{ TOOL DEFINITIONS IN JSON SCHEMA }}
+{{ USER SYSTEM PROMPT }}
+{{ TOOL CONFIGURATION }}
+</script>
+<p>Определения инструментов стоят раньше твоего собственного системного промпта. Сама обёртка тоже стоит денег: на Claude Opus 5.5 и Sonnet 5.5 при <code>tool_choice</code> равном <code>auto</code> или <code>none</code> она добавляет 286 токенов, на Opus 4.8 — 290, на Opus 4.7 — 675<a class="cite" href="#src-3">3</a>. Дальше идут имена, описания и JSON-схемы всех тулов, по полной на каждый запрос.</p>
+<p>Для модели инструмент складывается из трёх кусков текста. Определение лежит в начале каждого запроса. Результаты вызовов копятся в истории. Ошибки приходят туда же, в виде обычного результата. Реализация, которая стоит за этим текстом, для модели не существует, и все три куска приходится проектировать с той же тщательностью, что и промпт.</p>
+<aside class="margin"><p><b>ACI</b>, agent-computer interface — интерфейс между агентом и инструментами, по аналогии с HCI.</p></aside>
+<p>Anthropic сформулировала это в декабре 2024 года, в приложении «Prompt engineering your tools» к статье «Building effective agents»: в интерфейс для агента, <dfn>ACI</dfn>, стоит вкладывать столько же сил, сколько вкладывают в интерфейс для человека<a class="cite" href="#src-4">4</a>. Там же есть признание, которое удивляет при первом чтении: «While building our agent for SWE-bench, we actually spent more time optimizing our tools than the overall prompt». Через девять месяцев в статье «Writing effective tools for agents» та же команда описала тул как контракт нового типа: «a contract between deterministic systems and non-deterministic agents»<a class="cite" href="#src-5">5</a>.</p>
+<p>Разница с обычным API в том, кто по нему ходит. Программист читает документацию один раз. Агент перечитывает её на каждом шаге, платит за неё токенами, а сломавшись, читает твоё сообщение об ошибке как инструкцию. Поэтому правила этой главы одинаково относятся к Python-функции в <code>tools</code>, к MCP-серверу и к CLI-утилите, которую агент вызывает через bash.</p>
+<p>Как <code>tool_use</code> и <code>tool_result</code> ходят по проводу и как устроен цикл агента, разобрано в <a href="../01-llm-api-agent-loop/index.html">главе 1</a>. Протокол MCP целиком — в <a href="../05-mcp/index.html">главе 5</a>. Здесь речь о том, что писать внутри, независимо от транспорта.</p>
+</section>
+
+<section id="workflow-tools">
+<h2>Инструмент под задачу, а не под эндпоинт</h2>
+<p>В 2025 году группа исследователей разобрала 116 официальных MCP-серверов, то есть выпущенных самими владельцами сервисов<a class="cite" href="#src-6">6</a>. У 88,6% под капотом полностью или частично REST API. 92% реализуют инструменты как голые обёртки над API: один эндпоинт — один тул. При этом медианный сервер открывает агенту только 19% операций, которые есть в API. Получается сразу две беды. Инструментов много, и они мелкие. А нужной операции среди них может не оказаться вовсе.</p>
+<p>Обёртка над эндпоинтом кажется честным решением, потому что так пишут SDK для людей. Но у агента другие возможности, Anthropic называет их affordances<a class="cite" href="#src-5">5</a>. Программа прочитает адресную книгу из тысячи записей в память за миллисекунды и найдёт нужную. Агент читает ту же тысячу записей токен за токеном, и все они остаются в его контексте. Поэтому вместо <code>list_contacts</code> Anthropic советует делать <code>search_contacts</code> или сразу <code>message_contact</code>.</p>
+<p>Хуже всего обёртки ведут себя на задачах из нескольких шагов. Чтобы назначить встречу через три тула-обёртки, модель должна по очереди вызвать каждый, прочитать каждый ответ и сама склеить данные:</p>
+<figure class="fig wide" id="fig-roundtrips">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant M as Модель
+  participant H as Харнесс
+  participant A as API календаря
+  Note over M,A: три обёртки над эндпоинтами
+  M->>H: list_users()
+  H->>A: GET /users
+  H-->>M: все пользователи в контекст
+  M->>H: list_events(user_ids)
+  H->>A: GET /events
+  H-->>M: все события недели в контекст
+  M->>H: create_event(...)
+  H->>A: POST /events
+  H-->>M: сырой JSON события
+  Note over M,A: один инструмент под задачу
+  M->>H: schedule_event(attendees, week)
+  H->>A: три запроса к API внутри тула
+  H-->>M: встреча во вторник, id события
+</script>
+<figcaption>Одна и та же встреча двумя способами. Сверху каждый промежуточный ответ проходит через контекст модели и остаётся в истории, снизу склейка идёт в коде тула, а модель получает одну строку результата.</figcaption>
+</figure>
+<p>В статье «Writing effective tools for agents» три таких замены приведены прямо<a class="cite" href="#src-5">5</a>. Вместо <code>list_users</code>, <code>list_events</code> и <code>create_event</code> — тул <code>schedule_event</code>, который сам находит свободное время и ставит встречу. Вместо <code>read_logs</code> — <code>search_logs</code>, который возвращает только подходящие строки и немного контекста вокруг. Вместо <code>get_customer_by_id</code>, <code>list_transactions</code> и <code>list_notes</code> — <code>get_customer_context</code>, который собирает всё свежее о клиенте за один вызов. OpenAI в своём руководстве советует то же другими словами: функции, которые всегда вызываются подряд, лучше объединить в одну<a class="cite" href="#src-7">7</a>.</p>
+<p>Как найти, что объединять, подсказывают логи. Anthropic советует считать вызовы на прогонах: повторяющиеся цепочки показывают, какие рабочие процессы агент собирает сам и какие инструменты просятся в один<a class="cite" href="#src-5">5</a>. Пара <code>search</code> → <code>get_task_by_id</code> из первого раздела — классический кандидат. Если после поиска агент почти всегда запрашивает подробности, поиск должен сразу их возвращать.</p>
+<p>Консолидация работает и в масштабе целого сервиса. В той же работе о 116 серверах авторы генерировали MCP-серверы из спецификаций OpenAPI и отдельно отфильтровывали и перегруппировывали операции. Это уменьшило медианное число инструментов на API на треть<a class="cite" href="#src-6">6</a>. Команда официального MCP-сервера GitHub в октябре 2025 года пошла от данных: по реальной статистике использования оставила включёнными по умолчанию только наборы <code>context</code>, <code>repos</code>, <code>issues</code>, <code>pull_requests</code> и <code>users</code>. Число инструментов упало со 101 до 52, а их описания — с 64,6 до 30,3 тыс. токенов<a class="cite" href="#src-8">8</a>.</p>
+
+<h3>Параметр action и «божественный» тул</h3>
+<p>Текущая документация Claude идёт дальше слияния цепочек<a class="cite" href="#src-2">2</a>: «Rather than creating a separate tool for every action (<code>create_pr</code>, <code>review_pr</code>, <code>merge_pr</code>), group them into a single tool with an <code>action</code> parameter». Меньше инструментов — меньше неоднозначности при выборе.</p>
+<p>А в практических разборах MCP-серверов тот же приём числится анти-паттерном. Digital Applied в мае 2026 года поставила god tool, один мега-инструмент с ветвлением по множеству операций, в список семи типовых ошибок, рядом с «omnibus parameter blobs» вроде <code>Record&lt;string, unknown&gt;</code>, которые отключают валидацию схемы целиком<a class="cite" href="#src-9">9</a>. Оценки тяжести в этом рейтинге сами авторы называют эвристикой и просят доверять порядку, а не числам.</p>
+<div class="note debate"><p>Противоречие снимается, если посмотреть, что именно объединяют. Документация Claude говорит о родственных операциях над одним ресурсом: создать, отревьюить и смёржить один и тот же pull request. Анти-паттерн — тул, который ветвится по несвязанным операциям и принимает их параметры одним нетипизированным объектом. Бери <code>action</code>, когда операции делят ресурс и большую часть параметров, а у каждого значения <code>action</code> короткий и явно описанный набор полей. Если для описания тула приходится писать «в режиме X поле Y игнорируется» пять раз подряд, это уже несколько тулов.</p></div>
+<p>У слияния есть естественный предел. Anthropic формулирует его так: инструменты должны давать агенту делить задачу примерно так же, как её поделил бы человек с теми же ресурсами<a class="cite" href="#src-5">5</a>. Человек не назначает встречу через три отдельных запроса к базе. Но и «сделай всё с клиентом» одной кнопкой он тоже не делает. Он ищет клиента, смотрит его историю и потом решает, что предложить.</p>
+<div class="note practice"><p>Выгрузи логи вызовов своего агента за неделю и посчитай пары «тул A, сразу за ним тул B» с одним и тем же идентификатором в аргументах. Пары, которые встречаются в большинстве сессий, — первые кандидаты на слияние или на расширенный ответ первого тула. Digital Applied считает тревожным признаком больше пяти вызовов на один ход пользователя<a class="cite" href="#src-9">9</a>.</p></div>
+</section>
+
+<section id="descriptions">
+<h2>Описание модель читает на каждом шаге</h2>
+<p>Когда Anthropic выпускала инструмент веб-поиска для Claude, в прогонах нашлась странность: модель без всякой нужды дописывала «2025» к параметру <code>query</code>. Результаты поиска смещались к одному году, качество падало. Исправили это не кодом и не системным промптом, а новой формулировкой в описании тула<a class="cite" href="#src-5">5</a>.</p>
+<p>Документация Claude называет подробное описание «by far the most important factor in tool performance» и просит минимум три-четыре предложения на инструмент, больше для сложных<a class="cite" href="#src-2">2</a>. В описании должно быть четыре вещи: что тул делает, когда его звать и когда не звать, что значит каждый параметр и как он влияет на поведение, какие есть ограничения, в том числе чего тул <em>не</em> возвращает. Пример из той же документации:</p>
+<div class="tabs">
+  <section data-tab="Хорошее описание">
+  <script type="text/plain" class="code" data-lang="json" data-title="get_stock_price, хороший вариант">
+{
+  "name": "get_stock_price",
+  "description": "Retrieves the current stock price for a given ticker symbol. The ticker symbol must be a valid symbol for a publicly traded company on a major US stock exchange like NYSE or NASDAQ. The tool will return the latest trade price in USD. It should be used when the user asks about the current or most recent price of a specific stock. It will not provide any other information about the stock or company.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "ticker": {"type": "string", "description": "The stock ticker symbol, e.g. AAPL for Apple Inc."}
+    },
+    "required": ["ticker"]
+  }
+}
+  </script>
+  </section>
+  <section data-tab="Плохое описание">
+  <script type="text/plain" class="code" data-lang="json" data-title="get_stock_price, плохой вариант">
+{
+  "name": "get_stock_price",
+  "description": "Gets the stock price for a ticker.",
+  "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}}, "required": ["ticker"]}
+}
+  </script>
+  </section>
+</div>
+<p>Хороший вариант заранее закрывает то, что модель иначе решала бы угадыванием. Тикер с Лондонской биржи не подойдёт, только NYSE и NASDAQ. Цена будет в долларах. Про дивиденды этот тул не расскажет. Плохой вариант на всё это молчит, и модель будет пробовать.</p>
+<p>Один из самых поучительных открытых примеров описания Anthropic опубликовала в январе 2025 года вместе с результатом 49% на SWE-bench Verified. Агент с Claude 3.5 Sonnet обходился двумя инструментами, и вот первый из них целиком<a class="cite" href="#src-10">10</a>:</p>
+<script type="text/plain" class="code wide" data-lang="json" data-title="Тул bash агента для SWE-bench, январь 2025" data-hl="4-10">
+{
+   "name": "bash",
+   "description": "Run commands in a bash shell\n
+* When invoking this tool, the contents of the \"command\" parameter does NOT need to be XML-escaped.\n
+* You don't have access to the internet via this tool.\n
+* You do have access to a mirror of common linux and python packages via apt and pip.\n
+* State is persistent across command calls and discussions with the user.\n
+* To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.\n
+* Please avoid commands that may produce a very large amount of output.\n
+* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.",
+   "input_schema": {
+       "type": "object",
+       "properties": {
+           "command": {
+               "type": "string",
+               "description": "The bash command to run."
+           }
+       },
+       "required": ["command"]
+   }
+}
+</script>
+<p>В посте описание разбито на строки для читаемости, а в настоящем определении это одна строка с <code>\n</code>, иначе JSON не разберётся. Ни одна строка здесь не объясняет, как пользоваться bash: это модель знает и так. Все строки описывают окружение, которое модель не может увидеть сама, плюс один готовый приём (<code>sed -n 10,25p</code>) и одна снятая ошибка формата (XML-экранирование не нужно). Это и есть «неявный контекст», который Anthropic советует делать явным, описывая тул так, будто объясняешь его новому сотруднику<a class="cite" href="#src-5">5</a>. OpenAI формулирует то же как «intern test»: сможет ли стажёр правильно вызвать функцию, если у него есть только то, что ты дал модели<a class="cite" href="#src-7">7</a>. Там же есть совет, который часто упускают: когда звать какую функцию, а когда нет, можно и нужно писать в системный промпт, а не только в описания. Об этом подробнее в <a href="../04-prompting/index.html">главе 4</a>.</p>
+
+<h3>Имена</h3>
+<p>Ревизия спецификации MCP от 28 июля 2026 года задаёт для имён тулов конкретные правила уровня SHOULD<a class="cite" href="#src-11">11</a>. Длина от 1 до 128 символов, регистр значим, допустимы латинские буквы, цифры, подчёркивание, дефис и точка, пробелов и запятых быть не должно, внутри одного сервера имена уникальны. Спецификация приводит примеры <code>getUser</code>, <code>DATA_EXPORT_v2</code> и <code>admin.tools.list</code>. Если у двух серверов совпали имена, развести их должен клиент, например приставив к имени идентификатор сервера. Claude Code так и делает: тул <code>query</code> с сервера <code>db</code> модель видит как <code>mcp__db__query</code>, и под этим же именем его пишут в правилах разрешений и матчерах хуков<a class="cite" href="#src-12">12</a>.</p>
+<p>Внутри своего сервера имена строят с пространством имён. Anthropic сравнивала два способа: по сервису (<code>asana_search</code>, <code>jira_search</code>) и по ресурсу (<code>asana_projects_search</code>, <code>asana_users_search</code>). Выбор между префиксом и суффиксом дал «non-trivial effects» на их оценках, причём разные для разных моделей, так что универсального ответа нет<a class="cite" href="#src-5">5</a>. Текущая документация советует префикс по сервису и отдельно отмечает, что с поиском инструментов это особенно важно<a class="cite" href="#src-2">2</a>. Поиск идёт по именам и описаниям, так что имя там работает как ключевое слово для поиска. Среди реальных ошибок выбора Anthropic приводит пару <code>notification-send-user</code> и <code>notification-send-channel</code>: с такими похожими именами модель путает тул и параметры<a class="cite" href="#src-13">13</a>.</p>
+<p>Параметры подчиняются тем же правилам. <code>user_id</code> лучше, чем <code>user</code>, потому что второе можно прочитать и как имя, и как email, и как объект<a class="cite" href="#src-5">5</a>.</p>
+<div class="note warn"><p>Claude Code по умолчанию обрезает описание каждого MCP-тула и инструкции каждого сервера до 2048 символов<a class="cite" href="#src-12">12</a>. Если ограничения и «когда не использовать» стоят в конце длинного описания, в Claude Code модель их просто не увидит. Важное ставь в начало. Порог меняется переменной <code>CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH</code>, начиная с версии 2.1.280.</p></div>
+
+<h3>Что показали замеры настоящих серверов</h3>
+<p>Работа с говорящим названием «MCP Tool Descriptions Are Smelly!»<a class="cite" href="#src-14">14</a> вышла в феврале 2026 года (ревизия v3 — в мае). Авторы разложили описание на шесть компонентов: назначение, указания по использованию, ограничения, объяснение параметров, полнота, примеры. По этой рубрике они проверили 856 инструментов из 103 серверов. У 97,1% нашёлся хотя бы один дефект, у 56% непонятно даже назначение. Случайная выборка из реестра выглядит ещё хуже: из 400 серверов, взятых наугад из 24 135, рукопожатие <code>initialize</code> завершили только 48,8%, а у 58,8% инструментов работающих серверов нет необязательных аннотаций безопасности<a class="cite" href="#src-15">15</a>.</p>
+<figure class="fig" id="fig-ecosystem">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Что измерили в настоящих MCP-серверах", "unit": "%", "decimals": 1, "max": 100, "emphasis": ["Неясное назначение тула"],
+ "rows": [["Хотя бы один дефект описания", 97.1, "856 тулов, 103 сервера"], ["Неясное назначение тула", 56, "те же 856 тулов"], ["Сервер — голая обёртка API", 92, "116 официальных серверов"], ["Нет аннотаций безопасности", 58.8, "тулы случайной выборки серверов"], ["Сервер не прошёл initialize", 51.2, "400 случайных серверов из реестра"], ["Описание расходится с кодом", 9.93, "19 200 пар из 2 214 серверов"]],
+ "note": "Четыре разных исследования 2025–2026 годов, у каждой строки своя выборка."}
+</script>
+<figcaption>Типичный MCP-сервер из реестра — обёртка над API с плохо описанными тулами, и примерно каждое десятое описание не совпадает с тем, что делает код.</figcaption>
+</figure>
+<p>Затем авторы дополнили описания по всем шести компонентам и прогнали агентов на бенчмарке MCP-Universe: 231 задача, 18 серверов, 202 инструмента, модели GPT-4.1, Qwen3-Coder-480B и GLM-4.5. Медианная доля успешных задач выросла на 5,85 п.п. Цена оказалась неожиданной: число шагов выполнения выросло на 67,46%, а в 16,67% случаев результат стал хуже. Компактные варианты с частью компонентов часто давали ту же надёжность при меньшем числе токенов, а удаление примеров не ухудшало качество статистически значимо.</p>
+<p>Вывод неудобный. Совет «три-четыре предложения минимум» верен как нижняя граница для описания, в котором нет назначения и ограничений. Дописывать всё подряд, пока описание не станет «полным», не стоит: модель начинает делать больше шагов, а иногда и хуже. В первую очередь пиши назначение, границу с соседними тулами и то, чего тул не делает. Примеры добавляй, когда есть конвенция формата, которую иначе не угадать. И меряй после правки не только долю успеха, но и число шагов.</p>
+<p>И последнее, о чужих серверах. Исследование 2 214 MCP-серверов в июне 2026 года нашло расхождение между описанием и кодом в 9,93% из 19 200 пар «описание — реализация»<a class="cite" href="#src-16">16</a>. Туда попали и функции, которые делают не то, что обещано, и побочные эффекты, о которых описание молчит. Описание — это утверждение автора сервера, никем не проверенное. Как через описания проводят промпт-инъекции, разобрано в <a href="../16-security/index.html">главе 16</a>.</p>
+</section>
+
+<section id="parameters">
+<h2>Параметры, в которых трудно ошибиться</h2>
+<p>Агент Anthropic для SWE-bench систематически ошибался в путях к файлам. Пока он стоял в корне репозитория, относительные пути работали. Стоило ему перейти в другой каталог, и правки уходили не туда. Исправили это в самом инструменте: он стал принимать только абсолютные пути, «and we found that the model used this method flawlessly»<a class="cite" href="#src-4">4</a>. В опубликованной спецификации тула это одна строка в описании параметра <code>path</code>: «Absolute path to file or directory, e.g. <code>/repo/file.py</code> or <code>/repo</code>»<a class="cite" href="#src-10">10</a>.</p>
+<aside class="margin"><p><b>Poka-yoke</b> — термин из производственной системы Toyota: приспособление, которое не даёт собрать деталь неправильно.</p></aside>
+<p>Anthropic называет такой приём <dfn>poka-yoke</dfn>: «Change the arguments so that it is harder to make mistakes». Модель по-прежнему будет ошибаться, но выбор должен оставлять для ошибки как можно меньше места. OpenAI в своих рекомендациях приводит хрестоматийный пример<a class="cite" href="#src-7">7</a>: сигнатура <code>toggle_light(on: bool, off: bool)</code> допускает вызов, в котором свет одновременно включён и выключен. Один параметр-перечисление <code>state: "on" | "off"</code> такой вызов исключает.</p>
+<p>Ещё один совет OpenAI: «Don't make the model fill arguments you already know». Если <code>user_id</code> известен из авторизации, а <code>order_id</code> уже лежит в состоянии сессии, их подставляет код. У модели одним параметром меньше, значит, меньше мест, где можно ошибиться. Заодно она физически не может подставить чужой идентификатор, и для тула с доступом к данным пользователей это уже вопрос безопасности.</p>
+<p>Третий приём — проверка на стороне инструмента, которая превращает опасную неоднозначность в понятный отказ. Второй тул того же SWE-bench-агента, <code>str_replace_editor</code>, правит файл заменой строки. Anthropic перепробовала несколько способов задавать правки, и надёжнее всего оказалась замена точной строки<a class="cite" href="#src-10">10</a>. Замена выполняется, только если <code>old_str</code> встречается в файле ровно один раз. Если совпадений нет или их несколько, модель получает сообщение об ошибке и повторяет попытку с более длинным фрагментом. Описание предупреждает об этом заранее: «If the <code>old_str</code> parameter is not unique in the file, the replacement will not be performed. Make sure to include enough context in <code>old_str</code> to make it unique».</p>
+<p>У poka-yoke есть обратная крайность, Digital Applied называет её schema over-fit: слишком много обязательных полей и перечисления, в которые не попадает реальное значение. Модель тогда либо отказывается от вызова, либо подгоняет значение под ближайшее допустимое<a class="cite" href="#src-9">9</a>. Обязательными делай только поля, без которых вызов теряет смысл.</p>
+
+<h3>Форматы, которые модели тяжело писать</h3>
+<p>В том же приложении к «Building effective agents» разобран неочевидный класс ошибок<a class="cite" href="#src-4">4</a>. Одну и ту же правку можно передать диффом или новым текстом файла, а код можно вернуть в Markdown или внутри JSON. Для программиста это косметика: одно конвертируется в другое без потерь. Для модели нет. Чтобы написать заголовок ханка в диффе, нужно заранее знать, сколько строк поменяется, а код внутри JSON требует экранировать каждый перевод строки и каждую кавычку. Совет оттуда: держать формат близким к тому, что модель видела в текстах из интернета, и не заставлять её считать строки или экранировать код.</p>
+<p>У Gemini этот класс ошибок задокументирован как сбой. Если промпт требует от модели структурированного текста прямо перед вызовом тула, например блока <code>&lt;UPDATE&gt;…&lt;/UPDATE&gt;</code>, вызов иногда падает с <code>Malformed_Function_Call</code>. Google советует перенести такие заметки в отдельный тул <code>update()</code><a class="cite" href="#src-17">17</a>, то есть превратить свободный протокол в инструмент со схемой.</p>
+<p>OpenAI сделала из этого совета отдельный тип инструмента. У тула с <code>"type": "custom"</code> вход — свободный текст, а не JSON<a class="cite" href="#src-7">7</a>:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Custom tool в Responses API, пример из документации OpenAI" data-hl="6-8">
+response = client.responses.create(
+    model="gpt-6-astra",
+    input="Use the code_exec tool to print hello world to the console.",
+    tools=[
+        {
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes arbitrary Python code.",
+        }
+    ],
+)
+</script>
+<p>Модель отвечает элементом <code>custom_tool_call</code>, в поле <code>input</code> которого лежит просто <code>print("hello world")</code>. Документация объясняет зачем: «to avoid unnecessarily wrapping a response in JSON, or to apply a custom grammar to the response». Вход можно ограничить грамматикой Lark или регулярным выражением в синтаксисе Rust-крейта <code>regex</code>, сэмплирование при этом идёт через LLGuidance, а слишком сложную грамматику API может отклонить.</p>
+
+<h3>Strict: что гарантирует схема и чего не гарантирует</h3>
+<p>С флагом <code>strict: true</code> Claude подбирает токены только из тех, что оставляют вызов валидным по схеме. Это <dfn>grammar-constrained sampling</dfn>, тот же конвейер, что у structured outputs<a class="cite" href="#src-18">18</a>. Гарантий две: <code>input</code> соответствует <code>input_schema</code>, и <code>name</code> — имя существующего инструмента. Скомпилированная грамматика кешируется до 24 часов. У OpenAI тот же флаг работает поверх Structured Outputs, и руководство советует: «We recommend always enabling strict mode»<a class="cite" href="#src-7">7</a>. У Gemini похожую гарантию даёт режим <code>tool_choice</code> <code>validated</code>: «Model ensures function schema adherence»<a class="cite" href="#src-17">17</a>.</p>
+<div class="tabs">
+  <section data-tab="Claude">
+  <script type="text/plain" class="code" data-lang="json" data-title="Строгий тул, пример из документации Claude" data-hl="4,12">
+{
+  "name": "get_weather",
+  "description": "Get the current weather in a given location",
+  "strict": true,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "location": {"type": "string", "description": "The city and state, e.g. San Francisco, CA"},
+      "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+    },
+    "required": ["location"],
+    "additionalProperties": false
+  }
+}
+  </script>
+  </section>
+  <section data-tab="OpenAI">
+  <script type="text/plain" class="code" data-lang="json" data-title="Строгий тул, пример из документации OpenAI" data-hl="5,10,12,13">
+{
+  "type": "function",
+  "name": "get_weather",
+  "description": "Retrieves current weather for the given location.",
+  "strict": true,
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "location": {"type": "string", "description": "City and country e.g. Bogotá, Colombia"},
+      "units": {"type": ["string", "null"], "enum": ["celsius", "fahrenheit"], "description": "Units the temperature will be returned in."}
+    },
+    "required": ["location", "units"],
+    "additionalProperties": false
+  }
+}
+  </script>
+  </section>
+</div>
+<p>Во второй вкладке видно главное отличие OpenAI. В строгом режиме все поля обязаны быть в <code>required</code>, у каждого объекта <code>additionalProperties: false</code>, а необязательность выражается типом с <code>null</code>. Если прислать <code>strict: true</code> со схемой, которая этим правилам не отвечает, запрос отклонят с перечнем проблем. Если <code>strict</code> не указать, Responses API попробует привести схему к строгой и молча откатится к нестрогому режиму, если не выйдет. Chat Completions по умолчанию остаётся нестрогим. В статьях часто пишут, что strict несовместим с параллельными вызовами. В документации оговорка уже: строгий режим отключается, только если дообученная модель вызвала несколько функций за один ход.</p>
+<p>У Claude свои ограничения, и они бьют по poka-yoke сильнее<a class="cite" href="#src-19">19</a>. Строгая схема не поддерживает числовые ограничения (<code>minimum</code>, <code>maximum</code>, <code>multipleOf</code>), ограничения длины строк, рекурсивные схемы и <code>additionalProperties</code> со значением, отличным от <code>false</code>. У массивов <code>minItems</code> может быть только 0 или 1. На запрос действуют жёсткие бюджеты: не больше 20 строгих инструментов, не больше 24 необязательных параметров и 16 параметров-объединений суммарно по всем строгим схемам. Неподдерживаемая конструкция даёт ошибку 400 с описанием, тихого отката нет.</p>
+<figure class="fig" id="fig-strict">
+<div class="versus">
+  <div data-tone="ok"><h4>Гарантирует strict</h4><ul><li>аргументы проходят JSON Schema</li><li>обязательные поля на месте, лишних нет</li><li>значения из <code>enum</code></li><li>имя тула существует</li></ul></div>
+  <div data-tone="warn"><h4>Проверяет сам сервер</h4><ul><li>диапазоны чисел и длины строк (у Claude)</li><li>дата в будущем, формат ID, существование объекта</li><li>права пользователя на этот объект</li><li>бизнес-правила и лимиты</li></ul></div>
+</div>
+<figcaption>Строгий режим закрывает только синтаксис вызова. Всё, что зависит от значений и от состояния системы, сервер проверяет сам и отвечает понятной ошибкой.</figcaption>
+</figure>
+<p>Для Claude строгий режим стал обязательным инструментом дизайна по ещё одной причине. На Claude Fable 5.1 и Mythos 5.1 (1 сентября 2026), Opus 5.5 (22 сентября) и Sonnet 5.5 (28 сентября) принудительный выбор тула убрали<a class="cite" href="#src-20">20</a>: <code>tool_choice</code> со значениями <code>any</code> и <code>tool</code> возвращает 400. Вместо него документация предлагает <code>auto</code> вместе со <code>strict: true</code> или structured outputs, если нужен ответ фиксированной формы<a class="cite" href="#src-2">2</a>. Код, который заставлял модель вызвать конкретный тул для извлечения данных, на этих моделях надо переписать. А решение, какой тул звать, теперь целиком зависит от описаний и системного промпта.</p>
+
+<h3>Примеры вызовов: помогают не всегда</h3>
+<p>В ноябре 2025 года Anthropic добавила в определение тула поле <code>input_examples</code>: массив примеров входа, каждый из которых должен проходить схему, иначе запрос вернёт 400<a class="cite" href="#src-2">2</a>. Схема описывает, какой вызов допустим, но не описывает принятые договорённости: как записывать дату, как выглядит идентификатор (<code>USR-XXXXX</code>), какие необязательные поля заполняют вместе. В примере Anthropic с тулом <code>create_ticket</code> три вызова показывают полную, частичную и минимальную форму. На внутреннем тесте «complex parameter handling» точность выросла с 72 до 90%<a class="cite" href="#src-13">13</a>.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="input_examples, пример из документации Claude">
+"input_examples": [
+  {"location": "San Francisco, CA", "unit": "fahrenheit"},
+  {"location": "Tokyo, Japan", "unit": "celsius"},
+  {"location": "New York, NY"}
+]
+</script>
+<p>Стоят примеры 20–50 токенов каждый для простых входов и 100–200 для вложенных объектов, и платишь ты за них в каждом запросе. Anthropic советует от одного до пяти примеров на тул, с реалистичными данными. Но есть и данные против. OpenAI предупреждает, что примеры могут ухудшить результат у рассуждающих моделей<a class="cite" href="#src-7">7</a>. В исследовании «запахов» описаний удаление компонента «примеры» качество статистически значимо не ухудшило<a class="cite" href="#src-14">14</a>. Добавляй примеры, когда у параметров есть договорённость, которую схема не выражает. Для тулов с двумя строковыми параметрами они не нужны.</p>
+</section>
+
+<section id="responses">
+<h2>Что вернуть модели</h2>
+<p>Поиск MCP-B из первого раздела возвращал <code>id</code>, <code>title</code> и <code>url</code>. Для человека, который смотрит на экран, этого хватает: он кликнет по ссылке. Агенту для следующего шага нужен <code>project_id</code>, а его в ответе нет. Автор замера сформулировал правило, к которому стоит возвращаться при каждом новом туле<a class="cite" href="#src-1">1</a>: «think about what the Agent will need next, not just what it's asking for right now». Ответ должен содержать достаточно, чтобы агент сделал следующий шаг без лишнего вызова. И ровно столько: поля <code>createdTime</code> и <code>focusSummaries: null</code> следующему шагу не нужны ни при каком раскладе.</p>
+<p>Проектируя ответ, выпиши, какие вызовы обычно идут после этого тула и какие поля им нужны. Эти поля оставь. Остальное вырежи, а сырой JSON из бэкенда переведи в форму, которую удобно читать. Anthropic приводит примеры замен: <code>uuid</code> на <code>name</code>, <code>256px_image_url</code> на <code>image_url</code>, <code>mime_type</code> на <code>file_type</code><a class="cite" href="#src-5">5</a>.</p>
+
+<h3>Три вида идентификаторов</h3>
+<p>Про идентификаторы источники на первый взгляд спорят. В статье 2025 года Anthropic пишет, что замена случайных буквенно-цифровых UUID на осмысленные имена «or even a 0-indexed ID scheme» заметно уменьшила галлюцинации Claude в задачах поиска<a class="cite" href="#src-5">5</a>. Текущая документация советует возвращать «semantic, stable identifiers (for example, slugs or UUIDs) rather than opaque internal references»<a class="cite" href="#src-2">2</a>, то есть UUID уже в списке хороших. А спецификация MCP 2026-07-28 требует, чтобы хэндлы состояния были как раз непрозрачными: «Handles that encode internal structure invite parsing or guessing; opaque identifiers do not»<a class="cite" href="#src-11">11</a>.</p>
+<p>Противоречия нет, потому что речь о трёх разных вещах. Первая — сущности, о которых модель рассуждает: пользователи, файлы, каналы. Здесь нужны имена и слаги, по которым модель узнаёт объект и которые может сверить с запросом пользователя. Сырой ID при этом доступен в подробном режиме ответа. Вторая — идентификаторы, которые модель только переносит из одного вызова в другой. Стабильный UUID здесь нормален. Плохи ссылки, которые меняются или ничего не значат вне момента вызова: номер строки во вчерашней выдаче, смещение в списке. Третья — хэндлы, которые сервер выдаёт под состояние: корзина, черновик, курсор. Они непрозрачны, живут ограниченное время, и права на них проверяются при каждом вызове.</p>
+
+<h3>Краткий и подробный ответ</h3>
+<p>Модели нужен то короткий ответ, то длинный, в зависимости от задачи. Anthropic предлагает отдать выбор ей: параметр <code>response_format</code> со значениями <code>concise</code> и <code>detailed</code><a class="cite" href="#src-5">5</a>. В их примере с тредами Slack подробный ответ занимал 206 токенов, краткий — 72, примерно треть. Краткий содержит только текст треда. Подробный добавляет <code>thread_ts</code>, <code>channel_id</code> и <code>user_id</code>, без которых не получится ни прочитать ответы в треде, ни написать в канал.</p>
+<figure class="fig" id="fig-response-format">
+<script type="text/x-mermaid">
+flowchart TD
+  search["поиск по Slack(query, response_format)"] --> fmt{"response_format"}
+  fmt -- "concise" --> short["текст треда<br/>72 токена"]:::ok
+  fmt -- "detailed" --> long["текст + thread_ts,<br/>channel_id, user_id<br/>206 токенов"]:::accent
+  short --> answer["ответ пользователю"]
+  long -- "thread_ts" --> replies["прочитать ответы в треде"]
+  long -- "channel_id" --> post["написать в канал"]
+</script>
+<figcaption>Краткий ответ втрое дешевле и годится, когда нужно только содержание. Подробный нужен, когда за поиском последует действие: идентификаторы из него уходят аргументами в следующий вызов.</figcaption>
+</figure>
+<p>Значение по умолчанию выбирай по логам. Если после поиска в большинстве сессий идёт действие, по умолчанию нужен <code>detailed</code>, иначе модель будет повторять поиск ради ID. Если поиск почти всегда заканчивается ответом пользователю, по умолчанию хватит <code>concise</code>.</p>
+<p>С форматом самого ответа — XML, JSON или Markdown — универсального решения нет. Anthropic объясняет это так: модели лучше работают с форматами, похожими на их обучающие данные, а оптимум «will vary widely by task and agent», поэтому формат выбирают по собственным прогонам<a class="cite" href="#src-5">5</a>. В MCP у результата два канала: <code>content</code> с текстом и картинками для модели и <code>structuredContent</code> с JSON для кода, который можно описать <code>outputSchema</code><a class="cite" href="#src-11">11</a>. Для обратной совместимости спецификация советует дублировать структурированный результат сериализованным JSON в текстовом блоке. Значит, всё, что ты кладёшь в <code>structuredContent</code>, скорее всего окажется и в тексте, который читает модель, и правило «только нужные поля» действует для обоих каналов.</p>
+
+<h3>Хэндлы вместо сессии</h3>
+<p>В ревизии MCP от 28 июля 2026 года протокол стал без состояния: нет рукопожатия <code>initialize</code>, нет сессий, а <code>tools/list</code> больше не зависит от соединения<a class="cite" href="#src-11">11</a>. Если инструменту нужно состояние между вызовами, он должен явно выдать модели хэндл, и модель передаёт его обратно обычным аргументом. Пример из спецификации:</p>
+<script type="text/plain" class="code" data-lang="jsonc" data-title="Хэндл состояния, пример из спецификации MCP 2026-07-28" data-hl="7,13">
+// → tools/call
+{ "name": "create_basket", "arguments": {} }
+
+// ← result
+{
+  "content": [{ "type": "text", "text": "Created basket bsk_a1b2c3" }],
+  "structuredContent": { "basket_id": "bsk_a1b2c3" }
+}
+
+// → tools/call
+{
+  "name": "add_item",
+  "arguments": { "basket_id": "bsk_a1b2c3", "sku": "..." }
+}
+</script>
+<p>Нести <code>basket_id</code> дальше — обязанность модели, а сервер по этому ключу хранит содержимое корзины. Спецификация даёт четыре правила для таких хэндлов. Хэндл — это имя, а не право доступа: сервер проверяет авторизацию вызывающего при каждом вызове («a handle is a name, not a capability»). Хэндл непрозрачен. Срок жизни написан в описании создающего тула, например «baskets expire after 24 hours of inactivity», чтобы модель видела его, когда решает создать состояние. Вызов с просроченным или неизвестным хэндлом возвращает ошибку выполнения, из которой модель понимает, что надо создать новый.</p>
+<p>Протокольные подробности новой ревизии, от многошаговых запросов до кеширования списков, — в <a href="../05-mcp/index.html">главе 5</a>.</p>
+</section>
+
+<section id="truncation">
+<h2>Усечение, которое не врёт</h2>
+<p>Компания Stainless в марте 2026 года опубликовала сравнение нескольких способов дать агенту банковское API Increase: 31 тестовый случай<a class="cite" href="#src-21">21</a>. Среди разобранных провалов один особенно поучителен. Агент через Code Mode-сервер нашёл пять платежей из восьми и доложил сумму $98 306,02. Реальная сумма была на $42 274 больше, и ни в ответе инструмента, ни в ответе агента не было ни намёка, что данные неполные. Бенчмарк вендорский, Stainless продаёт собственный вариант code mode, так что итоговому рейтингу можно верить только с оговоркой. Но сам провал типичен и от вендора не зависит: инструмент отдал часть данных, не сказав, что это часть.</p>
+<p>Молчаливое усечение хуже ошибки. После ошибки модель хотя бы знает, что что-то пошло не так. Усечённый без предупреждения ответ выглядит как полный, и модель уверенно строит на нём итог. Поэтому любой тул, который может вернуть много, должен делать четыре вещи: сказать, сколько найдено всего, признать, что показана часть, дать агрегат по всей выборке и подсказать точные вызовы, которыми можно сузить запрос или получить продолжение.</p>
+<p>У Anthropic есть образцовый пример такого ответа. В статье он дан картинкой, текст ниже переписан с неё<a class="cite" href="#src-5">5</a>:</p>
+<script type="text/plain" class="code" data-lang="markdown" data-title="Усечённый ответ, который направляет агента (Anthropic, 2025)" data-hl="3,4,9-11,13-15">
+stripe - transactions_search (MCP)(limit: 5000, responseFormat: "concise")
+## Transaction Search Results
+Found **2,847 transactions** matching your query.
+The results are truncated. Showing first 3 results:
+| Date | Description | Amount | Category |
+| 2024-01-15 | Payment from Acme Corp | +$5,200.00 | Revenue |
+| 2024-01-14 | Payment from TechStart | +$3,100.00 | Revenue |
+| 2024-01-13 | Payment from Cloud Co. | +$3,100.00 | Revenue |
+**Summary of all 2,847 results:**
+- Total Revenue: $458,291.00
+- Date Range: Jan 1 - Jan 15, 2024
+## To refine these results, you can:
+- **Search for specific vendors**: Use `transactions_search(payee: "Acme Corp")` to see only Acme Corp charges
+- **Filter by amount range**: Use `transactions_search(minAmount: 1000, maxAmount: 5000)`
+- **Get next page**: Use `transactions_search(query: <query>, page: 2)`
+</script>
+<figure class="fig" id="fig-truncation">
+<div class="layers">
+  <div class="layer" data-tone="accent"><b>Итог и признак усечения</b><span>«Found 2,847», «results are truncated». Модель знает, что видит часть</span></div>
+  <div class="layer" data-tone="soft"><b>Образец</b><span>три строки в формате, который модель прочитает без разбора JSON</span></div>
+  <div class="layer" data-tone="ok"><b>Агрегат по всей выборке</b><span>сумма и диапазон дат посчитаны на сервере по всем 2 847 строкам</span></div>
+  <div class="layer" data-tone="violet"><b>Следующие вызовы</b><span>готовые сигнатуры с аргументами: фильтр по контрагенту, по сумме, следующая страница</span></div>
+</div>
+<figcaption>Четыре слоя усечённого ответа. Агрегат отвечает на вопрос, ради которого обычно и выгружают тысячи строк, а последний слой превращает «слишком много» в конкретный следующий шаг.</figcaption>
+</figure>
+<p>Обрати внимание на агрегат. Если бы агент из примера Stainless получил от сервера сумму по всем платежам, он не собирал бы её сам из неполного списка. Во многих задачах модели нужна не выгрузка, а число, и посчитать его на сервере дешевле и надёжнее.</p>
+<p>Остальное — старые приёмы из проектирования API, только с другими значениями по умолчанию. Anthropic перечисляет пагинацию, выбор диапазона, фильтрацию и усечение, у каждого параметра разумное значение по умолчанию<a class="cite" href="#src-5">5</a>. Курсор пагинации — тоже аргумент, как хэндл из прошлого раздела; сама спецификация MCP отдаёт <code>tools/list</code> страницами с <code>nextCursor</code><a class="cite" href="#src-11">11</a>. В статье Anthropic есть и фраза на вырост: «We expect the effective context length of agents to grow over time, but the need for context-efficient tools to remain».</p>
+
+<h3>Как это выглядит в Claude Code</h3>
+<p>Claude Code защищает контекст от больших ответов сам, и автору сервера полезно знать как<a class="cite" href="#src-12">12</a>. Когда ответ MCP-тула превышает 10 тыс. токенов, появляется предупреждение, и этот порог не настраивается. Лимит по умолчанию — 25 тыс. токенов, его меняет переменная <code>MAX_MCP_OUTPUT_TOKENS</code>. Слишком большой ответ не попадает в разговор целиком: Claude Code сохраняет его на диск, а в контекст кладёт ссылку на файл. Сервер может поднять порог для отдельного тула, у которого большой ответ законен, например для схемы базы или дерева файлов:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Запись в tools/list, пример из документации Claude Code" data-hl="4-6">
+{
+  "name": "get_schema",
+  "description": "Returns the full database schema",
+  "_meta": {
+    "anthropic/maxResultSizeChars": 200000
+  }
+}
+</script>
+<p>Потолок — 500 тыс. символов, и на картинки аннотация не действует, для них остаётся только <code>MAX_MCP_OUTPUT_TOKENS</code>. Для своего сервера это значит простую вещь. Если ответ тула регулярно упирается в эти пороги, значит, в нём не хватает пагинации или фильтра, и поднимать лимит — последнее, что стоит делать.</p>
+</section>
+
+<section id="errors">
+<h2>Ошибка — тоже инструкция</h2>
+<p>Вот две ошибки, которые может вернуть один и тот же тул Asana на один и тот же вызов. В статье Anthropic они тоже даны картинками, текст переписан с них<a class="cite" href="#src-5">5</a>.</p>
+<div class="tabs">
+  <section data-tab="Бесполезная">
+  <script type="text/plain" class="code" data-lang="json" data-title="asana - user_info (MCP)(userId: &quot;john.doe@acme.corp&quot;)">
+{
+  "error": {
+    "code": "RESOURCE_NOT_FOUND",
+    "status": 422,
+    "message": "Invalid value",
+    "details": { "field": "userId", "value": "john.doe@acme.corp", "type": "invalid_value" }
+  }
+}
+  </script>
+  </section>
+  <section data-tab="Полезная">
+  <script type="text/plain" class="code" data-lang="markdown" data-title="asana - user_info (MCP)(userId: &quot;john.doe@acme.corp&quot;)" data-hl="3,5-7,9">
+# Resource Not Found: Invalid `userId`
+## Error Summary
+Your request to `/api/user/info` failed because the `userId` `john.doe@acme.corp` does not exist or is in the wrong format.
+## Valid User IDs
+Examples:
+- `1928298149291729`
+- `9381719375914731`
+## Resolving a User ID
+- Call user_search()
+  </script>
+  </section>
+</div>
+<p>По первой ошибке модель не поймёт, что случилось. Код говорит «не найдено», статус говорит «неверное значение», а сообщение — просто «Invalid value». Вторая называет поле, показывает на примерах, как выглядит правильный ID (это число, а не email), и называет тул, который превратит email в ID. После неё следующий шаг очевиден: вызвать <code>user_search</code> и повторить.</p>
+<p>Документация Claude говорит то же короче: вместо «failed» напиши, что пошло не так и что попробовать дальше, например «Rate limit exceeded. Retry after 60 seconds.»<a class="cite" href="#src-22">22</a>. Документация называет и число попыток: если вызов невалиден или в нём не хватает параметров, Claude исправляет его и повторяет 2–3 раза, прежде чем извиниться перед пользователем. Значит, у ошибки есть две-три попытки, чтобы довести модель до правильного вызова. «Invalid value» потратит их впустую.</p>
+
+<h3>Два канала ошибок в MCP</h3>
+<p>В MCP ошибка может прийти двумя путями, и от выбора пути зависит, увидит ли её модель<a class="cite" href="#src-11">11</a>. Протокольные ошибки — стандартные ошибки JSON-RPC вроде <code>-32602</code> на неизвестный тул или запрос, который не проходит схему <code>CallToolRequest</code>. Клиент <em>может</em> показать их модели, но спецификация предупреждает, что восстановиться по ним ей вряд ли удастся. Ошибки выполнения приходят обычным результатом с <code>isError: true</code>, и клиенту <em>следует</em> передавать их модели «to enable self-correction».</p>
+<p>В ревизии 2025-06-18 «invalid arguments» стояли в списке протокольных ошибок, а «invalid input data» — в списке ошибок выполнения, и было непонятно, куда относить неверный аргумент. Ревизия 2025-11-25 это уточнила: ошибки валидации входа — это ошибки выполнения, чтобы модель могла исправиться сама (SEP-1303)<a class="cite" href="#src-23">23</a>. В ревизии 2026-07-28 к ошибкам выполнения отнесены три класса: сбои внешних API, ошибки валидации («date in wrong format, value out of range») и нарушения бизнес-правил<a class="cite" href="#src-11">11</a>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Ошибка выполнения, пример из спецификации MCP 2026-07-28" data-hl="5,9,12">
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "resultType": "complete",
+    "content": [
+      {
+        "type": "text",
+        "text": "Invalid departure date: must be in the future. Current date is 08/08/2025."
+      }
+    ],
+    "isError": true
+  }
+}
+</script>
+<p>Текст здесь сделан по тому же образцу, что и полезная ошибка Asana. Он говорит, что не так (дата в прошлом), каким должно быть значение (в будущем) и даёт модели факт, которого у неё может не быть (сегодняшнюю дату). Поле <code>resultType</code> в этой ревизии обязательно для каждого результата: <code>complete</code> значит, что вызов завершён, а <code>input_required</code> — что серверу нужен ответ пользователя, прежде чем продолжить (об этом в <a href="#side-effects">разделе о подтверждениях</a>).</p>
+<figure class="fig" id="fig-error-routing">
+<script type="text/x-mermaid">
+flowchart TD
+  req["tools/call"] --> known{"тул существует,<br/>запрос по схеме?"}
+  known -- "нет" --> proto["ошибка JSON-RPC<br/>-32602"]:::warn
+  proto -.-> hidden["клиент может<br/>не показать модели"]:::mute
+  known -- "да" --> run["сервер проверяет<br/>аргументы и выполняет"]
+  run -- "успех" --> okres["result с content"]:::ok
+  run -- "плохие аргументы,<br/>бизнес-правило, сбой API" --> exec["result с isError true<br/>и текстом для модели"]:::accent
+  exec --> fix["модель читает текст<br/>и правит вызов"]
+  fix -- "до 2–3 попыток" --> req
+</script>
+<figcaption>Маршрут ошибки в MCP 2026-07-28. Всё, что модель может исправить сама, должно уходить по правой ветке, обычным результатом с понятным текстом. Протокольная ошибка остаётся для случаев, где исправлять нечего.</figcaption>
+</figure>
+
+<h3>Разные ошибки — разные действия</h3>
+<p>В разборе Digital Applied отдельным анти-паттерном названо отсутствие различий между ошибками: сервер сводит валидацию, таймаут и отказ в доступе к одному общему «failed», и модель не может выбрать разумную стратегию восстановления<a class="cite" href="#src-9">9</a>. Модель ведёт себя по-разному в зависимости от того, что прочитала, и текст ошибки должен подсказать ей правильное поведение:</p>
+<table>
+<thead><tr><th>Что случилось</th><th>Что написать в ошибке</th><th>Что модель должна сделать</th></tr></thead>
+<tbody>
+<tr><th>Неверный аргумент</th><td>какое поле, какой формат нужен, пример</td><td>исправить и повторить</td></tr>
+<tr><th>Объект не найден</th><td>чего нет и каким тулом его искать</td><td>вызвать поиск, потом повторить</td></tr>
+<tr><th>Временный сбой, лимит</th><td>через сколько можно повторить</td><td>подождать или сделать другое</td></tr>
+<tr><th>Нет прав</th><td>явное «не повторяй, спроси пользователя»</td><td>остановиться и сказать человеку</td></tr>
+<tr><th>Просроченный хэндл</th><td>что хэндл истёк и каким тулом создать новый</td><td>пересоздать состояние</td></tr>
+</tbody>
+</table>
+<p>Тоньше всего строка про отказ в доступе: модели надо сказать не только «нельзя», но и как вести себя дальше. Claude Code в режиме auto решает это для своих отказов именно текстом ошибки. Классификатор на Sonnet 4.6 проверяет каждый вызов тула. Отказ возвращается модели как результат тула вместе с инструкцией «to treat the boundary in good faith: find a safer path». Если в сессии набирается три отказа подряд или двадцать всего, модель останавливают и зовут человека<a class="cite" href="#src-24">24</a>. Здесь отказ политики безопасности написан как инструкция, в точности как ошибка валидации.</p>
+
+<h3>Те же правила на FastMCP</h3>
+<p>На Python MCP-серверы чаще всего пишут на FastMCP, и часть его умолчаний работает против правил этой главы<a class="cite" href="#src-25">25</a>. Описанием тула становится docstring над секцией <code>Args</code>, описаниями параметров — строки из <code>Args</code>, а <code>Literal</code> превращается в <code>enum</code>. Вернёшь dict, dataclass или Pydantic-модель — FastMCP положит объект в <code>structuredContent</code> и продублирует JSON-текстом, и модель получит все поля, как от MCP-B. С <code>mask_error_details=True</code> до клиента доходит только текст <code>ToolError</code>. Ниже поиск задач из первого раздела по правилам главы, проверенный на FastMCP 4.0.10.</p>
+<script type="text/plain" class="code wide" data-lang="python" data-title="tasks_server.py" data-hl="14,17-20,28,32,34-35,38">
+from typing import Literal
+
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
+
+mcp = FastMCP("tasks", mask_error_details=True)
+TASKS = [{"id": "t_81", "project_id": "p_7", "due": "2026-10-02", "title": "buy some groceries", "done": False}]
+
+
+@mcp.tool
+def tasks_search(
+    query: str,
+    status: Literal["open", "done", "any"] = "open",
+    limit: int = 20,
+) -> ToolResult:
+    """Find tasks by words in the title. Each hit has id, project_id and due date,
+    which is enough for tasks_update and tasks_complete without another lookup.
+    Call tasks_get only for the full description or comments.
+    Does not search inside descriptions or comments.
+
+    Args:
+        query: Words from the task title, e.g. "groceries".
+        status: "open" by default; "any" also returns completed tasks.
+        limit: Rows to show, 1 to 50.
+    """
+    if not 1 <= limit <= 50:
+        raise ToolError(f"limit must be 1-50, got {limit}. Narrow the query instead.")
+    hits = [t for t in TASKS if query.lower() in t["title"]
+            and (status == "any" or t["done"] == (status == "done"))]
+    if not hits:
+        raise ToolError(f'No {status} tasks match "{query}". Try fewer words or status="any".')
+    head = f"Found {len(hits)} tasks."
+    if len(hits) > limit:
+        head += f" Showing first {limit}; add words to query to narrow."
+    rows = [f"{t['id']} | project {t['project_id']} | due {t['due'] or '-'} | {t['title']}"
+            for t in hits[:limit]]
+    return ToolResult(content="\n".join([head, *rows]))
+</script>
+<p>Ответ собран вручную через <code>ToolResult</code>: только поля для следующих вызовов, общее число и признак усечения. Диапазон <code>limit</code> проверяется в коде, а не через <code>Field(ge=1, le=50)</code>, потому что Pydantic превратит такие ограничения в <code>minimum</code> и <code>maximum</code>, а строгий режим Claude на них отвечает 400. Это важно, если твой харнесс передаёт схемы MCP-тулов в Claude API со <code>strict: true</code>. Ошибки типов FastMCP возвращает сам, с <code>isError</code> и текстом Pydantic вроде «Input should be 'open', 'done' or 'any'».</p>
+<div class="note practice"><p>Вызови каждый свой тул с тремя заведомо плохими аргументами: не тот тип, несуществующий объект, значение вне диапазона. Прочитай, что вернулось. Если хоть в одном ответе нет поля, ожидаемого формата и следующего шага, модель потратит на эту ошибку свои две-три попытки.</p></div>
+</section>
+
+<section id="cost">
+<h2>Сколько стоит каждый инструмент</h2>
+<p>Пять MCP-серверов — GitHub, Slack, Sentry, Grafana и Splunk — дают агенту 58 инструментов и около 55 тыс. токенов описаний ещё до первого сообщения пользователя. Это пример Anthropic из ноября 2025 года. На GitHub в нём приходится 35 тулов и около 26 тыс. токенов, на Slack 11 тулов и около 21 тыс. В одной из собственных конфигураций Anthropic описания занимали 134 тыс. токенов, пока их не оптимизировали<a class="cite" href="#src-13">13</a>. OpenAI в руководстве напоминает, откуда берётся цена: функции встраиваются в системное сообщение, занимают контекст и оплачиваются как входные токены<a class="cite" href="#src-7">7</a>.</p>
+<figure class="fig" id="fig-server-tokens">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Сколько стоят описания инструментов, пока ничего не вызвано", "unit": "тыс. токенов", "decimals": 1, "emphasis": ["README к CLI-скриптам"],
+ "rows": [["GitHub MCP, все наборы", 64.6, "101 тул, октябрь 2025"], ["GitHub MCP, наборы по умолчанию", 30.3, "52 тула"], ["GitHub в примере Anthropic", 26, "35 тулов"], ["Slack в примере Anthropic", 21, "11 тулов"], ["Chrome DevTools MCP", 18.0, "26 тулов"], ["Playwright MCP", 13.7, "21 тул"], ["README к CLI-скриптам", 0.225, "225 токенов, те же задачи браузера"]],
+ "note": "Данные GitHub (discussion #1182), Anthropic (ноябрь 2025) и Марио Цехнера (ноябрь 2025). Замеры разными токенизаторами."}
+</script>
+<figcaption>Цена в покое. Каждая строка — токены, которые уходят в каждый запрос, даже если ни один тул не будет вызван. Нижняя строка — README к CLI-скриптам, который агент читает, только когда ему нужен браузер.</figcaption>
+</figure>
+<p>Марио Цехнер в ноябре 2025 года посчитал то же для двух популярных браузерных серверов<a class="cite" href="#src-26">26</a>. Playwright MCP — 21 тул и 13,7 тыс. токенов, 6,8% контекста Claude. Chrome DevTools MCP — 26 тулов и 18 тыс. токенов, 9%. Для своего набора CLI-скриптов, закрывающих те же задачи, он написал README на 225 токенов, и агент читает его только тогда, когда браузер действительно нужен.</p>
+
+<h3>Сколько тулов — слишком много</h3>
+<p>Токены — не вся цена. Вторая статья расхода — точность выбора, и здесь все хотят одно число. Его нет. У каждого источника свой порог и свои условия:</p>
+<table class="wide">
+<thead><tr><th>Источник</th><th>Что сказано или измерено</th><th>Условия</th></tr></thead>
+<tbody>
+<tr><th>Документация Claude</th><td>точность выбора «degrades once you exceed 30–50 available tools»<a class="cite" href="#src-27">27</a>; другая страница той же документации советует включать поиск инструментов уже с 20 тулов<a class="cite" href="#src-28">28</a></td><td>формулировки вендора, без описания замера</td></tr>
+<tr><th>Руководство OpenAI</th><td>«fewer than 20 functions available at the start of a turn», и сразу оговорка «just a soft suggestion»<a class="cite" href="#src-7">7</a></td><td>рекомендация, не замер</td></tr>
+<tr><th>Документация Gemini</th><td>«Keep active set to 10-20 tools maximum»<a class="cite" href="#src-17">17</a></td><td>рекомендация, не замер</td></tr>
+<tr><th>AlphaSignal, июль 2026</th><td>Haiku 4.5: 91% правильного выбора при 10 тулах и 87% при 15. Sonnet 4 держит 90% и выше до 20 тулов, к 30 падает ниже 90%<a class="cite" href="#src-29">29</a></td><td>данные одной компании: по 200 реальных ходов на каждое число тулов, наблюдение, а не эксперимент</td></tr>
+<tr><th>IBM Research, апрель 2025</th><td>от −1 до −8% точности, когда к набору добавляют родственные функции: в среднем 5,6 вместо 2,7<a class="cite" href="#src-30">30</a></td><td>подмножество BFCL, 200 случаев, модели 2024–2025 годов</td></tr>
+</tbody>
+</table>
+<figure class="fig" id="fig-ibm">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Насколько падает точность, когда к набору добавляют похожие функции", "subtitle": "Разница в точности вызова (AST) между исходным и расширенным набором", "unit": "п.п.", "decimals": 1, "emphasis": ["Claude-3.5-Sonnet", "Claude-3.5-Haiku"],
+ "rows": [["Granite3.1-8B", 7.5, "94,5 → 87,0"], ["Claude-3.5-Haiku", 5.5, "92,5 → 87,0"], ["gpt4o-mini", 5.5, "92,5 → 87,0"], ["Llama3.1-70B", 4.0, "96,5 → 92,5"], ["Llama3.3-70B", 4.0, "94,5 → 90,5"], ["Claude-3.5-Sonnet", 2.5, "91,5 → 89,0"], ["o1-mini", 2.0, "90,5 → 88,5"], ["DeepSeek-V2.5", 1.5, "96,5 → 95,0"], ["Qwen2.5-72B", 1.0, "97,5 → 96,5"]],
+ "note": "Rabinovich, Anaby-Tavor (IBM Research), arXiv:2504.00914, таблица 2. Набор растёт в среднем с 2,7 до 5,6 родственных функций."}
+</script>
+<figcaption>Добавили в набор три похожие функции, и маленькие модели теряют до 7,5 пункта точности. Сильные модели теряют меньше, но у всех девяти точность падает.</figcaption>
+</figure>
+<p>У чисел IBM есть оговорка, которая относится ко всем замерам на BFCL. Работа о случайной выборке из реестра MCP нашла, что 68,8% исходных строк BFCL — точные повторы пары «имя плюс описание»<a class="cite" href="#src-15">15</a>. Бенчмарк мерит выбор среди тулов, которые мало похожи на настоящие серверы, поэтому переносить его цифры на свой сервер напрямую нельзя.</p>
+<div class="note key"><p>Универсального порога нет. Все источники сходятся только в направлении: точность начинает проседать раньше, чем кажется, и сильнее у маленьких моделей. OpenAI советует: «Evaluate your performance with different numbers of functions». Если в контексте больше пары десятков тулов, проверь выбор на своих задачах или откладывай загрузку.</p></div>
+
+<h3>Инструменты и кеш</h3>
+<p>Определения инструментов стоят в самом начале запроса, раньше системного промпта, и входят в кешируемый префикс. Документация Claude описывает последствие так: «The <code>tools</code> array sits even earlier in the hashed request prefix than the top-level <code>system</code> field, so editing it invalidates the prompt cache for the entire conversation»<a class="cite" href="#src-31">31</a>. Смена <code>tool_choice</code> тоже сбрасывает кешированные блоки сообщений<a class="cite" href="#src-2">2</a>.</p>
+<figure class="fig wide" id="fig-cache">
+<svg class="diagram" viewBox="0 0 760 270" role="img" aria-label="Какие изменения сбрасывают кеш префикса запроса">
+  <text class="t-sub" x="20" y="24">Порядок частей в кешируемом префиксе запроса</text>
+  <rect class="box--accent" x="20" y="36" width="240" height="56" rx="6"/>
+  <text class="t-title" x="140" y="60" text-anchor="middle">tools</text>
+  <text class="t-sub" x="140" y="80" text-anchor="middle">определения всех тулов</text>
+  <rect class="box--soft" x="260" y="36" width="160" height="56" rx="6"/>
+  <text class="t-title" x="340" y="60" text-anchor="middle">system</text>
+  <text class="t-sub" x="340" y="80" text-anchor="middle">твой промпт</text>
+  <rect class="box" x="420" y="36" width="320" height="56" rx="6"/>
+  <text class="t-title" x="580" y="60" text-anchor="middle">messages</text>
+  <text class="t-sub" x="580" y="80" text-anchor="middle">история разговора</text>
+  <text class="t-red" x="20" y="128">Правка массива tools: кеш всего разговора сброшен</text>
+  <rect class="fill-red" x="20" y="138" width="720" height="10" rx="3"/>
+  <text class="t-red" x="20" y="178">Смена tool_choice: сброшены кешированные блоки сообщений</text>
+  <rect class="fill-red" x="420" y="188" width="320" height="10" rx="3"/>
+  <text class="t-green" x="20" y="228">tool_addition или раскрытый отложенный тул: дописываются в конец, префикс цел</text>
+  <rect class="box--ghost" x="20" y="238" width="652" height="10" rx="3"/>
+  <rect class="fill-green" x="680" y="238" width="60" height="10" rx="3"/>
+</svg>
+<figcaption>Красная полоса — часть запроса, которую после изменения придётся пересчитать без кеша. Правка <code>tools</code> стоит дороже всего, потому что стоит раньше всего. Отложенная загрузка и <code>tool_addition</code> добавляют инструменты в конец и не трогают префикс.</figcaption>
+</figure>
+<p>Поэтому набор инструментов внутри сессии не меняют правкой массива <code>tools</code>, даже если очень хочется показать модели на каждом шаге только нужные. Для этого есть отложенная загрузка и добавление тулов системным сообщением. У OpenAI это делает <code>allowed_tools</code> в <code>tool_choice</code>: массив тулов прежний, модели разрешено подмножество, и всё ради кеша<a class="cite" href="#src-7">7</a>.</p>
+<p>То же касается MCP-серверов. Ревизия 2026-07-28 требует от сервера отдавать тулы в детерминированном порядке, потому что это «improves LLM prompt cache hit rates when tools are included in model context», а в ответ <code>tools/list</code> добавила поля <code>ttlMs</code> и <code>cacheScope</code><a class="cite" href="#src-11">11</a>. Если твой сервер собирает список тулов из множества или из автоматически найденных плагинов, порядок может меняться между перезапусками, и каждый перезапуск будет стоить промаха кеша у всех клиентов.</p>
+<div class="note practice"><p>Запусти Claude Code с <code>ENABLE_TOOL_SEARCH=false</code>, набери <code>/context</code> и посмотри, сколько занимают твои MCP-серверы, когда их описания грузятся целиком. Это та цена, которую платит любой клиент без отложенной загрузки.</p></div>
+<p>У Anthropic есть страница, которая сводит механизмы экономии по тому, куда уходят токены, и задаёт порядок их внедрения для нагруженного агента<a class="cite" href="#src-28">28</a>. Строки таблицы идут в этом порядке. Механизмы не конфликтуют, их включают вместе.</p>
+<table class="wide">
+<thead><tr><th>Механизм</th><th>Что сокращает</th><th>Когда включать</th><th>Где подробнее</th></tr></thead>
+<tbody>
+<tr><th>1. Кеширование промпта</th><td>цену повторяющихся определений тулов, но не их объём</td><td>с первого дня; запись в кеш на 25% дороже обычного входа и окупается со второго запроса</td><td><a href="../02-context-engineering/index.html">глава 2</a></td></tr>
+<tr><th>2. Поиск инструментов</th><td>определения, загруженные заранее</td><td>когда тулов больше примерно 20 или базовый расход контекста стал заметен</td><td><a href="#tool-search">следующий раздел</a></td></tr>
+<tr><th>3. Context editing</th><td>старые <code>tool_result</code> в истории</td><td>когда разговоры так длинны, что ранние результаты больше не нужны</td><td><a href="../02-context-engineering/index.html">глава 2</a></td></tr>
+<tr><th>4. Programmatic tool calling</th><td>круги <code>tool_use</code> и <code>tool_result</code></td><td>когда в логах повторяются цепочки мелких вызовов</td><td><a href="#code-mode">раздел о коде вместо вызовов</a></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="tool-search">
+<h2>Инструменты, которых модель пока не видит</h2>
+<p>Так выглядит запрос с отложенной загрузкой в анонсе Anthropic от 24 ноября 2025 года<a class="cite" href="#src-13">13</a>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Отложенный тул, пример из анонса Anthropic" data-hl="3,8">
+{
+  "tools": [
+    {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+    {
+      "name": "github.createPullRequest",
+      "description": "Create a pull request",
+      "input_schema": {"...": "..."},
+      "defer_loading": true
+    }
+  ]
+}
+</script>
+<p>В массив <code>tools</code> по-прежнему уходят все определения. Но те, что помечены <code>defer_loading: true</code>, в системный промпт не попадают вовсе. Модель видит только инструмент поиска и неотложенные тулы. Когда ей что-то нужно, она ищет: вариант regex принимает шаблон Python <code>re.search</code> до 200 символов, вариант BM25 — запрос на естественном языке до 500 символов<a class="cite" href="#src-27">27</a>. Поиск идёт по именам, описаниям, именам аргументов и их описаниям. API возвращает блоки <code>tool_reference</code>, по умолчанию пять, и сам раскрывает их в полные определения прямо в истории разговора. Префикс запроса при этом не меняется, и кеш остаётся целым.</p>
+<figure class="fig wide" id="fig-tool-search">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant App as Приложение
+  participant API as Claude API
+  participant M as Модель
+  App->>API: tools, у большинства defer_loading true
+  API->>M: префикс только с поиском и горячими тулами
+  M->>API: tool_search_tool_regex, шаблон github.*pull
+  API->>API: поиск по именам, описаниям и аргументам
+  API->>M: пять tool_reference, раскрыты в истории
+  M->>App: tool_use github.createPullRequest
+  App-->>M: tool_result
+  Note over API,M: префикс не менялся, кеш цел
+</script>
+<figcaption>Отложенная загрузка в Claude API. Полное определение найденного тула появляется в истории, а не в начале запроса, поэтому кешированный префикс не пересчитывается.</figcaption>
+</figure>
+<p>С 17 февраля 2026 года поиск инструментов работает без beta-заголовка<a class="cite" href="#src-20">20</a>. Типы <code>tool_search_tool_regex_20251119</code> и <code>tool_search_tool_bm25_20251119</code> поддерживаются начиная с Haiku 4.5, Sonnet 4.5 и Opus 4.5. На запрос можно отложить до 10 тыс. инструментов, но хотя бы один должен остаться неотложенным. Отложенный тул не может нести <code>cache_control</code>: API вернёт 400<a class="cite" href="#src-27">27</a>. Если встроенный поиск не устраивает, можно написать свой тул поиска и возвращать из него те же блоки <code>tool_reference</code>. Anthropic советует оставлять неотложенными три-пять самых частых инструментов<a class="cite" href="#src-13">13</a>.</p>
+<p>Цифры из того же анонса. В конфигурации на 50 с лишним MCP-тулов одни описания занимали около 72 тыс. токенов, а весь контекст до начала работы — около 77 тыс. С поиском расход упал до 8,7 тыс., из них 500 на сам тул поиска. На внутренних MCP-оценках точность Opus 4 выросла с 49 до 74%, Opus 4.5 — с 79,5 до 88,1%<a class="cite" href="#src-13">13</a>. Это внутренние замеры вендора, и Opus 4 на Claude API, кроме Google Cloud, уже выведен из эксплуатации<a class="cite" href="#src-3">3</a>. Независимое подтверждение есть в работе RAG-MCP (май 2025): отбор описаний поиском до вызова модели поднял точность выбора с 13,62 до 43,13% и сократил промпт больше чем вдвое<a class="cite" href="#src-32">32</a>. Когда тулов много, поиск улучшает и цену, и выбор.</p>
+<p>У поиска есть цена: лишний круг «найти, потом вызвать» на каждый новый тул. Anthropic сама пишет, что он мало что даёт, когда тулов меньше десяти, когда все они нужны в каждой сессии или когда описания уже компактные<a class="cite" href="#src-13">13</a>. На Hacker News в день анонса это сформулировали резче<a class="cite" href="#src-33">33</a>:</p>
+<div class="note field">
+  <blockquote>Good context engineering leaves the tools you will need so adding a search if you are going to use all of them is just more overhead.
+    <footer>— jmward01, <a href="https://news.ycombinator.com/item?id=46039238">Hacker News, 24 ноября 2025</a></footer></blockquote>
+  <p>Хороший отбор тулов лучше поиска, который каждый раз заново находит одно и то же. Поиск нужен там, где набор большой, а в каждой сессии используется малая его часть.</p>
+</div>
+
+<h3>У OpenAI отложенный тул виден наполовину</h3>
+<p>OpenAI добавила в Responses API свой <code>{"type": "tool_search"}</code>, он работает с <code>gpt-5.4</code> и новее<a class="cite" href="#src-34">34</a>. Слово то же, механика другая. Для отдельной отложенной функции модель по-прежнему видит имя и описание, и документация это признаёт: «in practice tool search is mostly deferring the parameter schema». Целиком прячется только неймспейс или MCP-сервер, от которого наверху остаются имя и описание. Найденные тулы OpenAI добавляет в конец контекста. Есть два режима: hosted, где поиск выполняет сама платформа, и client-executed, где его выполняет твоё приложение. Второй нужен, когда набор доступных тулов зависит от арендатора или от состояния в рантайме.</p>
+<figure class="fig" id="fig-search-vendors">
+<div class="versus">
+  <div data-tone="accent"><h4>Claude: defer_loading</h4><ul><li>отложенного тула в префиксе нет совсем</li><li>поиск по именам, описаниям и аргументам</li><li>найденное раскрывается в истории</li><li>regex, BM25 или свой поиск</li></ul></div>
+  <div data-tone="violet"><h4>OpenAI: tool_search</h4><ul><li>у функции видны имя и описание, откладывается схема</li><li>неймспейс или MCP-сервер виден только своим описанием</li><li>найденное дописывается в конец контекста</li><li>hosted или client-executed</li></ul></div>
+</div>
+<figcaption>Одинаковое название, разная экономия. У OpenAI откладывание отдельных функций экономит в основном схемы, а заметный выигрыш дают неймспейсы. У Claude отложенный тул не стоит ничего, пока его не нашли.</figcaption>
+</figure>
+<p>Из этой разницы следуют разные правила для описаний. У OpenAI описание неймспейса отвечает за то, найдёт ли модель нужную группу, а описание функции — за то, правильно ли она её вызовет. Поэтому руководство советует писать подробности в описание функции, а описание неймспейса держать коротким<a class="cite" href="#src-7">7</a>. В документации по поиску есть и число: меньше десяти функций на неймспейс<a class="cite" href="#src-34">34</a>. У Claude поиск идёт по тексту определения, поэтому имя и первые слова описания работают как ключевые слова для поиска.</p>
+
+<h3>В Claude Code поиск уже включён</h3>
+<p>Если ты подключаешь MCP-серверы к Claude Code, отложенная загрузка у тебя уже работает: по умолчанию все MCP-тулы откладываются и находятся по запросу<a class="cite" href="#src-12">12</a>. Поведение задаёт переменная <code>ENABLE_TOOL_SEARCH</code>. Без значения тулы откладываются. <code>auto</code> откладывает их, только когда описания занимают 10% окна контекста или больше, а <code>auto:N</code> задаёт свой процент. <code>false</code> грузит всё сразу. Есть важное исключение: если <code>ANTHROPIC_BASE_URL</code> указывает на сторонний хост, Claude Code поиск выключает, «since most proxies don't forward <code>tool_reference</code> blocks». Если ты ходишь в модель через корпоративный прокси, все описания всех серверов снова едут в каждый запрос. Явное <code>ENABLE_TOOL_SEARCH=true</code> вернёт поиск, но запросы начнут падать, если прокси не пропускает <code>tool_reference</code>.</p>
+<p>Для автора сервера здесь два рычага. Флаг <code>alwaysLoad: true</code> в конфигурации сервера или <code>"anthropic/alwaysLoad": true</code> в <code>_meta</code> отдельного тула грузит его сразу, без поиска. Это для пары инструментов, которые нужны на каждом ходу. Второй рычаг — инструкции сервера. С поиском они становятся полезнее: документация Claude Code советует писать в них, какие задачи закрывает сервер и когда стоит искать его тулы.</p>
+
+<h3>Менять набор посреди разговора</h3>
+<p>Последнее изменение в этой области — бета с заголовком <code>inline-tools-2026-09-15</code><a class="cite" href="#src-31">31</a>. Инструменты можно добавлять и убирать блоками внутри системного сообщения посреди разговора, не трогая массив <code>tools</code> и не сбрасывая кеш:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Убрать тул посреди разговора, пример из документации Claude">
+{
+  "role": "system",
+  "content": [
+    {
+      "type": "tool_removal",
+      "tool": {"type": "tool_reference", "name": "get_weather"}
+    }
+  ]
+}
+</script>
+<p>Блок <code>tool_addition</code> работает в обратную сторону: он либо показывает тул, объявленный с <code>defer_loading: true</code>, либо приносит полное определение прямо в сообщении. Для автора тулов это способ открывать их по стадиям задачи: инструменты деплоя появляются только после того, как тесты прошли. Заголовок беты уже менялся, в июльских заметках о релизе он назывался <code>mid-conversation-tool-changes-2026-07-01</code><a class="cite" href="#src-20">20</a>, так что сверяйся с текущей страницей. Как эти блоки ложатся в историю сообщений, разобрано в <a href="../01-llm-api-agent-loop/index.html">главе 1</a>.</p>
+</section>
+
+<section id="code-mode">
+<h2>Код вместо вызовов</h2>
+<p>Кентон Варда и Сунил Пай из Cloudflare в сентябре 2025 года объяснили, почему модель пишет код лучше, чем вызывает инструменты по одному<a class="cite" href="#src-35">35</a>. Вызову тула модель учится на небольшом синтетическом наборе примеров, а код она видела из миллионов настоящих проектов. Их сравнение: «Making an LLM perform tasks with tool calling is like putting Shakespeare through a month-long class in Mandarin and then asking him to write a play in it». Предложение Cloudflare получило название Code Mode. MCP-тулы превращаются в TypeScript API, модель пишет против него код, а код выполняется в изолированной песочнице.</p>
+<p>Через полтора месяца Anthropic описала тот же ход в статье «Code execution with MCP»<a class="cite" href="#src-36">36</a>. Тулы лежат файлами вида <code>./servers/google-drive/getDocument.ts</code>, агент листает каталог, читает нужные файлы и импортирует функции. Задача из статьи — перенести стенограмму встречи из Google Drive в запись Salesforce:</p>
+<script type="text/plain" class="code" data-lang="typescript" data-title="Код, который пишет агент, пример Anthropic">
+import * as gdrive from './servers/google-drive';
+import * as salesforce from './servers/salesforce';
+
+const transcript = (await gdrive.getDocument({ documentId: 'abc123' })).content;
+await salesforce.updateRecord({
+  objectType: 'SalesMeeting',
+  recordId: '00Q5f000001abcXYZ',
+  data: { Notes: transcript }
+});
+</script>
+<p>При обычных вызовах стенограмма прошла бы через контекст модели дважды: ответом первого тула и аргументом второго. Здесь она идёт из переменной в переменную и в контекст модели не попадает. Для двухчасовой встречи Anthropic оценивает разницу в 50 тыс. токенов. Из статьи чаще цитируют другое число, 150 тыс. токенов против 2 тыс., минус 98,7%, но это не замер, а иллюстрация к соседнему приёму: агент листает каталог серверов и грузит только нужные описания<a class="cite" href="#src-36">36</a>. В той же статье есть приём с персональными данными: MCP-клиент заменяет email и телефоны на метки вроде <code>[EMAIL_1]</code> ещё до того, как данные попадут в контекст модели, а настоящие значения подставляет обратно только при передаче в следующий тул.</p>
+
+<h3>Programmatic tool calling в Claude API</h3>
+<p>В Claude API этот подход сделан функцией платформы, она называется <dfn>programmatic tool calling</dfn>, PTC. На сентябрь 2026 года она общедоступна, и запрос выглядит так<a class="cite" href="#src-37">37</a>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="PTC, актуальная форма запроса из документации Claude" data-hl="3,19">
+"tools": [
+    {
+        "type": "code_execution_20260120",
+        "name": "code_execution"
+    },
+    {
+        "name": "query_database",
+        "description": "Execute a SQL query against the sales database. Returns a list of rows as JSON objects.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "SQL query to execute"
+                }
+            },
+            "required": ["sql"]
+        },
+        "allowed_callers": ["code_execution_20260120"]
+    }
+]
+</script>
+<div class="note warn" data-label="Устарело"><p>Во многих статьях и даже в анонсе ноября 2025 года PTC включают через <code>code_execution_20250825</code> и beta-заголовок <code>advanced-tool-use-2025-11-20</code>. Сейчас версия <code>20250825</code> числится устаревшей и PTC не поддерживает, минимальная версия — <code>code_execution_20260120</code> (подходит и <code>20260521</code>), а заголовок не нужен с 17 февраля 2026 года<a class="cite" href="#src-20">20</a>.</p></div>
+<p>Модель пишет Python и отправляет его в песочницу. Каждый вызов тула изнутри кода приходит в твоё приложение обычным блоком <code>tool_use</code>, но с полем <code>caller</code>, по которому видно, что его сделал код. Ты выполняешь тул и возвращаешь <code>tool_result</code>. Результат попадает в переменную скрипта, а в контекст модели в итоге приходит только то, что скрипт напечатал.</p>
+<figure class="fig wide" id="fig-ptc">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant M as Модель
+  participant S as Песочница
+  participant API as Claude API
+  participant App as Приложение
+  M->>S: Python-скрипт в code_execution
+  S->>API: скрипт вызывает get_expenses
+  API->>App: tool_use с полем caller, скрипт на паузе
+  App->>API: tool_result, сотни строк расходов
+  API->>S: результат в переменную скрипта
+  Note over S,App: так для каждого из 20 вызовов
+  S->>S: фильтрует и суммирует
+  S-->>M: только stdout, около 1 КБ
+</script>
+<figcaption>Programmatic tool calling. Двадцать вызовов и 200 КБ промежуточных данных проходят мимо контекста модели, до неё доходит только итог скрипта.</figcaption>
+</figure>
+<p>Anthropic показывает PTC на задаче «кто из инженеров превысил бюджет на командировки в третьем квартале»<a class="cite" href="#src-13">13</a>. Модель пишет такой скрипт; <code>await</code> на верхнем уровне допустим, потому что его исполняет песочница, а не обычный <code>python</code>:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Скрипт, который Claude пишет для PTC, пример Anthropic" data-hl="3,5">
+team = await get_team_members("engineering")
+levels = list(set(m["level"] for m in team))
+budget_results = await asyncio.gather(*[get_budget_by_level(level) for level in levels])
+budgets = {level: budget for level, budget in zip(levels, budget_results)}
+expenses = await asyncio.gather(*[get_expenses(m["id"], "Q3") for m in team])
+exceeded = []
+for member, exp in zip(team, expenses):
+    budget = budgets[member["level"]]
+    total = sum(e["amount"] for e in exp)
+    if total > budget["travel_limit"]:
+        exceeded.append({"name": member["name"], "spent": total, "limit": budget["travel_limit"]})
+print(json.dumps(exceeded))
+</script>
+<p>Около 200 КБ строк расходов остаются в песочнице, модель получает примерно 1 КБ и обходится без 19 с лишним промежуточных проходов. На сложных исследовательских задачах PTC сократил расход с 43 588 до 27 297 токенов, на 37%. Точность на внутреннем тесте поиска знаний выросла с 25,6 до 28,5%, на GAIA — с 46,5 до 51,2% (в статье написано «GIA», но ссылка ведёт на GAIA, arXiv:2311.12983). Все цифры — внутренние замеры Anthropic.</p>
+<p>Ограничений у PTC много, и они влияют на то, как проектировать тулы<a class="cite" href="#src-37">37</a>. Тул, который можно звать из кода, не может быть <code>strict</code>. <code>tool_choice</code> не умеет принудить модель к программному вызову. Флаг <code>disable_parallel_tool_use</code> с PTC несовместим. Схема с рекурсивным <code>$ref</code> даёт 400 с текстом «Circular $ref detected». Тулы MCP-коннектора и наборы computer/browser из кода не вызываются. Если твой ответ на вызов не пришёл примерно за 4 минуты, в скрипте падает <code>TimeoutError ... no response after 270s</code>. PTC нет на Bedrock и Google Cloud, он не подпадает под нулевое хранение данных и не работает на Haiku 4.5. И важное про безопасность: <code>allowed_callers</code> — подсказка, а не граница. Документация просит не полагаться на неё как на защиту.</p>
+<p>Практических правил из этого два. Документация советует выбирать для тула либо <code>["direct"]</code>, либо <code>["code_execution_20260120"]</code>, а не оба сразу. Тул только для кода отдаёт JSON, который удобно разбирать программе, как <code>query_database</code> выше. Тул для прямого вызова отдаёт текст, который удобно читать модели. Если нужны и строгая схема, и вызов из кода, это два разных тула.</p>
+
+<h3>Сервер из двух инструментов</h3>
+<p>Cloudflare в феврале 2026 года перенесла Code Mode на сторону сервера<a class="cite" href="#src-38">38</a>. Её MCP-сервер для всего API Cloudflare, это больше 2500 эндпоинтов, отдаёт ровно два инструмента. <code>search</code> описан как «Search the Cloudflare OpenAPI spec. All $refs are pre-resolved inline», <code>execute</code> — как «Execute JavaScript code against the Cloudflare API». Модель пишет JavaScript сначала для поиска по спецификации, потом для вызовов. Описания всех эндпоинтов обычными тулами заняли бы 1,17 млн токенов, два тула занимают около тысячи, на 99,9% меньше. Код выполняется в изоляте V8 без файловой системы и переменных окружения, внешние запросы по умолчанию запрещены. Клиенту для этого не нужна своя песочница.</p>
+
+<h3>Что на самом деле значат 99%</h3>
+<p>Все эти проценты измеряют разное, и ни один из них не равен экономии денег. Независимый отчёт agent-swarm за июль 2026 года как раз об этом<a class="cite" href="#src-39">39</a>. Авторы перевели свои агенты на code mode, за 30 дней набралось около 150 скриптов и 25 тыс. запусков. Заголовок обещает сокращение стоимости на 99,2%, а внутри сказано честно: «99.2% is the reduction in bytes put in front of the model for this one data-gathering step ... It is not the change in our bill». Прогон целиком стал короче, примерно с пяти минут до одной-двух, а стоимость прогона упала примерно вдвое.</p>
+<figure class="fig" id="fig-reductions">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Что измеряют проценты экономии от code mode", "unit": "%", "decimals": 1, "max": 100, "emphasis": ["agent-swarm: стоимость прогона"],
+ "rows": [["Cloudflare: описания всего API", 99.9, "1,17 млн → около 1 тыс. токенов"], ["agent-swarm: байты одного шага", 99.2, "только сбор данных"], ["Anthropic: описания по требованию", 98.7, "150 000 → 2 000 токенов, иллюстрация, не замер"], ["agent-swarm: стоимость прогона", 50, "«примерно вдвое», весь ежедневный прогон"], ["Anthropic PTC: исследовательские задачи", 37, "43 588 → 27 297 токенов"]],
+ "note": "Cloudflare (февраль 2026), agent-swarm (июль 2026), Anthropic (ноябрь 2025). Кроме строки про стоимость, все значения — сокращение объёма, а не денег."}
+</script>
+<figcaption>Верхние три строки — сокращение объёма на одном шаге или в описаниях. Когда считают стоимость всего прогона, эффект остаётся заметным, но это уже примерно половина, а не 99%.</figcaption>
+</figure>
+<p>Похожую картину получил и сам вендор. В феврале 2026 года Anthropic выпустила dynamic filtering для веб-поиска и веб-фетча (<code>web_search_20260209</code>, <code>web_fetch_20260209</code>): Claude пишет код, который отбрасывает лишнее из результатов до того, как они попадут в контекст. На двух бенчмарках качество выросло в среднем на 11%, входных токенов стало на 24% меньше, а стоимость в пересчёте на цены упала у Sonnet 4.6 и выросла у Opus 4.6<a class="cite" href="#src-40">40</a>. Объяснение там же: цена зависит от того, сколько кода модели пришлось написать.</p>
+<p>Есть и более неприятные данные. В тестах Stainless из раздела об усечении именно агент на Code Mode-сервере молча недосчитал платежи<a class="cite" href="#src-21">21</a>. Код, который отфильтровал данные неправильно, модель не видит, она видит только итог. Второе возражение появилось на Hacker News в день анонса PTC<a class="cite" href="#src-33">33</a>:</p>
+<div class="note field">
+  <blockquote>If something goes wrong halfway through the code execution of multiple 'tools' using Programmatic Tool Calling, it's significantly more complex for the AI model to fix that code and try again compared to a single tool usage - you're in trouble, especially if APIs/tools are not idempotent.
+    <footer>— olliem36, <a href="https://news.ycombinator.com/item?id=46044877">Hacker News, 25 ноября 2025</a></footer></blockquote>
+  <p>Если скрипт упал на двенадцатом из двадцати вызовов, первые одиннадцать уже выполнены. Для чтения это не страшно, для записи нужна идемпотентность, см. <a href="#side-effects">раздел о побочных эффектах</a>.</p>
+</div>
+<p>Третье возражение — безопасность. Когда модель пишет код, промпт-инъекция становится способом запустить чужой код. В августе 2026 года Check Point Research показала на Black Hat цепочку от инъекции до выхода из песочницы в workerd, рантайме, на котором работает Code Mode<a class="cite" href="#src-41">41</a>. Модель под влиянием инъекции писала код, который через пять ошибок памяти и авторизации (среди них use-after-free в <code>node:zlib</code> и обход авторизатора SQL) добирался до чужих секретов и выполнения нативного кода. Управляемые Workers Cloudflare исправила, для самостоятельной установки нужен workerd не ниже v1.20260619.1. Подробнее о песочницах — в <a href="../16-security/index.html">главе 16</a>.</p>
+<div class="note key"><p>Code mode и PTC окупаются, когда задача состоит из многих вызовов, промежуточные результаты которых модели читать не нужно: агрегаты, соединения, фильтрация больших выборок. Если каждый шаг требует суждения модели, обычные вызовы проще отлаживать. В обоих случаях инструменты с записью должны переживать повтор, а песочница — считаться частью поверхности атаки.</p></div>
+</section>
+
+<section id="bash-cli">
+<h2>Bash, CLI или MCP</h2>
+<p>В январе 2025 года Claude 3.5 Sonnet набрал 49% на SWE-bench Verified с «a simple prompt and two general purpose tools»<a class="cite" href="#src-10">10</a>. Один из двух инструментов — bash. Через него агенту доступна любая утилита на машине, и описывать каждую в контексте не нужно: про <code>git</code>, <code>psql</code> и <code>uv</code> модель знает из обучения, а про остальное прочитает <code>--help</code>. В Claude Code так же: <code>gh</code> или <code>kubectl</code>, установленные у тебя, модель получает бесплатно, без единого токена описаний в каждом запросе.</p>
+<p>Марио Цехнер довёл эту идею до предела в своём агенте Pi, о котором написал в ноябре 2025 года<a class="cite" href="#src-42">42</a>. Инструментов по умолчанию четыре: read, write, edit и bash. «pi's system prompt and tool definitions together come in below 1000 tokens». MCP Pi не поддерживает и поддерживать не будет. Для тех, кому нужен конкретный MCP-сервер, Цехнер советует mcporter Питера Штайнбергера, который превращает MCP-сервер в CLI.</p>
+<p>Самый полезный замер в этом споре Цехнер сделал ещё в августе 2025 года<a class="cite" href="#src-43">43</a>. Три задачи: отладка в LLDB, работа в Python REPL и анализ проекта в TUI OpenCode. Четыре способа управлять терминалом: его собственный terminalcp в виде MCP-сервера, тот же terminalcp в виде CLI, tmux и screen. По десять прогонов на каждую пару, каждый раз свежий экземпляр Claude Code, всего 120 прогонов. Результат: «Both terminalcp MCP and CLI versions achieved 100% success rates. The MCP version was 23% faster (51m vs 66m) and 2.5% cheaper ($19.45 vs $19.95)». Screen провалил анализ проекта полностью, и его общая доля успеха упала до 67%. На простых задачах tmux обходился на 10–22% дешевле terminalcp, на сложной terminalcp был на 39% дешевле tmux за счёт более чистого вывода.</p>
+<p>Протокол на успех почти не повлиял, повлиял дизайн. Сервер terminalcp отвечает простым текстом, а не JSON. Вместо инструмента на каждую команду у него один тул <code>terminalcp</code> с параметром действия. Вывод отдаётся последними N строками, а у потокового режима есть <code>since_last</code> и вырезание ANSI-последовательностей. Вывод Цехнера: «The problem with many MCPs isn't the protocol - it's that they're badly designed wrappers». И совет оттуда же: если пишешь инструмент с нуля, а шелл у пользователей уже есть, «just make a good CLI», а MCP-сервер поверх хорошего CLI добавить несложно.</p>
+<p>У CLI есть свои проблемы, и Армин Ронахер перечислил их в статье «Your MCP Doesn't Need 30 Tools: It Needs Code»<a class="cite" href="#src-44">44</a>. Утилиты бывают «platform-dependent, version-dependent, and at times undocumented». Sonnet и Opus не всегда понимают, как передать в аргументах шелла перевод строки или управляющий символ. Хуже всего многошаговые сессии: управляя LLDB через tmux, агент терял состояние сессии, однажды переименовал её посередине работы и забыл, что она у него вообще была. Ронахер предложил другой крайний вариант — MCP-сервер с одним инструментом, интерпретатором Python с <code>eval()</code> и сохранением состояния. Первая отладка у него заняла около 45 секунд и семь вызовов. Скрипт, который агент из неё выгрузил, при повторном запуске отработал за один вызов и меньше чем за 5 секунд, и запустить его можно было уже без MCP.</p>
+<div class="note field">
+  <blockquote>My mantra is: just use CLI tools. Or maybe "CLI tools are all you need"?
+    <footer>— redhale, <a href="https://news.ycombinator.com/item?id=45822258">Hacker News, 5 ноября 2025</a></footer></blockquote>
+  <p>В том же треде<a class="cite" href="#src-45">45</a> redhale пишет, что официальный CLI Atlassian работает надёжнее официального MCP-сервера Atlassian. Ему возражает beoberha: MCP-сервер — «a one stop shop for discovering „tools“», а с голым CLI агенту сначала надо узнать, что утилита существует, и установить её.</p>
+</div>
+<p>Через год, в сентябре 2026 года, тред «Ask HN: Who is using MCP in production?» набрал около двухсот комментариев, и расклад в нём стал заметно чётче<a class="cite" href="#src-46">46</a>. Многие разработчики, у которых есть шелл, пишут, что ушли на CLI. «I find clis or calling apis directly to be waaay cheaper and faster», — пишет mrubon. sonofaragorn описывает путь от Jira MCP через Jira-skill к <code>acli</code>. 5ersi пользуется <code>gh</code> вместо MCP-сервера GitHub, но у него на работе есть свой MCP для поиска по логам и метрикам «across five different (legacy) systems», который находит связанные события в разных системах за минуты. Aldipower держит на MCP пользовательский продукт, которым пользуются из чатов ChatGPT, Claude, Grok, Perplexity и Mistral, где шелла нет вовсе. erikus описывает, как вернулся к MCP: «I don't want to give the agent a shell, and a narrower MCP interface is a great fit».</p>
+<p>Cloudflare, сравнивая подходы, сформулировала цену шелла без эмоций: агенту нужен шелл, «which not every environment provides and which introduces a much broader attack surface than a sandboxed isolate»<a class="cite" href="#src-38">38</a>.</p>
+<figure class="fig" id="fig-cli-decision">
+<script type="text/x-mermaid">
+flowchart TD
+  shell{"у агента есть шелл?"}
+  shell -- "нет, это чат-хост" --> mcp["MCP-сервер<br/>с немногими крупными тулами"]:::accent
+  shell -- "да" --> trust{"шеллу можно доверять<br/>в этом окружении?"}
+  trust -- "нет" --> mcp
+  trust -- "да" --> agg{"нужно сводить данные<br/>из нескольких систем?"}
+  agg -- "да" --> mcp
+  agg -- "нет" --> cli["CLI с внятным --help<br/>и коротким README"]:::ok
+  cli -- "позже понадобился<br/>хост без шелла" --> wrap["тонкий MCP<br/>поверх того же CLI"]:::violet
+</script>
+<figcaption>Выбор формы инструмента. CLI — вариант по умолчанию там, где у агента есть доверенный шелл. MCP нужен там, где шелла нет, где шелл давать нельзя, или где сервер делает работу, которой нет ни в одной отдельной утилите.</figcaption>
+</figure>
+<div class="note debate"><p>Спор CLI против MCP обычно ведут как спор о протоколе, а замер Цехнера показывает, что протокол почти ни на что не влияет: оба варианта terminalcp дали 100%. На качество влияет то, как спроектирован инструмент. Для внутренних задач своего бэкенда (миграции, фичефлаги, админские операции), которые ты делаешь из Claude Code, напиши CLI. Нужен понятный <code>--help</code>, компактный текстовый вывод, флаг для JSON и ошибки по правилам этой главы. Опиши его в <code>CLAUDE.md</code> или в skill (о них <a href="../06-skills/index.html">глава 6</a>). MCP-сервер добавляй, когда инструментом будут пользоваться из хоста без шелла, когда нужны отдельные права и аудит или когда сервер сводит несколько систем. Этот совет перестанет работать, если твоего агента запускают в окружении, где шелл — недопустимый риск, и тогда MCP с узким набором тулов становится единственным вариантом.</p></div>
+</section>
+
+<section id="side-effects">
+<h2>Побочные эффекты: подтверждение, повтор, параллельность</h2>
+<p>Тул с записью может выполниться дважды, даже если модель ни в чём не ошиблась. Повторов бывает три вида. Модель, получив ошибку о неверном вызове, исправляет его и повторяет 2–3 раза<a class="cite" href="#src-22">22</a>. Скрипт PTC, не дождавшись твоего ответа за 270 секунд, получает <code>TimeoutError</code><a class="cite" href="#src-37">37</a>, и модель может запустить его снова, хотя первый вызов у тебя на сервере, возможно, ещё выполняется. Наконец, харнесс или сетевой клиент сами переотправляют запрос после обрыва соединения. Для чтения всё это безобидно. Для <code>send_payment</code> или <code>create_ticket</code> это двойное списание и два одинаковых тикета.</p>
+<p>Решение давно известно из платёжных API. У Stripe сервер сохраняет код и тело ответа на первый запрос с данным ключом идемпотентности, «regardless of whether it succeeds or fails», и на повтор с тем же ключом отдаёт сохранённое<a class="cite" href="#src-47">47</a>. Ключ длиной до 255 символов, хранится не меньше 24 часов. Если повтор пришёл с тем же ключом, но другими параметрами, Stripe возвращает ошибку, а не выполняет новую операцию.</p>
+<p>Для инструментов агента правило переносится с одной поправкой. Ни один из прочитанных для главы документов вендоров LLM не предписывает этого явно, так что дальше — вывод, собранный из семантики Stripe и из того, как устроены повторы. Ключ по <code>tool_use_id</code> спасает только от переотправки харнессом. Модель при повторе и скрипт при перезапуске создают новый вызов с новым ID. Надёжнее разбить запись на два шага. Первый тул готовит операцию и возвращает хэндл, например <code>prepare_payment</code> → <code>pi_42</code>. Второй подтверждает её по хэндлу, и повторное подтверждение возвращает сохранённый результат.</p>
+<figure class="fig wide" id="fig-idempotency">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant M as Модель
+  participant H as Харнесс
+  participant T as confirm_payment
+  participant K as Хранилище ключей
+  M->>H: confirm_payment(pi_42)
+  H->>T: вызов
+  T->>K: ключа pi_42 нет, списываем
+  T->>K: сохранить ответ для pi_42
+  T--xH: ответ потерян по таймауту
+  H-->>M: ошибка таймаута
+  M->>H: повтор confirm_payment(pi_42)
+  H->>T: вызов
+  T->>K: ответ для pi_42 уже есть
+  T-->>H: сохранённый ответ, второго списания нет
+  H-->>M: платёж pi_42 проведён
+</script>
+<figcaption>Повтор после потерянного ответа. Ключом служит хэндл подготовленной операции, а не ID вызова, поэтому повтор модели находит сохранённый результат и деньги не списываются второй раз.</figcaption>
+</figure>
+
+<h3>Аннотации ничего не гарантируют</h3>
+<p>В MCP у инструмента есть четыре аннотации поведения<a class="cite" href="#src-48">48</a>. <code>readOnlyHint</code> говорит, что тул ничего не меняет, по умолчанию <code>false</code>. <code>destructiveHint</code> — что изменения могут быть разрушительными, по умолчанию <code>true</code>. <code>idempotentHint</code> — что повтор с теми же аргументами ничего не добавит, по умолчанию <code>false</code>. <code>openWorldHint</code> — что тул работает с внешним миром, как веб-поиск, по умолчанию <code>true</code>. Умолчания рассчитаны на худший случай: тул без аннотаций аккуратный клиент считает разрушительным и неидемпотентным. В комментарии к схеме сказано: «Clients should never make tool use decisions based on ToolAnnotations received from untrusted servers». Спецификация к тому же советует клиенту спрашивать подтверждение на чувствительных операциях и показывать пользователю аргументы до вызова<a class="cite" href="#src-11">11</a>. В случайной выборке из реестра 58,8% инструментов аннотаций не несут вовсе<a class="cite" href="#src-15">15</a>. На своём сервере их заполняй, хост может опереться на них в интерфейсе подтверждений, но на аннотациях чужого сервера безопасность не строй.</p>
+
+<h3>Где спросить человека</h3>
+<p>Подтверждение за последний год стало частью API в нескольких стеках. В Claude Code сервер может пометить инструмент так, что разрешение будут спрашивать при каждом вызове<a class="cite" href="#src-12">12</a>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Тул, который всегда требует одобрения, пример из документации Claude Code" data-hl="4-6">
+{
+  "name": "grant_access",
+  "description": "Requests access to a protected resource",
+  "_meta": {
+    "anthropic/requiresUserInteraction": true
+  }
+}
+</script>
+<p>Флаг работает с версии 2.1.199. Запрос появляется даже в режимах <code>acceptEdits</code>, <code>auto</code> и <code>bypassPermissions</code>, правила разрешений его не пропускают, а в режиме <code>dontAsk</code> вызов просто отклоняется. В OpenAI Agents SDK то же задаётся на стороне приложения, причём правило может зависеть от аргументов<a class="cite" href="#src-49">49</a>:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="needs_approval в OpenAI Agents SDK, пример из документации" data-hl="1,6,10">
+@tool(needs_approval=True)
+async def cancel_order(order_id: int) -> str:
+    return f"Cancelled order {order_id}"
+
+
+async def requires_review(_ctx, params, _call_id) -> bool:
+    return "refund" in params.get("subject", "").lower()
+
+
+@tool(needs_approval=requires_review)
+async def send_email(subject: str, body: str) -> str:
+    return f"Sent '{subject}'"
+</script>
+<p>Прогон с таким вызовом останавливается и отдаёт <code>ToolApprovalItem</code> в <code>result.interruptions</code>, а продолжить его можно через <code>approve</code> или <code>reject</code> на <code>RunState</code>. Правило-функция «fail closed»: если SDK не смог безопасно разобрать аргументы, вызов считается требующим одобрения. Для MCP-серверов в том же SDK есть <code>require_approval</code> у <code>MCPServerStdio</code> и <code>MCPServerStreamableHttp</code> и <code>tool_config={"require_approval": "always"}</code> у <code>HostedMCPTool</code><a class="cite" href="#src-49">49</a>.</p>
+<p>Сервер MCP может спросить человека и сам, посреди вызова: в ревизии 2026-07-28 он возвращает результат с <code>resultType: "input_required"</code> и запросом <code>elicitation/create</code> внутри поля <code>inputRequests</code>. Отдельного запроса клиенту сервер не шлёт: клиент повторяет вызов с ответом пользователя в <code>inputResponses</code><a class="cite" href="#src-11">11</a>. Механика разобрана в <a href="../05-mcp/index.html">главе 5</a>. В Claude Managed Agents с 10 сентября 2026 года есть политика разрешений <code>auto</code>: сервер сам оценивает каждый вызов тула агента или MCP и выполняет его, отклоняет или ставит на паузу до твоего решения<a class="cite" href="#src-20">20</a>. Разрушительные тулы без такого шлюза Digital Applied ставит первыми в своём рейтинге анти-паттернов и советует режим <code>dry_run</code>, журнал аудита и упоминание одобрения прямо в описании инструмента<a class="cite" href="#src-9">9</a>.</p>
+
+<h3>Несколько вызовов за один ход</h3>
+<p>Claude может вернуть несколько блоков <code>tool_use</code> в одном ответе. На каждый нужно вернуть свой <code>tool_result</code>, все в следующем сообщении пользователя, и блоки результатов идут раньше любого текста<a class="cite" href="#src-22">22</a>. В каком порядке и с каким параллелизмом выполнять вызовы, решает твой код, и решение зависит от побочных эффектов: чтение можно пустить через <code>asyncio.gather</code>, записи в один и тот же ресурс — по очереди. Если параллелизм мешает совсем, у OpenAI есть <code>parallel_tool_calls: false</code>, тогда модель вызывает не больше одной функции<a class="cite" href="#src-7">7</a>. У Claude есть флаг <code>disable_parallel_tool_use</code> внутри <code>tool_choice</code>, но с PTC он несовместим<a class="cite" href="#src-37">37</a>.</p>
+<p>Если ты решил какой-то вызов из пачки не выполнять, например шёл по очереди и предыдущий упал, результат на него всё равно нужен, с <code>is_error: true</code> и короткой причиной<a class="cite" href="#src-50">50</a>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Невыполненный вызов из пачки, пример из документации Claude">
+{
+  "type": "tool_result",
+  "tool_use_id": "toolu_02",
+  "is_error": true,
+  "content": "Not executed: the preceding write_file call failed."
+}
+</script>
+<p>Сколько вызовов модель сложит в одну пачку, промпт определяет не меньше, чем флаги. Для системного промпта у Claude есть готовый блок <code>&lt;use_parallel_tool_calls&gt;</code>, и документация отдельно предупреждает, что Fable 5.1 в длинных агентных циклах делает меньше параллельных вызовов, чем прежние модели<a class="cite" href="#src-50">50</a>. Обратная беда, зависимые вызовы в одной пачке, лечится фразой «Only batch tool calls that are independent of each other». Надёжнее всего, когда тул сам переносит параллельный вызов: идемпотентная запись по хэндлу не боится ни повтора, ни соседа.</p>
+</section>
+
+<section id="iterate">
+<h2>Описания правят по транскриптам</h2>
+<p>Строя многоагентную исследовательскую систему в 2025 году, Anthropic завела отдельного агента-тестировщика инструментов<a class="cite" href="#src-51">51</a>. Ему давали MCP-тул с изъяном. Агент пытался им пользоваться, а потом переписывал описание так, чтобы обойти сбои. «By testing the tool dozens of times, this agent found key nuances and bugs». С новым описанием последующие агенты решали задачи на 40% быстрее. Авторы предупреждают: «Bad tool descriptions can send agents down completely wrong paths».</p>
+<p>В «Writing effective tools for agents» этот приём развёрнут в полный цикл<a class="cite" href="#src-5">5</a>. Anthropic пишет, что большая часть советов из статьи получена именно так: они раз за разом улучшали свои внутренние тулы Slack и Asana с помощью Claude Code. На отложенной выборке задач результат оказался лучше тулов, которые вручную написали их же исследователи.</p>
+<ol class="steps">
+  <li><b>Собери прототип и потрогай его руками.</b> Оберни тулы в локальный MCP-сервер и подключи к Claude Code командой <code>claude mcp add &lt;name&gt; &lt;command&gt; [args...]</code>. Если у API есть <code>llms.txt</code>, дай его Claude Code, когда он пишет тулы.</li>
+  <li><b>Напиши задачи, похожие на настоящие.</b> Сильная задача из статьи: «Customer ID 9182 reported that they were charged three times for a single purchase attempt. Find all relevant log entries and determine if any other customers were affected by the same issue». Слабая: «Search the payment logs for <code>purchase_complete</code> and <code>customer_id=9182</code>». Слабая уже назвала модели, что искать, и тестирует только парсер аргументов.</li>
+  <li><b>Прогони простым циклом.</b> Цикл <code>while</code>, в котором вызовы модели чередуются с вызовами тулов, по одному на задачу. В системном промпте попроси модель писать рассуждение и отзыв перед вызовами или включи interleaved thinking. Отдельный пустой тул <code>think</code> из руководств 2025 года Anthropic теперь в большинстве случаев советует заменять extended thinking<a class="cite" href="#src-52">52</a>. Считай точность, время вызовов, их число, токены и ошибки.</li>
+  <li><b>Прочитай транскрипты целиком.</b> Много повторных вызовов обычно значит, что надо поправить пагинацию и лимиты. Много ошибок в параметрах значит, что описаниям не хватает ясности или примеров. Смотри и на то, о чём модель промолчала: «what agents omit in their feedback and responses can often be more important than what they include».</li>
+  <li><b>Отдай транскрипты Claude Code.</b> Склей их и попроси переписать описания, схемы и ответы тулов. Проверяй результат на отложенных задачах, которых в цикле не было, иначе описания подгонятся под обучающие задачи.</li>
+</ol>
+<p>Что ещё считать, подсказывает раздел об описаниях. После дополнения описаний в исследовании «запахов» доля успеха выросла, а число шагов увеличилось на две трети<a class="cite" href="#src-14">14</a>. Если после правки ты смотришь только на долю решённых задач, такую регрессию не заметишь. В первом разделе оба сервера решали 90% задач, а пятикратная разница нашлась во входных токенах<a class="cite" href="#src-1">1</a>.</p>
+<div class="note practice"><p>План на вечер. Выпиши десять задач так, как их сформулировал бы пользователь, без имён тулов, и для каждой — проверяемый результат. Напиши цикл на Anthropic SDK с твоими тулами и лимитом шагов, который пишет каждый <code>tool_use</code> и <code>tool_result</code> в JSONL. Прогони каждую задачу три раза: прогоны недетерминированы, и для агента, которым пользуются люди, важна доля задач, прошедших все три раза (метрика pass^k). Посчитай успех, шаги, токены, ошибки по тулам и повторяющиеся пары вызовов. Провальные транскрипты отдай Claude Code с просьбой переписать описания и ответы, затем проверь на трёх-четырёх новых задачах. Методика оценок — грейдеры, наборы из реальных ошибок, гейты в CI — разобрана в <a href="../17-evals/index.html">главе 17</a>.</p></div>
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>У MCP-A описания инструментов втрое длиннее, чем у MCP-B, а входных токенов на те же 40 задач ушло впятеро меньше. Как так?</summary><p>Описания лежат в запросе один раз, а результаты вызовов копятся в истории и уходят в модель на каждом следующем шаге. MCP-B отдавал сырой JSON и не возвращал <code>project_id</code>, поэтому каждый поиск тянул за собой лишний вызов и лишний круг цикла.</p></details>
+<details><summary>Агент извлекал данные через <code>tool_choice: {"type": "tool", "name": "extract"}</code>. Что случится при переходе на Claude Opus 5.5 и как это переписать?</summary><p>Запрос вернёт 400: на Opus 5.5, Sonnet 5.5, Fable 5.1 и Mythos 5.1 принудительный выбор тула не поддерживается. Нужен <code>auto</code> со <code>strict: true</code> на тулах или structured outputs, если нужен ответ фиксированной формы, а указание, когда вызывать тул, переезжает в описание и системный промпт.</p></details>
+<details><summary>Ты добавил в строгую схему Claude <code>"minimum": 1</code> для поля количества. Что произойдёт и как сделать правильно?</summary><p>Строгий режим Claude не поддерживает числовые ограничения, и неподдерживаемая конструкция даёт 400 с описанием проблемы, тихого отката нет. Ограничение убирают из схемы, проверяют значение на сервере и на нарушение отвечают ошибкой выполнения с понятным текстом.</p></details>
+<details><summary>Почему неверный формат даты в MCP 2026-07-28 возвращают результатом с <code>isError: true</code>, а не ошибкой JSON-RPC <code>-32602</code>?</summary><p>Ошибки выполнения клиенту следует передавать модели, чтобы она исправила вызов, а протокольные ошибки он показывать не обязан. С ревизии 2025-11-25 ошибки валидации входа явно отнесены к ошибкам выполнения, а <code>-32602</code> остался для неизвестного тула и запросов, не проходящих схему <code>CallToolRequest</code>.</p></details>
+<details><summary>На тридцатом ходу длинной сессии ты дописал в массив <code>tools</code> новый инструмент. Что стало с кешем и как можно было иначе?</summary><p><code>tools</code> стоит в самом начале хешируемого префикса, поэтому его правка сбрасывает кеш всего разговора. Иначе можно было объявить тул заранее с <code>defer_loading: true</code> и дать модели найти его поиском или добавить его блоком <code>tool_addition</code> в системном сообщении (бета). В обоих случаях определение появляется в конце, а префикс не меняется.</p></details>
+<details><summary>Почему <code>defer_loading</code> на отдельной функции у OpenAI экономит меньше, чем у Claude?</summary><p>У OpenAI модель по-прежнему видит имя и описание отложенной функции, откладывается в основном схема параметров. Целиком прячутся только неймспейс или MCP-сервер. У Claude отложенного тула в префиксе нет совсем, пока поиск его не нашёл.</p></details>
+<details><summary>У коллеги, который работает через корпоративный прокси, контекст Claude Code забит описаниями MCP-тулов, а у тебя нет. Почему?</summary><p>Claude Code выключает поиск инструментов, когда <code>ANTHROPIC_BASE_URL</code> указывает на сторонний хост, потому что большинство прокси не пропускают блоки <code>tool_reference</code>. Все MCP-тулы тогда грузятся целиком. Явное <code>ENABLE_TOOL_SEARCH=true</code> включит поиск, но запросы упадут, если прокси эти блоки действительно режет.</p></details>
+<details><summary>Code mode сократил объём данных на шаге сбора на 99,2%. Почему счёт за прогон упадёт не на 99%?</summary><p>Процент относится к одному шагу и к байтам, которые видит модель. Остальные шаги, генерация кода, выходные токены и повторы никуда не делись. В отчёте agent-swarm, где получились эти 99,2%, стоимость всего прогона упала примерно вдвое.</p></details>
+<details><summary>В <code>send_payment</code> ключ идемпотентности равен <code>tool_use_id</code>. От какого повтора это защищает, а от какого нет?</summary><p>Защищает от переотправки того же вызова харнессом или сетевым клиентом. Не защищает от повтора модели после таймаута и от перезапуска скрипта PTC, потому что там появляется новый вызов с новым ID. Для них нужен ключ из самой операции, например хэндл, который вернул тул подготовки платежа.</p></details>
+<details><summary>Сторонний MCP-сервер пометил тул <code>readOnlyHint: true</code>. Можно ли вызывать его без подтверждения?</summary><p>Нельзя: это подсказки, и спецификация требует считать их недоверенными, если не доверен сам сервер. Описания тоже не проверены, в одном исследовании описание расходилось с кодом в 9,93% пар. Подтверждение решается по доверию к серверу.</p></details>
+<details><summary>Почему задача для оценки «Search the payment logs for <code>purchase_complete</code> and <code>customer_id=9182</code>» слабая?</summary><p>Она уже назвала модели, что искать и с какими аргументами, поэтому проверяет только разбор параметров. Выбор тула, последовательность вызовов и работа с неоднозначностью в ней не участвуют. Сильная задача описывает проблему пользователя и оставляет всё это модели.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу для своего тула перечислить вызовы, которые обычно идут после него, и вернуть в ответе поля, нужные этим вызовам</li>
+  <li>Писал описание, где есть назначение, когда тул не вызывать, смысл параметров и то, чего тул не возвращает, и всё важное стоит в первых 2048 символах</li>
+  <li>Нашёл в логах повторяющуюся цепочку вызовов и заменил её одним инструментом под задачу</li>
+  <li>Включал <code>strict</code> на своих тулах: убрал из схемы для Claude <code>minimum</code>, <code>maxLength</code> и другие неподдерживаемые ограничения и перенёс эти проверки в код тула</li>
+  <li>Переводил код с принудительного <code>tool_choice</code> на <code>auto</code> со строгими тулами</li>
+  <li>Возвращаю ошибки валидации результатом с <code>isError: true</code>, где названы поле, формат, пример и следующий шаг</li>
+  <li>Делаю усечённый ответ с общим числом, признаком усечения, агрегатом и готовыми следующими вызовами</li>
+  <li>Посчитал, сколько токенов стоят описания моих MCP-серверов без отложенной загрузки</li>
+  <li>Настраивал <code>defer_loading</code> с поиском инструментов и могу объяснить, почему правка <code>tools</code> посреди сессии сбрасывает кеш</li>
+  <li>Собирал запрос с PTC на <code>code_execution_20260120</code> и <code>allowed_callers</code> и знаю, с чем он несовместим</li>
+  <li>Выбрал между CLI и MCP-сервером для конкретного внутреннего инструмента своего бэкенда и записал, по какому признаку</li>
+  <li>Делал запись идемпотентной через хэндл подготовленной операции и проверил повтор после потерянного ответа</li>
+  <li>Прогонял свои тулы на десятке реалистичных задач и переписывал описания по транскриптам, сверяя и успех, и число шагов</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://news.ycombinator.com/item?id=48407391">Bad MCP design costs your agent 5x more tokens</a>. JohnnyZhang483, Hacker News, 5 июня 2026.</li>
+  <li id="src-2"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools">Define tools</a>. Claude Platform Docs, живая страница, по состоянию на 30 сентября 2026.</li>
+  <li id="src-3"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Tool use with Claude</a> (раздел Pricing). Claude Platform Docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-4"><a href="https://www.anthropic.com/engineering/building-effective-agents">Building effective agents</a> (Appendix 2, «Prompt engineering your tools»). Erik S., Barry Zhang, Anthropic, 19 декабря 2024.</li>
+  <li id="src-5"><a href="https://www.anthropic.com/engineering/writing-tools-for-agents">Writing effective tools for agents — with agents</a>. Ken Aizawa и др., Anthropic, 11 сентября 2025.</li>
+  <li id="src-6"><a href="https://arxiv.org/abs/2507.16044">From REST to MCP: An Empirical Study of API Wrapping and Automated Server Generation for LLM Agents</a>. Mastouri, Ksontini, Barrak, Kessentini, arXiv:2507.16044, 21 июля 2025, ревизия v4 от 6 апреля 2026.</li>
+  <li id="src-7"><a href="https://developers.openai.com/api/docs/guides/function-calling">Function calling</a>. OpenAI API docs, живая страница, по состоянию на 30 сентября 2026.</li>
+  <li id="src-8"><a href="https://github.com/github/github-mcp-server/discussions/1182">Improving GitHub MCP Server Performance and Resource Consumption: Introducing default toolsets</a>. tonytrg, github/github-mcp-server, Discussion #1182, 6 октября 2025.</li>
+  <li id="src-9"><a href="https://www.digitalapplied.com/blog/mcp-server-anti-patterns-design-mistakes-2026-developer-guide">MCP Server Anti-Patterns: Design Mistakes 2026 Guide</a>. Digital Applied, 6 мая 2026.</li>
+  <li id="src-10"><a href="https://www.anthropic.com/engineering/swe-bench-sonnet">Raising the bar on SWE-bench Verified with Claude 3.5 Sonnet</a>. Anthropic, 6 января 2025.</li>
+  <li id="src-11"><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/tools">Model Context Protocol Specification: Tools</a>, ревизия 2026-07-28.</li>
+  <li id="src-12"><a href="https://code.claude.com/docs/en/mcp">Connect Claude Code to tools via MCP</a>. Claude Code Docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-13"><a href="https://www.anthropic.com/engineering/advanced-tool-use">Introducing advanced tool use on the Claude Developer Platform</a>. Anthropic, 24 ноября 2025.</li>
+  <li id="src-14"><a href="https://arxiv.org/abs/2602.14878">Model Context Protocol (MCP) Tool Descriptions Are Smelly! Towards Improving AI Agent Efficiency with Augmented MCP Tool Descriptions</a>. Hasan, Li, Rajbahadur, Adams, arXiv:2602.14878, 16 февраля 2026, ревизия v3 от 31 мая 2026.</li>
+  <li id="src-15"><a href="https://arxiv.org/abs/2609.10962">What a Random Draw from the MCP Registry Contains, and What Tool-Use Benchmarks Contain Instead</a>. Haseeb Mohammed Afsar, arXiv:2609.10962, 10 сентября 2026.</li>
+  <li id="src-16"><a href="https://arxiv.org/abs/2606.04769">Description-Code Inconsistency in Real-world MCP Servers: Measurement, Detection, and Security Implications</a>. Shi, Zhang, Zhang, Shen и др., arXiv:2606.04769, 3 июня 2026.</li>
+  <li id="src-17"><a href="https://ai.google.dev/gemini-api/docs/function-calling">Function calling with the Gemini API</a>. Google AI for Developers, по состоянию на 30 сентября 2026.</li>
+  <li id="src-18"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/strict-tool-use">Strict tool use</a>. Claude Platform Docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-19"><a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs">Structured outputs</a> (разделы о поддержке JSON Schema и лимитах сложности). Claude Platform Docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-20"><a href="https://platform.claude.com/docs/en/release-notes/overview">Claude Platform release notes</a>. Записи с 14 ноября 2025 по 28 сентября 2026.</li>
+  <li id="src-21"><a href="https://www.stainless.com/blog/sdk-code-mode">SDK code mode shows SotA accuracy and performance for agents using APIs</a>. Stainless, 2 марта 2026.</li>
+  <li id="src-22"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls">Handle tool calls</a>. Claude Platform Docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-23"><a href="https://modelcontextprotocol.io/specification/2025-11-25/changelog">Model Context Protocol Specification: Key Changes</a>, ревизия 2025-11-25.</li>
+  <li id="src-24"><a href="https://www.anthropic.com/engineering/claude-code-auto-mode">How we built Claude Code auto mode: a safer way to skip permissions</a>. Anthropic, 25 марта 2026.</li>
+  <li id="src-25"><a href="https://gofastmcp.com/servers/tools">Tools</a>. Документация FastMCP 4, по состоянию на 30 сентября 2026.</li>
+  <li id="src-26"><a href="https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/">What if you don't need MCP at all?</a> Mario Zechner, 2 ноября 2025.</li>
+  <li id="src-27"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool">Tool search tool</a>. Claude Platform Docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-28"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/manage-tool-context">Manage tool context</a>. Claude Platform Docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-29"><a href="https://alphasignalai.substack.com/p/why-your-mcp-server-picks-the-wrong">Why Your MCP Server Picks the Wrong Tool, and the Five Patterns That Fix It</a>. AlphaSignal AI, 7 июля 2026, разбор работы Carson Rodrigues и Oysturn Vas.</li>
+  <li id="src-30"><a href="https://arxiv.org/abs/2504.00914">On the Robustness of Agentic Function Calling</a>. Ella Rabinovich, Ateret Anaby-Tavor (IBM Research), arXiv:2504.00914, 1 апреля 2025.</li>
+  <li id="src-31"><a href="https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages">Mid-conversation system messages</a>. Claude Platform Docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-32"><a href="https://arxiv.org/abs/2505.03275">RAG-MCP: Mitigating Prompt Bloat in LLM Tool Selection via Retrieval-Augmented Generation</a>. Tiantian Gan, Qiyao Sun, arXiv:2505.03275, 6 мая 2025.</li>
+  <li id="src-33"><a href="https://news.ycombinator.com/item?id=46038047">Claude Advanced Tool Use</a>. Обсуждение на Hacker News, 24–27 ноября 2025, 673 балла.</li>
+  <li id="src-34"><a href="https://developers.openai.com/api/docs/guides/tools-tool-search">Tool search</a>. OpenAI API docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-35"><a href="https://blog.cloudflare.com/code-mode/">Code Mode: the better way to use MCP</a>. Kenton Varda, Sunil Pai, Cloudflare, 26 сентября 2025.</li>
+  <li id="src-36"><a href="https://www.anthropic.com/engineering/code-execution-with-mcp">Code execution with MCP: Building more efficient agents</a>. Adam Jones, Conor Kelly, Anthropic, 4 ноября 2025.</li>
+  <li id="src-37"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling">Programmatic tool calling</a>. Claude Platform Docs (статус GA), по состоянию на 30 сентября 2026.</li>
+  <li id="src-38"><a href="https://blog.cloudflare.com/code-mode-mcp/">Code Mode: give agents an entire API in 1,000 tokens</a>. Matt Carey, Cloudflare, 20 февраля 2026.</li>
+  <li id="src-39"><a href="https://www.agent-swarm.dev/blog/code-mode-token-savings">Code mode yields a 99.2% cost reduction in our systems</a>. agent-swarm.dev, 8 июля 2026.</li>
+  <li id="src-40"><a href="https://claude.com/blog/improved-web-search-with-dynamic-filtering">Improved web search with dynamic filtering</a>. Claude Blog, Anthropic, 17 февраля 2026.</li>
+  <li id="src-41"><a href="https://research.checkpoint.com/2026/when-agentic-glue-melts/">When Agentic Glue Melts: Exploiting Cloudflare Code Mode and Workers</a>. Yarden Porat, Check Point Research, 7 августа 2026.</li>
+  <li id="src-42"><a href="https://mariozechner.at/posts/2025-11-30-pi-coding-agent/">What I learned building an opinionated and minimal coding agent</a>. Mario Zechner, 30 ноября 2025.</li>
+  <li id="src-43"><a href="https://mariozechner.at/posts/2025-08-15-mcp-vs-cli/">MCP vs CLI: Benchmarking Tools for Coding Agents</a>. Mario Zechner, 15 августа 2025.</li>
+  <li id="src-44"><a href="https://lucumr.pocoo.org/2025/8/18/code-mcps/">Your MCP Doesn't Need 30 Tools: It Needs Code</a>. Armin Ronacher, 18 августа 2025.</li>
+  <li id="src-45"><a href="https://news.ycombinator.com/item?id=45818300">Code execution with MCP: Building more efficient agents</a>. Обсуждение на Hacker News, 5 ноября 2025.</li>
+  <li id="src-46"><a href="https://news.ycombinator.com/item?id=49548600">Ask HN: Who is using MCP in production?</a> Hacker News, 3–4 сентября 2026, 198 баллов.</li>
+  <li id="src-47"><a href="https://docs.stripe.com/api/idempotent_requests">Idempotent requests</a>. Stripe API Reference, по состоянию на 30 сентября 2026.</li>
+  <li id="src-48"><a href="https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/schema/2026-07-28/schema.ts">MCP schema.ts</a> (интерфейс <code>ToolAnnotations</code>), ревизия 2026-07-28.</li>
+  <li id="src-49"><a href="https://github.com/openai/openai-agents-python/blob/main/docs/human_in_the_loop.md">Human-in-the-loop</a>. OpenAI Agents SDK (Python), документация в репозитории, по состоянию на 30 сентября 2026.</li>
+  <li id="src-50"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use">Parallel tool use</a>. Claude Platform Docs, по состоянию на 30 сентября 2026.</li>
+  <li id="src-51"><a href="https://www.anthropic.com/engineering/multi-agent-research-system">How we built our multi-agent research system</a>. Anthropic, 13 июня 2025.</li>
+  <li id="src-52"><a href="https://www.anthropic.com/engineering/claude-think-tool">The „think“ tool: Enabling Claude to stop and think</a>. Anthropic, 20 марта 2025, с пометкой «Extended thinking update» от 15 декабря 2025.</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>

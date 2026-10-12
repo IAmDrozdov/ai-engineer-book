@@ -1,0 +1,1323 @@
+<!doctype html>
+<html lang="ru" data-chapter="07">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A2A: Agent2Agent — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 7</b> из 17, часть «Протоколы»</p>
+  <h1>A2A: Agent2Agent</h1>
+  <p class="lead">Попроси агента по A2A собрать release notes из двух коммитов, и в ответ придёт не текст, а задача: идентификатор, <code>contextId</code> и состояние <code>TASK_STATE_INPUT_REQUIRED</code> с вопросом «Какую версию выпускаем?». Дальше разговор идёт о задаче с её собственным состоянием, и из этого решения растёт почти всё удобное и почти всё болезненное в протоколе. На конец сентября 2026 года спецификация стоит на версии 1.0.1, Python SDK скачивают около 10 млн раз в месяц против 219 млн у MCP, а часть крупных фреймворков по проводу всё ещё говорит на версии 0.3.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="task-not-call">
+<h2>Ответом приходит задача</h2>
+<p>Вот этот обмен целиком. Агент поднят на официальном Python SDK <code>a2a-sdk</code> 1.2.1, его код разобран <a href="#python">в разделе про свой агент</a>. Клиент отправляет JSON-RPC метод <code>SendMessage</code> с одним сообщением и заголовком версии протокола.</p>
+
+<div class="tabs">
+<section data-tab="Запрос">
+<script type="text/plain" class="code" data-lang="http" data-title="SendMessage, JSON-RPC (снято с живого сервера)">
+POST / HTTP/1.1
+Content-Type: application/json
+A2A-Version: 1.0
+
+{"jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+ "params": {"message": {
+   "messageId": "m-1", "role": "ROLE_USER",
+   "parts": [{"text": "fix: retry on 429\nfeat: add ListTasks"}]}}}
+</script>
+</section>
+<section data-tab="Ответ">
+<script type="text/plain" class="code" data-lang="json" data-title="Ответ (снят с живого сервера, повторные id сокращены)">
+{
+  "result": {
+    "task": {
+      "id": "54ea27e5-4930-410d-9de6-848db2b05dc5",
+      "contextId": "764aeafb-0089-4248-b981-000bc2d9ae73",
+      "status": {
+        "state": "TASK_STATE_INPUT_REQUIRED",
+        "message": {
+          "messageId": "82ac1893-dbe0-46fd-b5f5-2b751792a068",
+          "contextId": "764aeafb-…",
+          "taskId": "54ea27e5-…",
+          "role": "ROLE_AGENT",
+          "parts": [{"text": "Какую версию выпускаем? Пришли номер вида 1.4.0."}]
+        },
+        "timestamp": "2026-09-30T16:58:09.218333Z"
+      },
+      "history": [
+        {"messageId": "m-1", "contextId": "764aeafb-…", "taskId": "54ea27e5-…",
+         "role": "ROLE_USER",
+         "parts": [{"text": "fix: retry on 429\nfeat: add ListTasks"}]}
+      ]
+    }
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}
+</script>
+</section>
+</div>
+
+<p>Сервер завёл задачу, положил сообщение клиента в её историю, не нашёл в тексте номера версии и остановился. Вопрос лежит в <code>status.message</code>, состояние говорит, что задача ждёт ввода. Задача живёт на сервере: её можно запросить по <code>id</code>, на неё можно подписаться, в неё можно дописать ответ тем же <code>taskId</code>, и работа продолжится с того места, где встала.</p>
+
+<p>Сравни с тем, как ту же работу сделал бы MCP-сервер из <a href="../05-mcp/index.html">главы 5</a>. Он отдал бы клиенту инструмент <code>release_notes</code> с JSON Schema аргументов <code>commits</code> и <code>version</code>, твоя модель сама решила бы, когда его вызвать, и сама спросила бы у пользователя версию до вызова. Логика «чего не хватает и что спросить» жила бы в твоём цикле агента. В A2A она живёт на той стороне. Ты не видишь ни инструментов агента, ни его промпта, ни того, какая у него модель. Видишь карточку с навыками, описанными обычным языком, и обмениваешься с ним сообщениями.</p>
+
+<aside class="margin"><p><b>Opaque Execution</b> — так этот принцип назван в списке руководящих принципов спецификации.</p></aside>
+<p>Спецификация называет это непрозрачностью (<dfn>opacity</dfn>): агенты сотрудничают, «without needing to share their internal thoughts, plans, or tool implementations»<a class="cite" href="#src-1">1</a>. Отсюда обычная формула из документации проекта: MCP — вертикаль «агент → инструменты», A2A — горизонталь «агент ↔ агент»<a class="cite" href="#src-2">2</a>. Формула удобная, но на деле она о том, кто владеет циклом агента. MCP-сервер встраивается в чужой цикл агента как набор функций. A2A-агент держит свой цикл у себя и отдаёт наружу только результат и вопросы.</p>
+
+<figure class="fig" id="fig-opacity">
+<div class="versus">
+  <div data-tone="soft"><h4>MCP-сервер: что видит вызывающий</h4><ul><li>Имена и JSON Schema всех инструментов</li><li>Аргументы вызова формирует твоя модель</li><li>Ответ одного вызова, дальше решает твой цикл</li><li>Состояние между вызовами держишь ты</li></ul></div>
+  <div data-tone="accent"><h4>A2A-агент: что видит вызывающий</h4><ul><li>Карточку с навыками и примерами обычным языком</li><li>Сообщения и артефакты, но не промпт, не модель и не тулы</li><li>Задачу с <code>id</code> и состоянием, которую хранит агент</li><li>Вопросы агента посреди работы (<code>INPUT_REQUIRED</code>)</li></ul></div>
+</div>
+<figcaption>Граница проходит в разных местах. MCP-сервер отдаёт свои функции в чужой цикл агента, A2A-агент оставляет цикл у себя и наружу выдаёт только результат, статус и вопросы.</figcaption>
+</figure>
+
+<p>Зачем это нужно, видно по тому, кто сидит на той стороне. Когда агент принадлежит другой команде или другой компании, отдавать тебе свои инструменты он не станет: за ними ключи к их базам, их промпты и их деньги на модель. Ему проще принять задачу и отчитаться по ней. Когда оба агента твои и живут в одном процессе, как сабагенты в Claude Code, та же непрозрачность только мешает: ты теряешь видимость того, что происходит внутри, и получаешь сетевой протокол там, где хватило бы вызова функции. Про этот выбор подробно в <a href="../13-multi-agent/index.html">главе 13</a>, здесь важен механизм.</p>
+
+<h3>Четыре объекта и один идентификатор</h3>
+<p>Весь протокол крутится вокруг четырёх сущностей. <dfn>Message</dfn> — один ход разговора: роль (<code>ROLE_USER</code> или <code>ROLE_AGENT</code>) и список частей. <dfn>Task</dfn> описывает единицу работы с идентификатором, состоянием, историей сообщений и результатами. <dfn>Artifact</dfn> хранит результат задачи, тоже из частей. <dfn>Part</dfn> — лист дерева: текст, байты, ссылка на файл или структурированные данные. Нормативно всё это определено в Protocol Buffers, и вот как это выглядит в <code>a2a.proto</code><a class="cite" href="#src-3">3</a>:</p>
+
+<script type="text/plain" class="code" data-lang="text" data-title="specification/a2a.proto, v1.0.1 (выдержка)">
+message Part {
+  oneof content {
+    string text = 1;
+    bytes raw = 2;      // base64 in JSON
+    string url = 3;
+    google.protobuf.Value data = 4;
+  }
+  google.protobuf.Struct metadata = 5;
+  string filename = 6;
+  string media_type = 7;
+}
+
+message Message {
+  string message_id = 1 [(google.api.field_behavior) = REQUIRED];
+  string context_id = 2;
+  string task_id = 3;
+  Role role = 4 [(google.api.field_behavior) = REQUIRED];
+  repeated Part parts = 5 [(google.api.field_behavior) = REQUIRED];
+  google.protobuf.Struct metadata = 6;
+  repeated string extensions = 7;
+  repeated string reference_task_ids = 8;
+}
+</script>
+
+<p>Артефакт отделён от сообщения намеренно. Инженер из команды A2A объяснял это в треде запуска на Hacker News так: «A2A has 'Messages' and 'Artifacts' to distinguish between generated content and everything else (context, thoughts, user instructions, etc)»<a class="cite" href="#src-4">4</a>. Поэтому клиенту не нужно выковыривать результат из болтовни агента: release notes лежат в <code>artifacts</code>, а «Processing request…» и вопросы — в сообщениях и статусе.</p>
+
+<p>Пятая вещь — <code>contextId</code>. Он склеивает несколько задач и отдельных сообщений в один логический разговор. Сервер выдаёт его при первом контакте, клиент носит его дальше. Если клиент прислал только <code>taskId</code>, сервер выведет контекст из задачи<a class="cite" href="#src-3">3</a>. Если прислал оба и они не сходятся, Python SDK начиная с 1.2.0 отвечает ошибкой, а до этого молча принимал<a class="cite" href="#src-5">5</a>.</p>
+
+<figure class="fig" id="fig-objects">
+<script type="text/x-mermaid">
+flowchart TD
+  ctx["contextId 764a…"]:::accent
+  ctx --> t1["Task 54ea…<br/>INPUT_REQUIRED"]
+  ctx --> t2["Task 25f3…<br/>COMPLETED"]
+  ctx -.-> m0["Message без задачи"]:::mute
+  t1 --> st["status.message<br/>вопрос агента"]
+  t1 --> hist["history: Message[]"]
+  t2 --> art["artifacts: Artifact[]"]
+  hist --> parts["parts: Part[]"]
+  art --> parts
+  parts --> oneof["text | raw | url | data<br/>+ mediaType, filename"]:::ok
+  m3["новый Message<br/>referenceTaskIds"]:::violet -. ссылается .-> t2
+</script>
+<figcaption>Как вложены объекты. Контекст объединяет задачи и свободные сообщения, задача держит историю и артефакты, и там и там содержимое — список частей. Завершённую задачу не продолжают, на неё ссылаются из нового сообщения через <code>referenceTaskIds</code>.</figcaption>
+</figure>
+
+<h3>Сообщение или задача</h3>
+<p>Сервер вправе ответить на <code>SendMessage</code> двумя способами: сразу сообщением или задачей. Документ «Life of a Task» делит агентов на три типа<a class="cite" href="#src-2">2</a>. Агенты только с сообщениями — тонкие обёртки над моделью, которые всегда отвечают <code>Message</code> и держат лишь <code>contextId</code>. Агенты, которые на всё заводят задачу, даже на «привет»: контракт у них проще, но каждое взаимодействие оставляет в хранилище завершённый объект. И гибриды, которые договариваются сообщениями, а задачу заводят, когда появилась настоящая работа. Документация рекомендует гибрид, и с этим трудно спорить: клиенту так или иначе придётся понимать оба ответа.</p>
+
+<p>Серверу же лучше не смешивать. Python SDK с версии 1.0 требует, чтобы исполнитель агента выбрал ровно один сценарий на запрос: либо положить в очередь одно сообщение и остановиться, либо положить задачу и дальше только события её обновления. Смешаешь — клиент получит <code>InvalidAgentResponseError</code><a class="cite" href="#src-6">6</a>. Это правило не выдумка SDK: у потокового ответа спецификация тоже разрешает либо одно сообщение, либо поток событий задачи<a class="cite" href="#src-1">1</a>.</p>
+
+<div class="note key"><p>По A2A уходит работа. У неё есть идентификатор, состояние и хозяин на другой стороне, который сам решает, что спросить и когда закончить. Остальной протокол нужен, чтобы узнавать, что с этой работой происходит.</p></div>
+</section>
+
+<section id="lifecycle">
+<h2>Жизненный цикл задачи</h2>
+<p>Клиент ответил агенту «1.4.0» в ту же задачу, агент дописал release notes и перевёл задачу в <code>TASK_STATE_COMPLETED</code>. Если теперь отправить в неё ещё одно сообщение, придёт вот это:</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="SendMessage в завершённую задачу (снято с живого сервера)">
+{"error": {
+   "code": -32004,
+   "message": "Task 54ea27e5-4930-410d-9de6-848db2b05dc5 is in terminal state: 3",
+   "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+             "reason": "UNSUPPORTED_OPERATION",
+             "domain": "a2a-protocol.org", "metadata": {}}]},
+ "id": 3, "jsonrpc": "2.0"}
+</script>
+
+<p>Код <code>-32004</code> означает <code>UnsupportedOperationError</code>, а тройка в тексте — числовое значение <code>TASK_STATE_COMPLETED</code> в proto-перечислении, которое SDK вывел как есть. Завершённая задача неизменяема: спецификация требует отвергать любые сообщения в задачу в терминальном состоянии<a class="cite" href="#src-1">1</a>. Уточнение или вторая итерация — это новая задача в том же <code>contextId</code>, а связь со старой передаётся через <code>referenceTaskIds</code> в новом сообщении<a class="cite" href="#src-2">2</a>.</p>
+
+<p>Правило старое, а исполнение свежее. В Python SDK ответ <code>UnsupportedOperationError</code> на операции с терминальными задачами закрепили только в 1.2.0, вышедшей 29 сентября 2026 года<a class="cite" href="#src-5">5</a>. LangSmith Agent Server на ту же ситуацию отвечает тем же <code>-32004</code>, а на <code>taskId</code>, выданный другим агентом, — <code>-32001</code>, то есть «задача не найдена»<a class="cite" href="#src-7">7</a>. Если твой клиент ретраит отправку по сетевой ошибке, он должен различать эти два ответа: первый значит «задача уже закончилась, забери результат через <code>GetTask</code>», второй — «ты перепутал агента или контекст».</p>
+
+<figure class="fig wide" id="fig-lifecycle">
+<script type="text/x-mermaid">
+stateDiagram-v2
+  direction LR
+  [*] --> SUBMITTED
+  SUBMITTED --> WORKING
+  SUBMITTED --> REJECTED: отказ
+  WORKING --> INPUT_REQUIRED: нужен ввод
+  INPUT_REQUIRED --> WORKING: ответ клиента
+  WORKING --> AUTH_REQUIRED: нужны права
+  AUTH_REQUIRED --> WORKING: креды получены
+  WORKING --> COMPLETED
+  WORKING --> FAILED
+  WORKING --> CANCELED: CancelTask
+  INPUT_REQUIRED --> CANCELED: CancelTask
+  AUTH_REQUIRED --> CANCELED: CancelTask
+  WORKING --> REJECTED
+</script>
+<figcaption>Состояния задачи в версии 1.0 (на проводе все с префиксом <code>TASK_STATE_</code>). Четыре терминальных принимают только чтение. Два прерванных, <code>INPUT_REQUIRED</code> и <code>AUTH_REQUIRED</code>, ждут клиента: ответом служит сообщение с тем же <code>taskId</code> или креды, полученные вне протокола. Отменить можно любую нетерминальную задачу, и отмена вместо ответа на вопрос агента — обычный случай. Отказ возможен и при создании задачи, и позже.</figcaption>
+</figure>
+
+<p>Всего в перечислении девять значений. <code>TASK_STATE_UNSPECIFIED</code> с номером 0 — это proto-значение по умолчанию, и если ты увидел его в ответе, где-то по дороге потеряли поле. Остальные восемь делятся на три группы, и путать их дороже всего в клиентском коде. <code>SUBMITTED</code> и <code>WORKING</code> означают «жди». Прерванные <code>INPUT_REQUIRED</code> и <code>AUTH_REQUIRED</code> означают «твой ход»: агент ничего не сделает, пока ты не ответишь. Терминальные <code>COMPLETED</code>, <code>FAILED</code>, <code>CANCELED</code> и <code>REJECTED</code> означают «всё». Цикл опроса, который ждёт только терминальных состояний, на прерванной задаче будет ждать вечно. Официальный CLI делает правильно: <code>a2a task get --wait</code> опрашивает до терминального состояния, но возвращается раньше, если задача прервалась<a class="cite" href="#src-8">8</a>.</p>
+
+<h3>Блокирующий вызов и его цена</h3>
+<p>По умолчанию <code>SendMessage</code> блокирующий. В конфигурации запроса есть флаг <code>returnImmediately</code>, и пока он не выставлен, сервер обязан держать соединение, пока задача не придёт в терминальное или прерванное состояние, и вернуть её целиком, с артефактами<a class="cite" href="#src-1">1</a>. Для агента release notes это полсекунды. Для агента, который час гоняет тесты, это HTTP-запрос длиной в час, и его по дороге убьёт первый же балансировщик с таймаутом в 60 секунд.</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="Неблокирующий вызов и ответ (снято с живого сервера, сокращено)">
+{"jsonrpc": "2.0", "id": 10, "method": "SendMessage",
+ "params": {
+   "message": {"messageId": "m-10", "role": "ROLE_USER",
+               "parts": [{"text": "feat: a\nfeat: b\n…\nv3.1.0"}]},
+   "configuration": {"returnImmediately": true}}}
+
+← {"result": {"task": {"id": "311a1146-…", "contextId": "1aece9be-…",
+                       "status": {"state": "TASK_STATE_SUBMITTED"}, "history": ["…"]}}}
+</script>
+
+<p>С <code>returnImmediately</code> сервер отдаёт задачу сразу после создания, и дальше у клиента три пути: опрашивать <code>GetTask</code>, подписаться на поток или зарегистрировать вебхук. Какие из них доступны, говорит карточка агента: флаги <code>capabilities.streaming</code> и <code>capabilities.pushNotifications</code>. Вызвать недекларированную возможность нельзя, это ошибка по спецификации.</p>
+
+<p>Отмена в A2A — просьба, а не команда. <code>CancelTask</code> «attempts to cancel the specified task», и успех не гарантирован: задача могла уже закончиться, агент мог не уметь отменять на текущем шаге<a class="cite" href="#src-1">1</a>. В официальном примере helloworld метод <code>cancel</code> просто бросает <code>NotImplementedError</code><a class="cite" href="#src-9">9</a>, и агент, собранный по этому примеру, отменять не умеет вовсе. Если ты оркеструешь чужих агентов, считай отмену подсказкой и держи свой собственный дедлайн на стороне клиента.</p>
+
+<p>Для обзора всего, что висит у агента, в версии 1.0 появился <code>ListTasks</code>: фильтр по <code>contextId</code> и состоянию, курсорная пагинация, сортировка по времени последнего обновления, свежие сверху. Артефакты в списке по умолчанию не отдаются вовсе, а <code>nextPageToken</code> присутствует всегда и на последней странице равен пустой строке<a class="cite" href="#src-1">1</a>. Ещё одно требование из того же раздела окажется важным в <a href="#security">разделе про безопасность</a>: список обязан содержать только задачи, видимые аутентифицированному клиенту.</p>
+</section>
+
+<section id="bindings">
+<h2>Одна модель, три провода</h2>
+<p>Запрос «покажи задачу 54ea…» этот же агент принимает в двух видах, потому что в его карточке объявлены два интерфейса. В JSON-RPC это <code>POST /</code> с методом в теле, в REST — обычный <code>GET</code> по пути с идентификатором:</p>
+
+<div class="tabs">
+<section data-tab="JSON-RPC">
+<script type="text/plain" class="code" data-lang="http" data-title="GetTask через JSON-RPC (снято с живого сервера)">
+POST / HTTP/1.1
+Content-Type: application/json
+A2A-Version: 1.0
+
+{"jsonrpc": "2.0", "id": 7, "method": "GetTask",
+ "params": {"id": "54ea27e5-4930-410d-9de6-848db2b05dc5", "historyLength": 1}}
+</script>
+</section>
+<section data-tab="HTTP+JSON">
+<script type="text/plain" class="code" data-lang="http" data-title="GetTask через REST (снято с живого сервера)">
+GET /rest/tasks/54ea27e5-4930-410d-9de6-848db2b05dc5?historyLength=1 HTTP/1.1
+A2A-Version: 1.0
+</script>
+</section>
+</div>
+
+<p>Внутри ответа в обоих случаях одна и та же задача в одном и том же JSON, только JSON-RPC заворачивает её в <code>result</code>. В апреле 2025 года, в треде запуска на Hacker News, первым же популярным комментарием была жалоба: «It's frustratingly difficult to see what these (A2A and MCP) protocols actually look like… the JSON that goes over the wire»<a class="cite" href="#src-4">4</a>. С тех пор спецификация переехала на Protocol Buffers, и теперь провод выводится из одного файла.</p>
+
+<p>Про <code>a2a.proto</code> в тексте спецификации сказано: это «the single authoritative normative definition of all protocol data objects and request/response messages»<a class="cite" href="#src-1">1</a>. JSON получается из proto по канонической схеме ProtoJSON: так решил технический комитет в ADR-001 от 18 ноября 2025 года, заранее пометив это как ломающее изменение<a class="cite" href="#src-10">10</a>. Отсюда имена полей в camelCase и перечисления вида <code>TASK_STATE_COMPLETED</code> вместо прежних <code>"completed"</code>. Поверх одной модели данных и одного набора операций спецификация описывает три биндинга, то есть три способа положить это на провод: JSON-RPC 2.0, gRPC и HTTP+JSON, он же REST.</p>
+
+<p>У каждого запроса есть ещё необязательное поле <code>tenant</code> (арендатор). Это непрозрачная строка, по которой хостинг, держащий несколько агентов за одним адресом, понимает, к какому из них пришёл запрос. Формат протокол не задаёт, значение берётся из карточки агента, а в REST оно становится префиксом пути<a class="cite" href="#src-3">3</a>.</p>
+
+<figure class="fig wide" id="fig-bindings">
+<script type="text/x-mermaid">
+flowchart LR
+  op["Операция GetTask<br/>GetTaskRequest → Task"]:::accent
+  op --> rpc["JSON-RPC<br/>POST / , method GetTask"]
+  op --> rest["HTTP+JSON<br/>GET /tasks/{id}"]
+  op --> grpc["gRPC<br/>A2AService.GetTask"]
+  rpc --> hdr["A2A-Version, A2A-Extensions<br/>в HTTP-заголовках"]
+  rest --> hdr
+  grpc --> meta["те же параметры<br/>в gRPC metadata"]
+  rest -.-> ten["/{tenant}/tasks/{id}<br/>если в карточке есть tenant"]:::mute
+</script>
+<figcaption>Одна операция из proto и три её проекции на провод. REST-пути записаны прямо в proto аннотациями <code>google.api.http</code>, служебные параметры в HTTP едут заголовками, в gRPC — метаданными. У каждого REST-пути есть двойник с префиксом тенанта.</figcaption>
+</figure>
+
+<p>REST-маршруты не придуманы отдельно, они записаны в proto аннотациями <code>google.api.http</code>, как в gRPC-gateway<a class="cite" href="#src-3">3</a>:</p>
+
+<script type="text/plain" class="code" data-lang="text" data-title="specification/a2a.proto: сервис A2AService (выдержка)">
+service A2AService {
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse) {
+    option (google.api.http) = {
+      post: "/message:send"
+      body: "*"
+      additional_bindings: { post: "/{tenant}/message:send" body: "*" }
+    };
+  }
+  rpc GetTask(GetTaskRequest) returns (Task) {
+    option (google.api.http) = {
+      get: "/tasks/{id=*}"
+      additional_bindings: { get: "/{tenant}/tasks/{id=*}" }
+    };
+  }
+  // ...ListTasks, CancelTask, SubscribeToTask и остальные
+}
+</script>
+
+<table class="wide">
+<thead><tr><th>Операция</th><th>JSON-RPC, метод в 1.0</th><th>REST</th><th>Было в 0.3</th></tr></thead>
+<tbody>
+<tr><td>Отправить сообщение</td><td><code>SendMessage</code></td><td><code>POST /message:send</code></td><td><code>message/send</code></td></tr>
+<tr><td>То же с потоком</td><td><code>SendStreamingMessage</code></td><td><code>POST /message:stream</code></td><td><code>message/stream</code></td></tr>
+<tr><td>Получить задачу</td><td><code>GetTask</code></td><td><code>GET /tasks/{id}</code></td><td><code>tasks/get</code></td></tr>
+<tr><td>Список задач</td><td><code>ListTasks</code></td><td><code>GET /tasks</code></td><td>не было</td></tr>
+<tr><td>Отменить</td><td><code>CancelTask</code></td><td><code>POST /tasks/{id}:cancel</code></td><td><code>tasks/cancel</code></td></tr>
+<tr><td>Подписаться</td><td><code>SubscribeToTask</code></td><td><code>GET /tasks/{id}:subscribe</code></td><td><code>tasks/resubscribe</code></td></tr>
+<tr><td>Вебхуки</td><td><code>CreateTaskPushNotificationConfig</code> и три соседа: <code>Get…</code>, <code>List…Configs</code>, <code>Delete…</code></td><td><code>/tasks/{task_id}/pushNotificationConfigs</code></td><td><code>tasks/pushNotificationConfig/*</code></td></tr>
+<tr><td>Расширенная карточка</td><td><code>GetExtendedAgentCard</code></td><td><code>GET /extendedAgentCard</code></td><td><code>agent/getAuthenticatedExtendedCard</code></td></tr>
+</tbody>
+</table>
+
+<p>Таблица собрана по proto и миграционному документу<a class="cite" href="#src-11">11</a>. Два места в ней расходятся с другими официальными текстами, и оба раза прав proto. Проза спецификации называет подписку <code>POST /tasks/{id}:subscribe</code>, а аннотация в proto — <code>GET</code>. Миграционный документ обещает у <code>TaskArtifactUpdateEvent</code> новое поле <code>index</code>, которого в proto нет. Когда документация и <code>a2a.proto</code> спорят, ты пишешь код по <code>a2a.proto</code>.</p>
+
+<p>Если в статье или в чужом коде ты видишь <code>tasks/send</code>, это версия 0.1.0 от апреля 2025 года: уже в 0.2.0 метод заменили на <code>message/send</code><a class="cite" href="#src-12">12</a>. Сервер версии 1.0 на старое имя отвечает <code>-32601 Method not found</code>, даже если выставить заголовок <code>A2A-Version: 1.0</code>.</p>
+
+<h3>Один proto не даёт три биндинга бесплатно</h3>
+<p>Из того, что все три биндинга выводятся из одного файла, легко решить, что любой сервер говорит на всех трёх. На деле каждый реализует то, что успел. LangSmith Agent Server пишет прямо: «Only the JSON-RPC binding is available. gRPC and HTTP+JSON are not implemented»<a class="cite" href="#src-7">7</a>. Контракт среды Bedrock AgentCore требует JSON-RPC 2.0 поверх HTTP<a class="cite" href="#src-13">13</a>. Официальный CLI в режиме сервера по умолчанию, наоборот, поднимает только REST. Какие биндинги реально есть, сервер сообщает в карточке списком <code>supportedInterfaces</code>, и клиент по спецификации обязан идти по нему сверху вниз и взять первый интерфейс, который умеет сам<a class="cite" href="#src-1">1</a>. Если у выбранного интерфейса указан <code>tenant</code>, клиент обязан ставить ровно это значение в каждый запрос. Забудешь, и многоарендный хост не поймёт, к какому агенту ты обращаешься.</p>
+
+<p>Не все клиенты этот порядок уважают. Клиент Microsoft Agent Framework, по его документации, при наличии обоих HTTP-биндингов по умолчанию выбирает HTTP+JSON<a class="cite" href="#src-14">14</a>. Python SDK по умолчанию следует порядку карточки, а флаг <code>use_client_preference</code> в <code>ClientConfig</code> разворачивает выбор в пользу клиента. Если пишешь сервер, первым в карточку ставь JSON-RPC: его понимают все, включая LangSmith и AgentCore. Если пишешь клиент, умей JSON-RPC и HTTP+JSON, а gRPC добавляй, когда он понадобится конкретному партнёру.</p>
+
+<h3>Ошибки</h3>
+<p>Ошибок, специфичных для A2A, девять, и у каждой фиксированы код JSON-RPC, статус gRPC и статус HTTP<a class="cite" href="#src-1">1</a>:</p>
+
+<table>
+<thead><tr><th>Ошибка</th><th class="num">JSON-RPC</th><th>gRPC</th><th class="num">HTTP</th></tr></thead>
+<tbody>
+<tr><td><code>TaskNotFoundError</code></td><td class="num">−32001</td><td>NOT_FOUND</td><td class="num">404</td></tr>
+<tr><td><code>TaskNotCancelableError</code></td><td class="num">−32002</td><td>FAILED_PRECONDITION</td><td class="num">400</td></tr>
+<tr><td><code>PushNotificationNotSupportedError</code></td><td class="num">−32003</td><td>FAILED_PRECONDITION</td><td class="num">400</td></tr>
+<tr><td><code>UnsupportedOperationError</code></td><td class="num">−32004</td><td>FAILED_PRECONDITION</td><td class="num">400</td></tr>
+<tr><td><code>ContentTypeNotSupportedError</code></td><td class="num">−32005</td><td>INVALID_ARGUMENT</td><td class="num">400</td></tr>
+<tr><td><code>InvalidAgentResponseError</code></td><td class="num">−32006</td><td>INTERNAL</td><td class="num">500</td></tr>
+<tr><td><code>ExtendedAgentCardNotConfiguredError</code></td><td class="num">−32007</td><td>FAILED_PRECONDITION</td><td class="num">400</td></tr>
+<tr><td><code>ExtensionSupportRequiredError</code></td><td class="num">−32008</td><td>FAILED_PRECONDITION</td><td class="num">400</td></tr>
+<tr><td><code>VersionNotSupportedError</code></td><td class="num">−32009</td><td>FAILED_PRECONDITION</td><td class="num">400</td></tr>
+</tbody>
+</table>
+
+<p>Машиночитаемая часть в версии 1.0 одинакова во всех биндингах: массив деталей в формате <code>google.rpc</code>, где главная — <code>ErrorInfo</code> с полем <code>reason</code> в SCREAMING_SNAKE_CASE и доменом <code>a2a-protocol.org</code>. В JSON-RPC массив лежит в <code>error.data</code>, в REST — в <code>error.details</code> тела вида <code>google.rpc.Status</code>:</p>
+
+<script type="text/plain" class="code" data-lang="http" data-title="REST: задача не найдена (снято с живого сервера)">
+HTTP/1.1 404 Not Found
+content-type: application/json
+
+{"error": {"code": 404,
+           "status": "NOT_FOUND",
+           "message": "Task not found",
+           "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "TASK_NOT_FOUND",
+                        "domain": "a2a-protocol.org", "metadata": {}}]}}
+</script>
+
+<p>Ветвись по <code>reason</code>, а не по тексту <code>message</code>: текст у разных SDK разный, у Python он ещё и вставляет числовые значения перечислений. И не верь двум примерам в разделах 6.4 и 6.5 самой спецификации: там ошибки HTTP показаны в старом формате RFC 9457 <code>application/problem+json</code>. Нормативный раздел 11.6 и миграционный документ говорят, что в 1.0 его заменил <code>google.rpc.Status</code><a class="cite" href="#src-11">11</a>, и живой сервер отвечает именно так. Ещё одна мелочь того же рода. Время в ответах Python SDK приходит с микросекундами (<code>16:58:09.218333Z</code>), хотя спецификация советует миллисекунды. Это SHOULD, не MUST, так что парсер на клиенте должен переваривать оба варианта.</p>
+
+<p>Таблица выглядит полным списком, но чаще всего клиент получит ошибки, которых в ней нет. Отсутствующие или негодные креды дают ошибку аутентификации: HTTP 401, gRPC <code>UNAUTHENTICATED</code>, в JSON-RPC собственный код сервера, и спецификация советует положить в ответ challenge с нужной схемой. Нехватка прав — это 403 или <code>PERMISSION_DENIED</code>. Невалидные параметры — <code>-32602 Invalid params</code>, а в REST 400 с деталью <code>google.rpc.BadRequest</code> и списком <code>fieldViolations</code><a class="cite" href="#src-1">1</a>. Политика ретраев отсюда простая: на 401 обнови токен и повтори запрос, на 403 и <code>-32602</code> не повторяй, со второго раза они не пройдут.</p>
+
+<div class="note warn"><p>Спецификация запрещает серверу выдавать само существование чужих ресурсов и советует не различать «нет такой задачи» и «задача есть, но не твоя»<a class="cite" href="#src-1">1</a>. На практике в обоих случаях приходит <code>TaskNotFoundError</code>. Если в логах клиента много <code>TASK_NOT_FOUND</code> на свежих задачах, первым делом проверь, тем ли токеном ты ходишь, а не жив ли агент.</p></div>
+</section>
+
+<section id="streaming">
+<h2>Поток, обрыв и вебхуки</h2>
+<p>Второй ход того же разговора клиент отправил методом <code>SendStreamingMessage</code>: ответ «1.4.0» в ту же задачу. Сервер ответил <code>text/event-stream</code>, и вот все кадры потока до закрытия соединения:</p>
+
+<script type="text/plain" class="code wide" data-lang="sse" data-title="SendStreamingMessage, ответ (снято с живого сервера, id сокращены)">
+HTTP/1.1 200 OK
+content-type: text/event-stream; charset=utf-8
+
+data: {"result": {"statusUpdate": {"taskId": "54ea…", "contextId": "764a…", "status": {"state": "TASK_STATE_WORKING", "timestamp": "2026-09-30T16:58:14.180442Z"}}}, "id": 2, "jsonrpc": "2.0"}
+
+data: {"result": {"artifactUpdate": {"taskId": "54ea…", "contextId": "764a…", "artifact": {"artifactId": "release-notes", "name": "RELEASE_NOTES.md", "parts": [{"text": "## 1.4.0\n", "mediaType": "text/markdown"}]}}}, "id": 2, "jsonrpc": "2.0"}
+
+data: {"result": {"artifactUpdate": {"taskId": "54ea…", "contextId": "764a…", "artifact": {"artifactId": "release-notes", "name": "RELEASE_NOTES.md", "parts": [{"text": "- fix: retry on 429\n", "mediaType": "text/markdown"}]}, "append": true}}, "id": 2, "jsonrpc": "2.0"}
+
+data: {"result": {"artifactUpdate": {"taskId": "54ea…", "contextId": "764a…", "artifact": {"artifactId": "release-notes", "name": "RELEASE_NOTES.md", "parts": [{"text": "- feat: add ListTasks\n", "mediaType": "text/markdown"}]}, "append": true, "lastChunk": true}}, "id": 2, "jsonrpc": "2.0"}
+
+data: {"result": {"statusUpdate": {"taskId": "54ea…", "contextId": "764a…", "status": {"state": "TASK_STATE_COMPLETED", "timestamp": "2026-09-30T16:58:14.786257Z"}}}, "id": 2, "jsonrpc": "2.0"}
+</script>
+
+<p>Каждый кадр — полноценный ответ JSON-RPC с тем же <code>id</code>, что у запроса, а внутри <code>result</code> лежит <code>StreamResponse</code>: ровно одно из <code>task</code>, <code>message</code>, <code>statusUpdate</code> или <code>artifactUpdate</code>. В REST-биндинге кадры те же, только без JSON-RPC-обёртки.</p>
+
+<p>Результат течёт через артефакт, потому что потоковой отдачи сообщения в A2A нет: <code>Message</code> приходит только целиком, и в дорожной карте это записано как пробел, который закроет двунаправленный стриминг из эпика #1995<a class="cite" href="#src-15">15</a>. Агент шлёт куски одного и того же <code>artifactId</code>: первый без флага, следующие с <code>append: true</code>, последний с <code>lastChunk: true</code><a class="cite" href="#src-3">3</a>. Клиент склеивает части сам. Если после завершения спросить задачу через <code>GetTask</code>, сервер вернёт один артефакт из трёх частей.</p>
+
+<figure class="fig wide" id="fig-chunks">
+<svg class="diagram" viewBox="0 0 760 300" role="img" aria-label="Как куски артефакта из потока собираются в один артефакт">
+  <rect class="box--ghost" x="430" y="10" width="320" height="282" rx="6"/>
+  <text class="t-title" x="590" y="38" text-anchor="middle">Artifact «release-notes»</text>
+  <rect class="box--soft" x="20" y="56" width="300" height="64" rx="6"/>
+  <text class="t-title" x="36" y="82">artifactUpdate 1</text>
+  <text class="t-mono" x="36" y="106">append: —</text>
+  <rect class="box--soft" x="20" y="136" width="300" height="64" rx="6"/>
+  <text class="t-title" x="36" y="162">artifactUpdate 2</text>
+  <text class="t-mono" x="36" y="186">append: true</text>
+  <rect class="box--accent" x="20" y="216" width="300" height="64" rx="6"/>
+  <text class="t-title" x="36" y="242">artifactUpdate 3</text>
+  <text class="t-mono" x="36" y="266">append: true, lastChunk: true</text>
+  <rect class="box--ok" x="446" y="64" width="288" height="48" rx="6"/>
+  <text class="t-mono" x="462" y="93">[0] ## 1.4.0</text>
+  <rect class="box--ok" x="446" y="144" width="288" height="48" rx="6"/>
+  <text class="t-mono" x="462" y="173">[1] - fix: retry on 429</text>
+  <rect class="box--ok" x="446" y="224" width="288" height="48" rx="6"/>
+  <text class="t-mono" x="462" y="253">[2] - feat: add ListTasks</text>
+  <path class="arrow" d="M320,88 L444,88"/>
+  <text class="t-sub" x="382" y="80" text-anchor="middle">создать</text>
+  <path class="arrow" d="M320,168 L444,168"/>
+  <text class="t-sub" x="382" y="160" text-anchor="middle">дописать</text>
+  <path class="arrow arrow--pen" d="M320,248 L444,248"/>
+  <text class="t-sub" x="382" y="240" text-anchor="middle">дописать</text>
+</svg>
+<figcaption>Три кадра <code>artifactUpdate</code> с одним <code>artifactId</code> складываются в один артефакт из трёх частей. Первый кадр создаёт артефакт, <code>append</code> дописывает, <code>lastChunk</code> говорит, что кусков больше не будет. Так в A2A стримят текст, потому что сообщение по кускам отдать нельзя.</figcaption>
+</figure>
+
+<p>Флага <code>final: true</code>, которым в версии 0.3 помечали последнее событие, в этих кадрах нет. В 1.0 его убрали, и концом потока считается закрытие соединения<a class="cite" href="#src-11">11</a>. Когда именно поток обязан закрыться, спецификация 1.0.1 говорит двумя голосами. Раздел 3.1.2: поток «MUST close when the task reaches a terminal state». Раздел 11.7: поток идёт, пока задача не достигнет «a terminal or interrupted state, at which point the stream closes»<a class="cite" href="#src-1">1</a>. Python SDK ведёт себя по второму варианту: если в начале разговора агент задал вопрос, поток из двух кадров (<code>task</code> в <code>SUBMITTED</code>, затем <code>statusUpdate</code> в <code>INPUT_REQUIRED</code>) закрывается сразу. Клиент должен переживать оба поведения: получил прерванное состояние — жди либо закрытия, либо следующих событий, и не считай закрытие ошибкой.</p>
+
+<p>Посмотри и на первый кадр. Раздел 3.1.2 требует, чтобы поток задачи начинался с объекта <code>Task</code>. Для новой задачи Python SDK так и делает. А в кадрах выше, где клиент продолжал существующую задачу, первым пришёл <code>statusUpdate</code>. Если твой клиент строит состояние задачи из первого кадра, на продолжении разговора он упадёт на <code>None</code>. Держи состояние задачи у себя и обновляй его любым пришедшим событием.</p>
+
+<h3>Если соединение оборвалось</h3>
+<p>SSE-поток в A2A нельзя продолжить с места обрыва. Спецификация не выдаёт событиям идентификаторов и не знает заголовка <code>Last-Event-ID</code>, то есть браузерный механизм переподключения здесь не работает. Вместо него есть отдельная операция <code>SubscribeToTask</code>, и у неё одно важное правило: первым событием сервер обязан прислать текущий снимок задачи. Спецификация объясняет зачем: «This prevents a potential loss of information between a call to <code>GetTask</code> and calling <code>SubscribeToTask</code>»<a class="cite" href="#src-1">1</a>.</p>
+
+<p>Вот как это выглядит вживую. Клиент отправил агенту семь коммитов с <code>returnImmediately</code>, подождал 0,7 секунды и подписался на задачу. Первым кадром пришла задача в <code>WORKING</code>, у которой в артефакте уже лежали четыре части, а потом только недостающие куски:</p>
+
+<script type="text/plain" class="code" data-lang="output" data-title="SubscribeToTask посреди работы (снято с живого сервера, вывод скрипта-пробы)">
+SendMessage -> TASK_STATE_SUBMITTED
+task snapshot: TASK_STATE_WORKING artifacts: [4]
+artifactUpdate: '- fix: d\n' append
+artifactUpdate: '- fix: e\n' append
+artifactUpdate: '- chore: f\n' append
+artifactUpdate: '- v3.1.0\n' append lastChunk
+statusUpdate TASK_STATE_COMPLETED
+</script>
+
+<figure class="fig wide" id="fig-resubscribe">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant C as Клиент
+  participant A as Агент
+  C->>A: SendStreamingMessage
+  A-->>C: task (SUBMITTED)
+  A-->>C: artifactUpdate, куски 1–3
+  Note over C,A: соединение оборвалось
+  A->>A: работает дальше, кусок 4
+  C->>A: SubscribeToTask {id}
+  A-->>C: task (WORKING), в артефакте куски 1–4
+  A-->>C: artifactUpdate, куски 5–7
+  A-->>C: statusUpdate (COMPLETED)
+  Note over C,A: сервер закрывает поток
+</script>
+<figcaption>Восстановление после обрыва. Продолжить поток с места нельзя, поэтому клиент подписывается заново и получает сначала полный снимок задачи, а потом только новые события. Локальное состояние клиент заменяет снимком, а не дописывает к нему.</figcaption>
+</figure>
+
+<p>После переподключения выбрасывай локально собранный артефакт и бери его из снимка, иначе куски 1–3 окажутся в нём дважды. Microsoft Agent Framework описывает то же ограничение со своей стороны: A2A поддерживает «stream reconnection (obtaining the same response stream from the beginning), not stream resumption from a specific point», и их клиент для этого хранит токен продолжения и заново получает поток<a class="cite" href="#src-14">14</a>. Если у тебя интерфейс, который показывает текст по мере генерации, отрисовка должна быть идемпотентной: снимок перерисовывает всё, события дописывают.</p>
+
+<p>На схеме нет одного случая: задача успела закончиться, пока клиент был отключён. Подписаться на терминальную задачу нельзя, и <code>SubscribeToTask</code> вернёт не снимок, а тот же <code>-32004 UnsupportedOperationError</code>, что и отправка в завершённую задачу<a class="cite" href="#src-3">3</a>. Клиент, который считает эту ошибку провалом, теряет готовый результат. Правильная реакция на неё — <code>GetTask</code>: итог и все артефакты лежат там.</p>
+
+<h3>Вебхуки для долгих задач</h3>
+<p>Держать SSE-соединение открытым час неудобно, а из serverless-функции часто и невозможно. Для этого есть push-уведомления: клиент регистрирует вебхук для задачи, а агент сам POST'ит обновления. Конфигурацию можно передать сразу в <code>SendMessage</code> (поле <code>taskPushNotificationConfig</code> в <code>configuration</code>) или позже через <code>CreateTaskPushNotificationConfig</code>. В ней URL, необязательный токен и блок <code>authentication</code> со схемой и кредами, которыми агент подпишет свои запросы<a class="cite" href="#src-3">3</a>. Тело вебхука — тот же <code>StreamResponse</code>, что идёт по SSE:</p>
+
+<script type="text/plain" class="code" data-lang="http" data-title="Набросок: запрос агента на вебхук клиента по шаблону §4.3.3 спецификации">
+POST {webhook_url}
+Authorization: {authentication_scheme} {credentials}
+Content-Type: application/a2a+json
+
+{"statusUpdate": {"taskId": "…", "contextId": "…", "status": {"state": "TASK_STATE_COMPLETED"}}}
+</script>
+
+<figure class="fig wide" id="fig-push">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant C as Клиент
+  participant W as Вебхук клиента
+  participant A as Агент
+  C->>A: SendMessage + taskPushNotificationConfig
+  A-->>C: task (SUBMITTED), соединение закрыто
+  A->>W: POST statusUpdate (WORKING)
+  W-->>A: 200
+  A->>W: POST artifactUpdate
+  Note over A,W: таймаут 10–30 с, ответа нет
+  A->>W: повтор с backoff
+  W-->>A: 200, дубль отброшен по id
+  A->>W: POST statusUpdate (COMPLETED)
+  W-->>A: 200
+  C->>A: GetTask {id}, забрать результат
+</script>
+<figcaption>Жизнь задачи с вебхуком. Агент обязан доставить уведомление хотя бы один раз и может повторять, поэтому дубли — норма, и вебхук отбрасывает их сам. Полный результат надёжнее забрать отдельным <code>GetTask</code>, чем собирать из уведомлений.</figcaption>
+</figure>
+
+<p>Гарантии тут такие, какие бывают у вебхуков. Агент обязан попытаться доставить каждое уведомление хотя бы раз, может повторять с экспоненциальной задержкой, должен ставить разумный таймаут (спецификация советует 10–30 секунд) и может сдаться после серии неудач. Клиент обязан ответить 2xx, обязан проверить, что <code>taskId</code> ему знаком, и должен обрабатывать уведомления идемпотентно, потому что дубли возможны<a class="cite" href="#src-1">1</a>. На практике это значит: храни в базе, какие события по какой задаче ты уже применил, и на каждое уведомление, которое меняет состояние на терминальное, отвечай <code>GetTask</code>, а не доверяй телу.</p>
+
+<div class="note field"><blockquote>fix: send PushNotificationConfig.authentication as an Authorization header (#1271), closes #585
+<footer>— <a href="https://github.com/a2aproject/a2a-python/blob/main/CHANGELOG.md">a2a-python 1.2.0, CHANGELOG, 29 сентября 2026</a></footer></blockquote><p>До версии 1.2.0 Python SDK не отправлял на вебхук настроенные креды, хотя спецификация требует класть их в заголовки<a class="cite" href="#src-5">5</a>. Все пять месяцев линии 1.x агенты на официальном SDK стучались на вебхуки без <code>Authorization</code>. Вебхук, который проверяет кред, такие уведомления отвергал, а вебхук, который не проверяет, принял бы их от кого угодно. Проверяй кред на своей стороне и обнови SDK на агентах.</p></div>
+
+<p>Какой способ выбрать, решают время и сеть. Задача на секунды: блокирующий <code>SendMessage</code>, и не надо ничего выдумывать. Задача на минуты с живым пользователем перед экраном: поток и <code>SubscribeToTask</code> на случай обрыва. Задача на часы или клиент без постоянных соединений: вебхук плюс редкий <code>GetTask</code> как страховка от потерянного уведомления. И проверь, что агент вообще умеет выбранное. LangSmith Agent Server, например, не реализует ни <code>SubscribeToTask</code>, ни вебхуки и отвечает на них <code>-32601</code><a class="cite" href="#src-7">7</a>. О том, чем вебхук опасен для самого агента, — в <a href="#security">разделе про безопасность</a>.</p>
+</section>
+
+<section id="agent-card">
+<h2>Agent Card: визитка, которой нельзя верить на слово</h2>
+<p>Прежде чем что-то отправить агенту, клиент берёт его карточку. У агента release notes она лежит по стандартному адресу, и сервер отдаёт её вместе с <code>ETag</code>:</p>
+
+<script type="text/plain" class="code" data-lang="http" data-title="GET /.well-known/agent-card.json (снято с живого сервера)">
+HTTP/1.1 200 OK
+server: uvicorn
+etag: W/"ab790108824b36672c6b9607a36e0d0243920459bfd88c5547317f77983c1b93"
+content-type: application/json
+
+{"name": "Release Notes Agent",
+ "description": "Собирает release notes из списка коммитов.",
+ "supportedInterfaces": [{"url": "http://127.0.0.1:9999/", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"},
+                         {"url": "http://127.0.0.1:9999/rest", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}],
+ "version": "0.1.0",
+ "capabilities": {"streaming": true},
+ "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/markdown"],
+ "skills": [{"id": "release-notes", "name": "Release notes",
+             "description": "Превращает список коммитов в раздел CHANGELOG.",
+             "tags": ["changelog", "git"],
+             "examples": ["fix: retry on 429\nfeat: add ListTasks"]}]}
+</script>
+
+<p>Карточка отвечает на три вопроса: куда стучаться, что агент умеет и как к нему войти. Куда — это <code>supportedInterfaces</code>, упорядоченный список пар «URL плюс биндинг плюс версия протокола», иногда с <code>tenant</code> для хостинга, где за одним адресом живёт несколько агентов. Что умеет — флаги в <code>capabilities</code> (поток, вебхуки, расширенная карточка, расширения) и список <code>skills</code>. Как войти — <code>securitySchemes</code> и <code>securityRequirements</code>, устроенные как в OpenAPI. Пример из спецификации с полным набором<a class="cite" href="#src-1">1</a>:</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="Sample Agent Card, спецификация §8.5 (выдержка)">
+{
+  "name": "GeoSpatial Route Planner Agent",
+  "supportedInterfaces": [
+    {"url": "https://georoute-agent.example.com/a2a/v1", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"},
+    {"url": "https://georoute-agent.example.com/a2a/grpc", "protocolBinding": "GRPC", "protocolVersion": "1.0"},
+    {"url": "https://georoute-agent.example.com/a2a/json", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}
+  ],
+  "capabilities": {"streaming": true, "pushNotifications": true, "extendedAgentCard": true},
+  "securitySchemes": {"google": {"openIdConnectSecurityScheme": {"openIdConnectUrl": "https://accounts.google.com/.well-known/openid-configuration"}}},
+  "securityRequirements": [{"schemes": {"google": {"list": ["openid", "profile", "email"]}}}],
+  "skills": [{
+    "id": "route-optimizer-traffic",
+    "name": "Traffic-Aware Route Optimizer",
+    "tags": ["maps", "routing", "navigation", "directions", "traffic"],
+    "examples": ["Plan a route from '1600 Amphitheatre Parkway, Mountain View, CA' to 'San Francisco International Airport' avoiding tolls."],
+    "outputModes": ["application/json", "application/vnd.geo+json", "text/html"]
+  }],
+  "signatures": [
+    {"protected": "eyJhbGciOiJFUzI1NiIs...", "signature": "QFdkNLNszlGj3z3u0YQGt_T9LixY3qtdQpZmsTdDHDe3fXV9y9-B3m2-XgCpzuhiLt8E0tV6HXoZKHv4GtHgKQ"}
+  ]
+}
+</script>
+
+<p>У навыка есть своё <code>description</code>, теги и примеры. Эти строки потом читает модель на стороне клиента, когда решает, какому агенту что поручить, так что карточка — это ещё и текст, который попадает в твой контекст. Относись к нему как к любому чужому тексту в промпте: он может врать о возможностях и может содержать инструкции для твоей модели (подробнее в <a href="../16-security/index.html">главе 16</a>).</p>
+
+<h3>Где искать карточку</h3>
+<aside class="margin"><p><b>RFC 8615</b> — соглашение о путях <code>/.well-known/</code> для метаданных сайта.</p></aside>
+<p>Способов найти карточку три<a class="cite" href="#src-2">2</a>. Первый — well-known путь <code>https://{домен}/.well-known/agent-card.json</code>. До версии 0.3.0 от 30 июля 2025 года файл назывался <code>agent.json</code>, и переименование числится в списке ломающих изменений той версии<a class="cite" href="#src-12">12</a>. Старое имя до сих пор живёт в документации и коде: Google ADK для <code>adk api_server --a2a</code> ждёт в папке агента файл карточки с именем <code>agent.json</code>, хотя отдаёт его уже по новому пути<a class="cite" href="#src-16">16</a>. Если твой клиент получает 404 на карточку, попробуй оба адреса, прежде чем объявлять агента мёртвым.</p>
+
+<p>Второй способ — реестры и каталоги, и тут спецификация молчит: документ о поиске агентов говорит, что текущая версия «does not prescribe a standard API for curated registries»<a class="cite" href="#src-2">2</a>. Любой реестр A2A-агентов, который ты встретишь, — чей-то собственный слой поверх протокола. Третий способ — прямая конфигурация: URL карточки в конфиге или сама карточка файлом. Для агентов внутри компании он самый частый и самый честный.</p>
+
+<p>Карточку не надо тянуть перед каждым запросом. Спецификация советует серверу отдавать <code>Cache-Control</code> и <code>ETag</code>, а клиенту — делать условные запросы по RFC 9111. Python SDK с 1.2.0 ставит <code>ETag</code> всегда и отвечает <code>304</code> на совпавший <code>If-None-Match</code>, а <code>max-age</code> по умолчанию не выставляет: как часто меняется карточка, знает только тот, кто её деплоит<a class="cite" href="#src-5">5</a>.</p>
+
+<p>У публичной карточки может быть расширенная версия для своих. Флаг <code>capabilities.extendedAgentCard</code> говорит, что аутентифицированный клиент может вызвать <code>GetExtendedAgentCard</code> и получить карточку с дополнительными навыками. В примере helloworld публичная карточка показывает навык <code>echo_bot</code>, а расширенная добавляет к нему «Super Mode»<a class="cite" href="#src-9">9</a>. Секретов в расширенную карточку тоже класть не надо: спецификация говорит, что внутренние URL и креды там не место.</p>
+
+<h3>Подпись карточки</h3>
+<p>Подписи у карточек появились в версии 0.3.0, а не в 1.0, как часто пишут: в 1.0 уточнили правила канонизации<a class="cite" href="#src-12">12</a>. Механика такая. Из карточки выбрасывают поле <code>signatures</code> и все поля со значениями по умолчанию, остаток приводят к каноническому JSON по RFC 8785 (JCS), подписывают как JWS и кладут результат обратно в массив <code>signatures</code>. Защищённый заголовок обязан содержать <code>alg</code>, <code>typ</code> и <code>kid</code>, может содержать <code>jku</code> — адрес набора ключей<a class="cite" href="#src-1">1</a>.</p>
+
+<figure class="fig wide" id="fig-signing">
+<ol class="pipeline">
+  <li><b>Карточка</b><span>AgentCard как есть</span></li>
+  <li><b>Очистка</b><span>без <code>signatures</code> и значений по умолчанию</span></li>
+  <li data-tone="accent"><b>JCS</b><span>канонический JSON, RFC 8785</span></li>
+  <li><b>JWS</b><span>заголовок <code>alg</code>, <code>typ</code>, <code>kid</code>, <code>jku</code></span></li>
+  <li data-tone="ok"><b>signatures[]</b><span><code>protected</code> + <code>signature</code></span></li>
+  <li data-tone="warn"><b>Проверка</b><span>ключ по <code>kid</code> из твоего хранилища</span></li>
+</ol>
+<figcaption>Путь подписи карточки и обратный путь проверки. Проверяющий повторяет очистку и канонизацию и сверяет подпись. Самый слабый шаг последний: откуда клиент берёт публичный ключ, спецификация оставляет ему.</figcaption>
+</figure>
+
+<p>В Python SDK для этого есть экстра <code>a2a-sdk[signing]</code> и две функции. Код ниже проверен на 1.2.1: подпись сходится, а добавленный в подписанную карточку навык проверка ловит.</p>
+
+<script type="text/plain" class="code" data-lang="python" data-title="sign_card.py (запускался на a2a-sdk 1.2.1)">
+from cryptography.hazmat.primitives.asymmetric import ec
+from a2a.utils.signing import create_agent_card_signer, create_signature_verifier
+
+private_key = ec.generate_private_key(ec.SECP256R1())
+sign = create_agent_card_signer(
+    private_key,
+    {"alg": "ES256", "typ": "JOSE", "kid": "notes-2026-09",
+     "jku": "https://notes.example.com/.well-known/jwks.json"},
+)
+signed = sign(card)                      # card: AgentCard из server.py
+
+TRUSTED = {"notes-2026-09": private_key.public_key()}
+
+def key_provider(kid, jku):
+    return TRUSTED[kid]                  # jku из карточки сознательно не используем
+
+verify = create_signature_verifier(key_provider, algorithms=["ES256"])
+verify(signed)                           # InvalidSignaturesError, если карточку подменили
+</script>
+
+<p>Обрати внимание на <code>key_provider</code>. Если он скачивает ключ по <code>jku</code>, указанному в самой карточке, подпись доказывает ровно одно: карточку подписал тот, кто контролирует домен в <code>jku</code>. Злоумышленник с собственным доменом подпишет свою карточку своим ключом, и проверка пройдёт. Доверие появляется только тогда, когда ключи ты берёшь из заранее известного места: из своего хранилища, из реестра партнёров, из конфигурации. Спецификация эту часть оставляет клиенту («or from a trusted key store»), а подпись делает необязательной: карточки «MAY be signed», клиенты «SHOULD verify»<a class="cite" href="#src-1">1</a>. И ещё одна деталь из кода SDK. Если в защищённом заголовке не указать <code>alg</code>, подписывающая функция возьмёт HS256, то есть симметричный ключ, который проверяющей стороне пришлось бы знать.</p>
+
+<p>Хранилище ключей должно знать и об отзыве. Спецификация разрешает несколько подписей на одной карточке как раз ради ротации и запрещает проверять подпись просроченными или отозванными ключами<a class="cite" href="#src-1">1</a>. В примере выше <code>TRUSTED</code> — обычный словарь, и утёкший ключ будет подписывать чужие карточки, пока его оттуда не уберут руками.</p>
+
+<h3>Спор об идентичности и шум вокруг него</h3>
+<p>Что подпись не отвечает на вопрос «кто этот агент и можно ли ему доверять», видят все. Самые обсуждаемые issues в репозитории спецификации посвящены именно этому, и по числу комментариев они на порядок обгоняют всё про провод:</p>
+
+<figure class="fig" id="fig-identity-issues">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Самые обсуждаемые issues в a2aproject/A2A", "unit": "комментариев",
+ "emphasis": ["#1672", "#1786", "#1829", "#1628", "#1575", "#1769", "#1717"],
+ "rows": [["#1672", 658, "проверка идентичности агента"], ["#1786", 245, "криптографическая идентичность"], ["#1829", 143, "подпись Ed25519 + RFC 9421"], ["#1628", 124, "trust.signals[]"], ["#1575", 116, "идентичность и делегирование"], ["#1769", 99], ["#1717", 94, "метаданные управления"], ["#1929", 65, "официальный CLI"]],
+ "note": "GitHub, сортировка по комментариям, снимок 30 сентября 2026."}
+</script>
+<figcaption>Семь из восьми самых комментируемых issues — предложения об идентичности агентов и доверии к ним. Единственное исключение, запрос на официальный CLI, закончился тем, что CLI сделали. Из предложений об идентичности в текст спецификации пока не попало ни одно.</figcaption>
+</figure>
+
+<p>Читать эти треды полезно, но с поправкой. В #1672 на 658 комментариев узнаваемый рисунок: аккаунт предлагает схему со ссылкой на собственный продукт (AgentID, APS, qntm, MolTrust, MoltBridge), второй аккаунт «независимо» её подтверждает, образуется «Agent Identity Working Group», которая ратифицирует свою спецификацию QSP-1 примерно за сутки, с 23 на 24 марта 2026 года<a class="cite" href="#src-17">17</a>. Умысел это или стая агентов, продвигающих своих хозяев, снаружи не отличить. Число комментариев в трекере горячего стандарта в 2026 году ничего не говорит о консенсусе. Решения ищи в тексте спецификации и в ADR.</p>
+</section>
+
+<section id="versions">
+<h2>Версия 1.0 на бумаге, 0.3 в проводе</h2>
+<p>Возьмём того же агента release notes и включим ему режим совместимости с 0.3: один флаг <code>enable_v0_3_compat=True</code> при создании маршрутов. Теперь отправим два запроса без заголовка <code>A2A-Version</code>, как делает клиент, написанный год назад:</p>
+
+<div class="tabs">
+<section data-tab="Метод 0.3, без заголовка">
+<script type="text/plain" class="code" data-lang="json" data-title="message/send → ответ в формате 0.3 (снято с живого сервера, сокращено)">
+→ {"jsonrpc": "2.0", "id": 1, "method": "message/send",
+   "params": {"message": {"messageId": "x1", "role": "user",
+              "parts": [{"kind": "text", "text": "feat: x\n1.0.0"}]}}}
+← {"id": 1, "jsonrpc": "2.0", "result": {
+     "kind": "task", "id": "62d17120-…", "contextId": "261fe76c-…",
+     "status": {"state": "completed", "timestamp": "2026-09-30T16:59:03.886182Z"},
+     "artifacts": [{"artifactId": "release-notes", "name": "RELEASE_NOTES.md",
+                    "parts": [{"kind": "text", "text": "## 1.0.0\n"}, "…"]}],
+     "history": ["…"]}}
+</script>
+</section>
+<section data-tab="Метод 1.0, без заголовка">
+<script type="text/plain" class="code" data-lang="json" data-title="SendMessage → ошибка версии (снято с живого сервера)">
+→ {"jsonrpc": "2.0", "id": 2, "method": "SendMessage",
+   "params": {"message": {"messageId": "x2", "role": "ROLE_USER", "parts": [{"text": "feat: y\n1.0.0"}]}}}
+← {"error": {"code": -32009,
+             "message": "A2A version '0.3' is not supported by this handler. Expected version '1.0'.",
+             "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                       "reason": "VERSION_NOT_SUPPORTED", "domain": "a2a-protocol.org", "metadata": {}}]},
+   "id": 2, "jsonrpc": "2.0"}
+</script>
+</section>
+</div>
+
+<p>Один и тот же агент, одна и та же работа, два разных провода. Старый клиент получил задачу со <code>"state": "completed"</code> и частями с <code>"kind": "text"</code>, как в 0.3. Новый метод без заголовка упёрся в ошибку, в которой сервер сам объясняет, что принял запрос за версию 0.3. Всё дело в правиле из раздела 3.6: клиент обязан отправлять <code>A2A-Version</code> с каждым запросом, а сервер обязан считать пустой заголовок версией 0.3<a class="cite" href="#src-1">1</a>. Сервер без режима совместимости отвечает на запрос без заголовка громкой ошибкой <code>-32009</code>. Сервер с режимом совместимости отвечает молча и в старом формате, и клиент, который ждёт <code>TASK_STATE_COMPLETED</code>, будет вечно ждать завершения задачи, которая давно закончилась.</p>
+
+<figure class="fig" id="fig-version">
+<script type="text/x-mermaid">
+flowchart TD
+  req["Запрос к агенту"]:::accent --> h{"A2A-Version?"}
+  h -- "пусто" --> v03["считаем 0.3"]
+  h -- "1.0" --> ok10["обработчик 1.0<br/>TASK_STATE_*, ROLE_*"]:::ok
+  h -- "0.5" --> err["−32009<br/>VERSION_NOT_SUPPORTED"]:::warn
+  v03 --> c{"режим совместимости?"}
+  c -- "да" --> ok03["обработчик 0.3<br/>kind, completed, final"]:::violet
+  c -- "нет" --> err
+</script>
+<figcaption>Что сервер делает с заголовком версии. Опасная ветка — фиолетовая: забытый заголовок на сервере с режимом совместимости не даёт ошибки, а тихо переключает ответ на формат 0.3.</figcaption>
+</figure>
+
+<p>На стороне клиента всегда выставляй заголовок явно. Python SDK 1.x делает это сам, Go SDK начал с версии 2.0.0, у официального CLI есть флаг <code>--a2a-version</code><a class="cite" href="#src-18">18</a>. Проблема в самописных клиентах на <code>httpx</code> и в клиентах, собранных год назад. На стороне сервера режим совместимости нужен, пока твои потребители сидят на 0.3, и включается он так<a class="cite" href="#src-6">6</a>:</p>
+
+<script type="text/plain" class="code" data-lang="python" data-title="Два протокола на одном агенте, a2a-sdk 1.x (из миграционного гайда)">
+supported_interfaces=[
+    AgentInterface(protocol_binding='JSONRPC', protocol_version='1.0', url='https://notes.example.com/'),
+    AgentInterface(protocol_binding='JSONRPC', protocol_version='0.3', url='https://notes.example.com/'),
+]
+# ...
+create_jsonrpc_routes(request_handler, rpc_url='/', enable_v0_3_compat=True)
+create_rest_routes(request_handler, enable_v0_3_compat=True)
+</script>
+
+<p>Интерфейс с <code>protocol_version='0.3'</code> в карточке делает ещё одну полезную вещь: SDK добавляет в JSON карточки поля верхнего уровня <code>url</code>, <code>preferredTransport</code> и <code>protocolVersion: "0.3"</code>, которые ищет старый клиент. Без него клиент 0.3 скачает карточку и не найдёт, куда стучаться. Официальный CLI в режиме сервера делает то же флагом <code>--card-compat</code><a class="cite" href="#src-8">8</a>.</p>
+
+<h3>Что поменялось между 0.3 и 1.0</h3>
+<p>Версия 1.0.0 вышла 12 марта 2026 года, через семь с половиной месяцев после 0.3.0, и в её списке изменений шестнадцать пунктов с пометкой BREAKING<a class="cite" href="#src-12">12</a>. Для того, кто переносит интеграцию, важны такие:</p>
+
+<table class="wide">
+<thead><tr><th>Что</th><th>0.3</th><th>1.0</th></tr></thead>
+<tbody>
+<tr><td>Методы JSON-RPC</td><td><code>message/send</code>, <code>tasks/get</code>, <code>tasks/resubscribe</code></td><td><code>SendMessage</code>, <code>GetTask</code>, <code>SubscribeToTask</code>, новый <code>ListTasks</code></td></tr>
+<tr><td>Перечисления</td><td><code>"completed"</code>, <code>"input-required"</code>, <code>"user"</code></td><td><code>"TASK_STATE_COMPLETED"</code>, <code>"TASK_STATE_INPUT_REQUIRED"</code>, <code>"ROLE_USER"</code></td></tr>
+<tr><td>Part</td><td><code>kind</code> + <code>TextPart</code>/<code>FilePart</code>/<code>DataPart</code>, <code>mimeType</code></td><td>один <code>Part</code> с <code>oneof</code>: <code>text</code>, <code>raw</code>, <code>url</code>, <code>data</code>; <code>mediaType</code></td></tr>
+<tr><td>События потока</td><td><code>"kind": "status-update"</code>, флаг <code>final</code></td><td>обёртки <code>statusUpdate</code> / <code>artifactUpdate</code>, конец — закрытие потока</td></tr>
+<tr><td>Карточка</td><td><code>url</code>, <code>preferredTransport</code>, <code>additionalInterfaces</code></td><td>упорядоченный <code>supportedInterfaces[]</code> с версией у каждого</td></tr>
+<tr><td>Ошибки</td><td>HTTP по RFC 9457</td><td><code>google.rpc.Status</code> и <code>ErrorInfo</code> во всех биндингах</td></tr>
+<tr><td>OAuth-потоки</td><td>implicit, password</td><td>убраны; добавлены device code (RFC 8628) и <code>pkceRequired</code></td></tr>
+<tr><td>REST-пути</td><td><code>/v1/message:send</code></td><td><code>/message:send</code></td></tr>
+<tr><td>gRPC</td><td>пакет <code>a2a.v1</code>, <code>TASK_STATE_CANCELLED</code>, в запросах имена вида <code>tasks/{id}</code></td><td>пакет <code>lf.a2a.v1</code>, то есть другие полные имена методов, и клиент из старого proto получит <code>UNIMPLEMENTED</code>; <code>TASK_STATE_CANCELED</code>; простой <code>id</code></td></tr>
+<tr><td>Вебхуки</td><td><code>PushNotificationConfig</code> внутри <code>TaskPushNotificationConfig</code></td><td>один тип <code>TaskPushNotificationConfig</code>, метод <code>ListTaskPushNotificationConfigs</code> во множественном числе</td></tr>
+<tr><td>Расширенная карточка</td><td>флаг <code>supportsAuthenticatedExtendedCard</code> в корне карточки</td><td><code>capabilities.extendedAgentCard</code></td></tr>
+</tbody>
+</table>
+
+<p>Таблица собрана по миграционному документу<a class="cite" href="#src-11">11</a>, changelog спецификации<a class="cite" href="#src-12">12</a> и двум версиям proto<a class="cite" href="#src-3">3</a>. Сама смена регистра перечислений выросла из ADR-001, где комитет выбрал ProtoJSON как нормативную сериализацию. Мотив понятный: одна модель данных для трёх биндингов вместо трёх рукописных. Цена тоже понятная: каждый клиент, который сравнивал <code>state == "completed"</code>, сломался молча.</p>
+
+<ol class="timeline">
+  <li class="is-major"><time>9 апреля 2025</time><p>Google публикует A2A, спецификация 0.1.0 с методами <code>tasks/send</code> и <code>tasks/sendSubscribe</code>. Больше 50 партнёров на старте<a class="cite" href="#src-19">19</a>.</p></li>
+  <li><time>май — июль 2025</time><p>Линия 0.2.x: уже в 0.2.0 <code>message/send</code> вместо <code>tasks/send</code>, в 0.2.2 (9 июня) — биндинги gRPC и REST и механизм расширений.</p></li>
+  <li class="is-major"><time>23 июня 2025</time><p>Google передаёт A2A в Linux Foundation.</p></li>
+  <li><time>30 июля 2025</time><p>0.3.0: путь <code>agent-card.json</code>, подписи карточек, mTLS, отдельный метод для расширенной карточки.</p></li>
+  <li><time>25 августа 2025</time><p>IBM вливает свой Agent Communication Protocol (ACP) в A2A.</p></li>
+  <li><time>18 ноября 2025</time><p>ADR-001: ProtoJSON становится нормативной сериализацией.</p></li>
+  <li class="is-major"><time>12 марта 2026</time><p>1.0.0: proto как источник истины, PascalCase-методы, <code>ListTasks</code>, тенанты, новый формат ошибок.</p></li>
+  <li><time>20 апреля 2026</time><p>Python SDK 1.0.0, через 39 дней после спецификации.</p></li>
+  <li><time>26 мая 2026</time><p>1.0.1: предпочтительный тип <code>application/a2a+json</code>, правки текста. Последний релиз спецификации на конец сентября.</p></li>
+  <li class="is-major"><time>17 августа 2026</time><p>A2A входит в Agentic AI Foundation, где уже живёт MCP.</p></li>
+</ol>
+
+<h3>Кто на чём говорит</h3>
+<p>Версии SDK с версией протокола не совпадают, и это первое, что сбивает. На 30 сентября 2026 года версии такие: Python-пакет <code>a2a-sdk</code> 1.2.1, Go-модуль v2.6.0 (вторая мажорная версия и есть поддержка спецификации 1.0), <code>@a2a-js/sdk</code> 1.3.0, a2a-java 1.4.0.Final, а .NET-пакет <code>A2A</code> всё ещё в 1.0.0-preview2 от 9 апреля. Go-SDK вышел через пять дней после спецификации 1.0, Python — через 39, стабильного .NET нет через 202 дня<a class="cite" href="#src-18">18</a>. Самый молодой официальный SDK — для Rust, репозиторий <code>a2a-rs</code> создан 3 апреля 2026 года. Фреймворки поверх SDK отстают ещё сильнее:</p>
+
+<table class="wide">
+<thead><tr><th>Платформа</th><th>Роль в A2A</th><th>На каком протоколе, по зависимостям и документации</th></tr></thead>
+<tbody>
+<tr><td>Google ADK</td><td>сервер (<code>to_a2a</code>) и клиент (<code>RemoteA2aAgent</code>), помечено Experimental</td><td>допускает <code>a2a-sdk</code> от 0.3.4 до 2, версию определяет при запуске</td></tr>
+<tr><td>Microsoft Agent Framework</td><td>клиент <code>A2AAgent</code> на C#, Python, Go</td><td><span class="yes">1.0</span>: требует <code>a2a-sdk&gt;=1.0.0</code></td></tr>
+<tr><td>LangSmith Agent Server</td><td>сервер на <code>/a2a/{assistant_id}</code>, только JSON-RPC</td><td><span class="part">объявляет 1.0, форма ответов 0.3</span></td></tr>
+<tr><td>CrewAI</td><td>клиент и сервер (<code>A2AClientConfig</code>, <code>A2AServerConfig</code>)</td><td><span class="no">0.3</span>: <code>a2a-sdk~=0.3.10</code></td></tr>
+<tr><td>AWS Strands</td><td>исполнитель <code>StrandsA2AExecutor</code></td><td><span class="no">0.3</span>: <code>a2a-sdk&lt;0.4.0</code></td></tr>
+<tr><td>Bedrock AgentCore</td><td>хостинг A2A-серверов</td><td><span class="part">экстры для 0.3 и 1.x, контракт в документации на 0.3</span></td></tr>
+<tr><td>Pydantic AI</td><td><code>Agent.to_a2a()</code> удалён в v2, замена в <code>fasta2a</code></td><td><span class="yes">1.0</span>: fasta2a с 1.0.0 от 5 сентября</td></tr>
+<tr><td>OpenAI Agents SDK</td><td>нет, PR отклонены</td><td>—</td></tr>
+</tbody>
+</table>
+
+<p>Источники по строкам: метаданные пакетов на PyPI<a class="cite" href="#src-18">18</a>, документация ADK<a class="cite" href="#src-16">16</a>, LangSmith<a class="cite" href="#src-7">7</a>, CrewAI<a class="cite" href="#src-20">20</a>, AgentCore<a class="cite" href="#src-13">13</a>, PR в Pydantic AI<a class="cite" href="#src-21">21</a>. Самая коварная строка — LangSmith. В его документации есть честный список известных провалов на наборе тестов совместимости: «Response wire shape is still v0.3», «SSE emits v0.3 objects with <code>final</code>», заголовок <code>A2A-Version</code> не читается вовсе. И ещё правило, которое там записано прямым текстом: имя метода из 1.0 возвращает перечисления в SCREAMING_SNAKE_CASE, имя из 0.3 — в нижнем регистре, «Pick one family per client and stay on it»<a class="cite" href="#src-7">7</a>.</p>
+
+<div class="note practice"><p>Не верь полю <code>protocolVersion</code> в чужой карточке, проверь провод. Самое дешёвое — один <code>curl</code> с <code>SendMessage</code> и взгляд на регистр состояния в ответе. Основательнее — официальный TCK: <code>./run_tck.py --sut-host … --level must</code> прогонит сервер по всем MUST из спецификации и отдельно покажет SHOULD и MAY<a class="cite" href="#src-22">22</a>. Совместимость SDK между собой проверяет соседний <code>a2a-itk</code>, а <code>a2a-inspector</code> из старых туториалов после v0.1.0 от 18 июня 2025 года релизов не выпускал, и отлаживать 1.0 удобнее через CLI. Если интеграция с партнёром важна, поставь TCK в CI рядом со своими eval-тестами из <a href="../17-evals/index.html">главы 17</a>.</p></div>
+
+<p>Что с этим делать в сентябре 2026 года. Новый сервер — на 1.0, с режимом совместимости 0.3 и интерфейсом 0.3 в карточке, пока среди потребителей есть CrewAI, Strands или AgentCore в конфигурации по умолчанию. Новый клиент — только 1.0, с явным заголовком версии и с разбором ответов через proto-типы SDK, а не через свои словари. И регулярная проверка партнёров: по опыту LangSmith видно, что объявленная версия и реальная могут расходиться месяцами. Это перестанет быть нужным, когда CrewAI и Strands снимут ограничение <code>&lt;0.4</code>; следи за их <code>requires_dist</code>.</p>
+</section>
+
+<section id="python">
+<h2>Свой агент за вечер</h2>
+<p>Все обмены выше сняты с агента, который целиком помещается в один файл. Он написан на <code>a2a-sdk</code> 1.2.1 по мотивам официального примера helloworld<a class="cite" href="#src-9">9</a>, запускался и проверялся клиентом, <code>curl</code> и официальным CLI. Модели внутри нет, чтобы пример работал без ключей: место, где агент решает, чего не хватает, и собирает результат, ты заменишь вызовом своей модели.</p>
+
+<script type="text/plain" class="code" data-lang="bash" data-title="Установка и запуск">
+uv venv && uv pip install "a2a-sdk[http-server]" uvicorn
+uv run python server.py          # слушает 127.0.0.1:9999
+</script>
+
+<div class="tabs">
+<section data-tab="Исполнитель">
+<script type="text/plain" class="code" data-lang="python" data-title="server.py, часть 1: исполнитель агента">
+import asyncio, re
+from a2a.helpers import get_message_text, new_task_from_user_message, new_text_message, new_text_part
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.tasks import TaskUpdater
+
+VERSION = re.compile(r"\bv?\d+\.\d+\.\d+\b")
+
+class ReleaseNotesExecutor(AgentExecutor):
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        task = context.current_task
+        if task is None:                                   # новая задача: сначала Task
+            task = new_task_from_user_message(context.message)
+            await event_queue.enqueue_event(task)
+        updater = TaskUpdater(event_queue, task.id, task.context_id)
+
+        history = [get_message_text(m) for m in task.history] + [get_message_text(context.message)]
+        version = VERSION.search("\n".join(history))
+        if version is None:                                # нечего делать без версии
+            await updater.requires_input(new_text_message(
+                "Какую версию выпускаем? Пришли номер вида 1.4.0.",
+                context_id=task.context_id, task_id=task.id))
+            return
+
+        await updater.start_work()
+        commits = [l.strip("-* ") for l in history[0].splitlines() if l.strip()]
+        chunks = [f"## {version.group(0)}\n"] + [f"- {c}\n" for c in commits]
+        for i, chunk in enumerate(chunks):                 # артефакт кусками
+            await updater.add_artifact(
+                parts=[new_text_part(chunk, media_type="text/markdown")],
+                artifact_id="release-notes", name="RELEASE_NOTES.md",
+                append=i > 0, last_chunk=i == len(chunks) - 1)
+            await asyncio.sleep(0.2)
+        await updater.complete()
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        await TaskUpdater(event_queue, context.task_id, context.context_id).cancel()
+</script>
+</section>
+<section data-tab="Карточка и маршруты">
+<script type="text/plain" class="code" data-lang="python" data-title="server.py, часть 2: карточка, обработчик, маршруты">
+import uvicorn
+from starlette.applications import Starlette
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes, create_rest_routes
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
+
+card = AgentCard(
+    name="Release Notes Agent", description="Собирает release notes из списка коммитов.",
+    version="0.1.0", default_input_modes=["text/plain"], default_output_modes=["text/markdown"],
+    capabilities=AgentCapabilities(streaming=True),
+    supported_interfaces=[
+        AgentInterface(protocol_binding="JSONRPC", url="http://127.0.0.1:9999/", protocol_version="1.0"),
+        AgentInterface(protocol_binding="HTTP+JSON", url="http://127.0.0.1:9999/rest", protocol_version="1.0"),
+    ],
+    skills=[AgentSkill(id="release-notes", name="Release notes",
+                       description="Превращает список коммитов в раздел CHANGELOG.",
+                       tags=["changelog", "git"], examples=["fix: retry on 429\nfeat: add ListTasks"])],
+)
+handler = DefaultRequestHandler(agent_executor=ReleaseNotesExecutor(),
+                                task_store=InMemoryTaskStore(), agent_card=card)
+app = Starlette(routes=create_agent_card_routes(card)
+                + create_jsonrpc_routes(handler, "/")
+                + create_rest_routes(handler, path_prefix="/rest"))
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=9999)
+</script>
+</section>
+</div>
+
+<p>Модель выполнения в SDK стоит понять один раз, потому что на ней спотыкаются все, кто переходит с 0.3. Твой код ничего не возвращает. Исполнитель кладёт события в очередь: сначала задачу, потом обновления статуса и куски артефактов. Обработчик запросов забирает их из очереди, применяет к задаче в хранилище и либо отдаёт клиенту потоком, либо ждёт терминального или прерванного состояния и отвечает целиком. С версии 1.0 порядок проверяется строго: сообщение вперемешку с событиями задачи, два сообщения подряд или обновление статуса раньше задачи дают <code>InvalidAgentResponseError</code><a class="cite" href="#src-6">6</a>. Другие изменения 1.0, из-за которых не собирается старый код: типы теперь сгенерированы из proto, а не написаны на Pydantic, <code>agent_card</code> у обработчика обязателен, вместо обёртки <code>A2AStarletteApplication</code> — фабрики маршрутов, которые монтируются в любое Starlette- или FastAPI-приложение.</p>
+
+<figure class="fig" id="fig-sdk">
+<script type="text/x-mermaid">
+flowchart TD
+  http["POST / или POST /rest/message:send"] --> disp["диспетчер биндинга<br/>проверка A2A-Version"]
+  disp --> rh["DefaultRequestHandler"]
+  store[("TaskStore")]:::mute -. текущая задача .-> rh
+  rh --> ex["AgentExecutor.execute()"]:::accent
+  ex -- "Task, statusUpdate,<br/>artifactUpdate" --> q["EventQueue"]
+  q --> chk{"порядок событий<br/>допустим?"}
+  chk -- "нет" --> bad["InvalidAgentResponseError"]:::warn
+  chk -- "да" --> save["применить к задаче"]
+  save --> store
+  save --> out["SSE-кадр или ожидание<br/>терминального состояния"]:::ok
+</script>
+<figcaption>Путь запроса внутри <code>a2a-sdk</code> 1.x. Исполнитель ничего не возвращает, он только пишет события в очередь. Обработчик проверяет их порядок, обновляет задачу в хранилище и решает, отдавать ли событие потоком сразу или ждать конца.</figcaption>
+</figure>
+
+<p>Клиент на том же SDK проходит оба хода разговора: получает вопрос, отвечает в ту же задачу и печатает артефакт по мере поступления. <code>create_client</code> сам скачивает карточку, выбирает биндинг по её порядку и ставит заголовок версии.</p>
+
+<script type="text/plain" class="code" data-lang="python" data-title="client.py (запускался против server.py)">
+import asyncio
+from a2a.client import ClientConfig, create_client
+from a2a.helpers import get_message_text, new_text_message
+from a2a.types import Role, SendMessageRequest, TaskState
+
+async def main() -> None:
+    client = await create_client("http://127.0.0.1:9999", client_config=ClientConfig(streaming=True))
+    first = new_text_message("fix: retry on 429\nfeat: add ListTasks", role=Role.ROLE_USER)
+    task = None
+    async for event in client.send_message(SendMessageRequest(message=first)):
+        if event.HasField("task"):
+            task = event.task
+        elif event.HasField("status_update"):
+            task.status.CopyFrom(event.status_update.status)
+
+    if task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED:
+        print("агент спрашивает:", get_message_text(task.status.message))
+        reply = new_text_message("1.4.0", role=Role.ROLE_USER, task_id=task.id, context_id=task.context_id)
+        async for event in client.send_message(SendMessageRequest(message=reply)):
+            if event.HasField("artifact_update"):
+                for part in event.artifact_update.artifact.parts:
+                    print(part.text, end="")
+            elif event.HasField("status_update"):
+                print("состояние:", TaskState.Name(event.status_update.status.state))
+    await client.close()
+
+asyncio.run(main())
+</script>
+
+<script type="text/plain" class="code" data-lang="output" data-title="Вывод client.py">
+агент спрашивает: Какую версию выпускаем? Пришли номер вида 1.4.0.
+состояние: TASK_STATE_WORKING
+## 1.4.0
+- fix: retry on 429
+- feat: add ListTasks
+состояние: TASK_STATE_COMPLETED
+</script>
+
+<p>События приходят как proto-сообщения, поэтому проверка «что пришло» — это <code>HasField</code>, а не <code>isinstance</code> и не ключ словаря. Обрати внимание и на то, что клиент держит задачу у себя и обновляет её статусом из события: на продолжении разговора первым кадром придёт <code>statusUpdate</code>, а не задача.</p>
+
+<h3>Не только текст</h3>
+<p>Release notes — это текст, а агентам между собой чаще нужно передавать структуры и файлы. Для этого в <code>oneof</code> у <code>Part</code> есть ещё три варианта: <code>data</code> несёт произвольный JSON (в proto это <code>google.protobuf.Value</code>), <code>raw</code> — байты, <code>url</code> — ссылку на файл, а к файлам прилагаются <code>mediaType</code> и <code>filename</code>. Обёрток <code>TextPart</code>, <code>FilePart</code> и <code>DataPart</code> из 0.3 в SDK 1.x нет, поля ставятся прямо на <code>Part</code>. При миграции здесь спотыкаются дважды: словарь для <code>data</code> надо прогнать через <code>ParseDict</code>, а байты в <code>raw</code> кладутся как есть, в base64 их переводит сериализатор<a class="cite" href="#src-6">6</a>.</p>
+
+<div class="tabs">
+<section data-tab="Python">
+<script type="text/plain" class="code" data-lang="python" data-title="parts.py (запускался на a2a-sdk 1.2.1)" data-hl="9">
+from google.protobuf.json_format import MessageToJson, ParseDict
+from google.protobuf.struct_pb2 import Value
+from a2a.types import Message, Part, Role
+
+msg = Message(
+    message_id="m-20", role=Role.ROLE_USER,
+    parts=[
+        Part(text="Сравни эти два релиза"),
+        Part(data=ParseDict({"repo": "acme/api", "from": "1.3.0", "to": "1.4.0"}, Value())),
+        Part(url="https://ci.example.com/builds/812/junit.xml",
+             media_type="application/xml", filename="junit.xml"),
+    ],
+)
+print(MessageToJson(msg, indent=1, ensure_ascii=False))
+</script>
+</section>
+<section data-tab="На проводе">
+<script type="text/plain" class="code" data-lang="json" data-title="Вывод parts.py (отступы уплотнены)">
+{
+ "messageId": "m-20",
+ "role": "ROLE_USER",
+ "parts": [
+  {"text": "Сравни эти два релиза"},
+  {"data": {"repo": "acme/api", "from": "1.3.0", "to": "1.4.0"}},
+  {"url": "https://ci.example.com/builds/812/junit.xml",
+   "filename": "junit.xml", "mediaType": "application/xml"}
+ ]
+}
+</script>
+</section>
+</div>
+
+<p>Какие типы агент принимает и отдаёт, объявляет карточка: <code>defaultInputModes</code> и <code>defaultOutputModes</code> для агента целиком, <code>inputModes</code> и <code>outputModes</code> у навыка, если он отличается. Клиент перечисляет в <code>acceptedOutputModes</code> конфигурации запроса, что готов принять, и агенту по proto следует под это подстроиться<a class="cite" href="#src-3">3</a>. Тип, которого агент или навык не поддерживает, даёт <code>ContentTypeNotSupportedError</code> с кодом <code>-32005</code><a class="cite" href="#src-1">1</a>. Python SDK научился сверять медиатипы сообщений с карточкой только в 1.2.0, и эту проверку надо включать явно. В той же версии REST-ответы SDK стали приходить с <code>Content-Type: application/a2a+json</code>, который спецификация 1.0.1 сделала предпочтительным<a class="cite" href="#src-5">5</a>. Клиент, который сравнивает заголовок строго с <code>application/json</code>, на обновлённом агенте сломается.</p>
+
+<h3>A2A из Claude Code</h3>
+<p>Самый короткий путь дать Claude Code доступ к A2A-агентам на сентябрь 2026 года — официальный CLI <code>a2a</code>. Репозиторий появился 28 июля 2026 года, версия 0.3.0 вышла 24 сентября, и в README сказано, зачем он: «give your coding agent the <code>a2a</code> tool to offload work to remote A2A agents». К нему приложен Agent Skill, который учит Claude Code, Cursor и Codex пользоваться этим CLI<a class="cite" href="#src-8">8</a>. Сам по себе CLI — удобный инструмент отладки: карточка, отправка, поток и продолжение задачи на том же агенте выглядят так.</p>
+
+<script type="text/plain" class="code" data-lang="bash" data-title="a2a CLI 0.3.0 против server.py (снято вживую, блок History опущен)">
+$ a2a card get http://127.0.0.1:9999
+Name:         Release Notes Agent
+Description:  Собирает release notes из списка коммитов.
+Version:      0.1.0
+Interfaces:
+  JSONRPC      http://127.0.0.1:9999/
+  HTTP+JSON    http://127.0.0.1:9999/rest
+Streaming:    true
+Skills:
+  release-notes        Release notes
+
+$ a2a send -a http://127.0.0.1:9999 "fix: retry on 429"
+Task:     3a0f6bd9-5b84-44f2-8def-f7d087151e5c
+Context:  fb608fdc-b7b1-4112-87e9-645d8e4574ef
+Status:   input-required (2026-09-30T16:59:31Z)
+  Какую версию выпускаем? Пришли номер вида 1.4.0.
+Resume:     a2a send --task-id 3a0f6bd9-5b84-44f2-8def-f7d087151e5c "<reply>"
+
+$ a2a send -a http://127.0.0.1:9999 --task-id 3a0f6bd9-5b84-44f2-8def-f7d087151e5c --stream "1.4.0"
+[status] working
+[artifact] ## 1.4.0
+[artifact+] - fix: retry on 429
+[artifact+] - feat: add ListTasks
+[status] completed
+</script>
+
+<p>Строка <code>Resume:</code> в выводе написана для модели: она подсказывает следующую команду, и харнесс, который видит этот вывод, сам продолжит разговор. Повторная отправка в завершённую задачу даёт <code>Error: … is in terminal state: 3</code> и код выхода 1, так что сбой видно и скрипту, и агенту.</p>
+
+<figure class="fig wide" id="fig-claude-code">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Ты
+  participant CC as Claude Code
+  participant CLI as a2a CLI
+  participant R as Агент команды релизов
+  U->>CC: собери release notes через агента релизов
+  CC->>CLI: a2a card get https://notes…
+  CLI->>R: GET /.well-known/agent-card.json
+  CC->>CLI: a2a send -a https://notes… коммиты
+  CLI->>R: SendMessage
+  R-->>CLI: task INPUT_REQUIRED, вопрос о версии
+  CLI-->>CC: Status input-required, строка Resume
+  CC->>U: агент спрашивает версию
+  U->>CC: 1.4.0
+  CC->>CLI: a2a send --task-id … --stream 1.4.0
+  CLI->>R: SendStreamingMessage
+  R-->>CLI: artifactUpdate…, COMPLETED
+  CLI-->>CC: текст release notes
+</script>
+<figcaption>Как A2A-агент встраивается в сессию Claude Code через CLI и скилл. В этой схеме сам Claude Code протокола не знает: он вызывает <code>a2a</code> через Bash, читает вывод и переносит вопрос удалённого агента тебе. Ключевое звено — <code>taskId</code>, который модель должна донести до второй команды.</figcaption>
+</figure>
+
+<script type="text/plain" class="code" data-lang="bash" data-title="Поставить CLI и скилл">
+brew tap a2aproject/a2a-cli https://github.com/a2aproject/a2a-cli
+brew install a2a
+npx skills add https://github.com/a2aproject/a2a-cli --skill a2a-cli
+</script>
+
+<div class="note warn"><p><code>a2a send</code> отправляет наружу всё, что модель решит туда положить, включая куски твоего кода и содержимое <code>.env</code>, если они оказались в контексте. Чтение (<code>a2a card get</code>, <code>a2a task get</code>) можно разрешить в настройках Claude Code без вопросов, а отправку держи на подтверждении и выпиши в <code>CLAUDE.md</code>, к каким агентам ходить можно. Про то, как скиллы попадают в контекст, — <a href="../06-skills/index.html">глава 6</a>.</p></div>
+
+<p>У CLI есть и обратный режим. <code>a2a server --exec "команда"</code> превращает любую программу в A2A-агента: сообщение уходит ей на stdin, stdout становится артефактом, ненулевой код выхода — провалом задачи. Проверка на <code>tr a-z A-Z</code> даёт карточку с одним интерфейсом HTTP+JSON и задачу, завершённую с артефактом <code>HELLO FROM A2A</code>. Отсюда вечерний эксперимент: выставить в сеть headless Claude Code как A2A-агента.</p>
+
+<script type="text/plain" class="code" data-lang="bash" data-title="Набросок: Claude Code как A2A-агент (не запускался)">
+# терминал 1: агент слушает только localhost
+a2a server --exec "claude -p --output-format text" --name reviewer --port 8080
+
+# терминал 2
+a2a send -a http://127.0.0.1:8080 "Найди в ./src функции без тестов"
+</script>
+
+<p>Авторы CLI предупреждают, что <code>--echo</code> и <code>--exec</code> сделаны «for learning, demos, and testing, not for production use»<a class="cite" href="#src-8">8</a>. Здесь это не формальность: у такого агента нет аутентификации, а за ним стоит харнесс, который умеет править файлы и запускать команды. Держи его на <code>127.0.0.1</code> (это адрес по умолчанию) и не открывай порт наружу.</p>
+
+<h3>Если агент уже написан на фреймворке</h3>
+<p>Писать исполнитель руками нужно не всегда. Большинство фреймворков выставляют готового агента как A2A-сервер одной функцией, но помни таблицу из <a href="#versions">предыдущего раздела</a>: у CrewAI и Strands под капотом 0.3.</p>
+
+<div class="tabs">
+<section data-tab="Pydantic AI / fasta2a">
+<script type="text/plain" class="code" data-lang="python" data-title="fasta2a ≥ 1.0 (из PR #5426)">
+from fasta2a.pydantic_ai import agent_to_a2a
+from pydantic_ai import Agent
+
+agent = Agent('openai:gpt-5.2')
+app = agent_to_a2a(agent)
+</script>
+</section>
+<section data-tab="CrewAI, клиент">
+<script type="text/plain" class="code" data-lang="python" data-title="CrewAI: делегировать удалённому агенту (из документации, выдержка)">
+from crewai.a2a import A2AClientConfig
+
+agent = Agent(
+    role="Research Coordinator",
+    goal="Coordinate research tasks efficiently",
+    backstory="Expert at delegating to specialized research agents",
+    llm="gpt-4o",
+    a2a=A2AClientConfig(
+        endpoint="https://example.com/.well-known/agent-card.json",
+        timeout=120,
+        max_turns=10
+    )
+)
+</script>
+</section>
+<section data-tab="Strands на AgentCore">
+<script type="text/plain" class="code" data-lang="python" data-title="Strands + Bedrock AgentCore (из документации AWS)">
+from strands import Agent, tool
+from strands.multiagent.a2a.executor import StrandsA2AExecutor
+from bedrock_agentcore.runtime import serve_a2a
+from model.load import load_model
+
+@tool
+def add_numbers(a: int, b: int) -> int:
+    """Return the sum of two numbers."""
+    return a + b
+
+agent = Agent(model=load_model(),
+              system_prompt="You are a helpful assistant. Use tools when appropriate.",
+              tools=[add_numbers])
+
+if __name__ == "__main__":
+    serve_a2a(StrandsA2AExecutor(agent))
+</script>
+</section>
+</div>
+
+<p>Pydantic AI в версии 2 убрал встроенный <code>Agent.to_a2a()</code>: библиотеку <code>fasta2a</code> передали в Datalayer, и мост теперь живёт там<a class="cite" href="#src-21">21</a>. В Google ADK агент выставляется через <code>to_a2a(root_agent, port=…)</code> или <code>adk api_server --a2a</code>, а чужой агент подключается как <code>RemoteA2aAgent</code> с URL карточки. Страница об A2A в документации ADK на сентябрь 2026 года помечена Experimental<a class="cite" href="#src-16">16</a>, хотя протокол придумал Google. У LangGraph картина обратная: серверная сторона есть в LangSmith Agent Server, а готового клиента в документации не показано, чужого агента там вызывают голым JSON-RPC через <code>aiohttp</code><a class="cite" href="#src-7">7</a>. Если граф должен сам ходить к A2A-агентам, бери клиент из <code>a2a-sdk</code> внутри узла или инструмента.</p>
+</section>
+
+<section id="security">
+<h2>Где ломается безопасность</h2>
+<p>28 августа 2026 года официальный Java SDK опубликовал четыре security advisory, а 9 сентября ещё одно. Самое серьёзное, GHSA-qw47-mcm5-934w с оценкой CVSS 7.5, называется «Fail-open default task authorization».</p>
+
+<p>Хранилище задач по умолчанию читает задачу простым поиском в словаре: «<code>InMemoryTaskStore.get(String taskId)</code> is a bare map lookup with no authorization check». Проверка владельца включалась, только если приложение само подключало провайдер авторизации и декоратор через CDI (DI-контейнер из Jakarta EE). Сервер на Spring или собранный вручную этой проверки не видел никогда, и любой клиент, знающий или угадавший <code>taskId</code>, читал чужую задачу<a class="cite" href="#src-23">23</a>.</p>
+
+<p>Требование тут однозначное: «Servers MUST implement authorization checks on every A2A Protocol Operations request», и результаты списков обязаны ограничиваться тем, что вызывающему можно видеть, даже без фильтра по <code>contextId</code><a class="cite" href="#src-1">1</a>.</p>
+
+<p>Python SDK закрыл похожие места тише: в 1.1.4 отмена и подписка стали проверять владельца, в 1.2.0 появилась проверка, что <code>contextId</code> сообщения совпадает с контекстом задачи, и отдельных advisory на это не выпускали<a class="cite" href="#src-5">5</a>. Вывод неприятный: настройки SDK по умолчанию годятся для демо. Прежде чем выставлять агента наружу, найди в своём коде место, где задача достаётся из хранилища, и убедись, что рядом стоит проверка владельца.</p>
+
+<h3>Аутентификация живёт снаружи протокола</h3>
+<p>В самих сообщениях A2A нет полей, которые говорили бы, кто их отправил. Аутентификация целиком отдана HTTP-слою, а карточка только объявляет, что агент примет: API-ключ, HTTP Bearer или Basic, OAuth 2.0, OpenID Connect или взаимный TLS. С версии 0.3.0 требования можно задать на уровне отдельного навыка, а в 1.0 из OAuth убрали потоки implicit и password и добавили device code и обязательный PKCE<a class="cite" href="#src-12">12</a>. Шифрование канала обязательно, а вот TLS 1.3 — только рекомендация: спецификация пишет «MUST use encrypted communication» и отдельно «TLS 1.3+ recommended»<a class="cite" href="#src-1">1</a>. Как устроить выдачу и хранение токенов агентам, разобрано в <a href="../15-integrations-auth/index.html">главе 15</a>. Здесь важнее другое: всё, что приходит от удалённого агента, включая его карточку, — недоверенный ввод.</p>
+
+<p>Второе advisory Java SDK показывает, насколько буквально это надо понимать. Клиент брал из чужой карточки схему <code>APIKeySecurityScheme</code> и использовал её поле <code>name</code> как имя HTTP-заголовка для своего секрета. Вредоносный агент объявлял схему с заголовком <code>X-Leaked-Cred</code>, получал в нём ключ и отвечал редиректом 302 на свой сервер. HTTP-клиент JDK при переходе на чужой домен вычищает только заголовок <code>Authorization</code>, поэтому ключ под нестандартным именем уезжал злоумышленнику (GHSA-9rhm-2h4x-jwmx).</p>
+
+<p>9 сентября вышло продолжение: на Android синхронный POST обходил исправление и снова пересылал креды через редирект<a class="cite" href="#src-23">23</a>. Правило для клиента: не пускай строки из карточки в имена заголовков и не следуй редиректам с кредами на другой домен.</p>
+
+<h3>Вебхук как SSRF</h3>
+<p>Третья находка — в вебхуках из <a href="#streaming">раздела про поток</a>. Клиент сам сообщает агенту URL, на который тот будет POST'ить данные задачи. В a2a-java до исправления этот URL никак не проверялся: «no block on loopback, RFC1918, link-local (<code>169.254.0.0/16</code>, including the <code>169.254.169.254</code> metadata address)», а оба встроенных HTTP-клиента ходили по редиректам (GHSA-q78c-5jjq-57g8)<a class="cite" href="#src-23">23</a>.</p>
+
+<figure class="fig wide" id="fig-ssrf">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant X as Клиент злоумышленника
+  participant A as Агент на a2a-java ≤ 1.2.0
+  participant M as Внутренний адрес 169.254.169.254
+  X->>A: SendMessage, любая задача
+  A-->>X: task {id}
+  X->>A: CreateTaskPushNotificationConfig url=http://169.254.169.254/…
+  A-->>X: 200, конфиг сохранён без проверки
+  Note over A: задача обновляется
+  A->>M: POST данные задачи
+  M-->>A: ответ внутреннего сервиса
+  Note over X,A: то же через 302 с внешнего URL на внутренний
+</script>
+<figcaption>Как вебхук превращается в SSRF. Агент ходит туда, куда скажет клиент, изнутри своей сети. Проверять адрес нужно дважды: при сохранении конфигурации и перед каждой отправкой, потому что DNS и редиректы меняют цель между этими моментами.</figcaption>
+</figure>
+
+<p>Стандарт проверку URL только советует: агентам «SHOULD validate webhook URLs to prevent SSRF», с перечнем частных диапазонов, localhost и link-local адресов<a class="cite" href="#src-1">1</a>. Java SDK поставлялся без неё, Python SDK добавил проверку перед отправкой в 1.1.4 с пометкой «SSRF hardening»<a class="cite" href="#src-5">5</a>. Если ты поддерживаешь вебхуки на своём агенте, заведи список разрешённых доменов для них и не надейся на чёрный список адресов.</p>
+
+<p>К ссылкам на файлы спецификация строже, чем к вебхукам. В разделе о регистрации типа <code>application/a2a+json</code> сказано, что «File references within A2A messages MUST be validated to prevent server-side request forgery»<a class="cite" href="#src-1">1</a>. Если твой агент скачивает то, что клиент положил в <code>Part.url</code>, всё сказанное выше относится и к нему. Четвёртое advisory из августовского пакета a2a-java, GHSA-x32g-jvvm-4725, мельче, но тоже про вебхуки: SDK писал креды из конфигурации push-уведомлений в лог открытым текстом<a class="cite" href="#src-23">23</a>. Блок <code>authentication</code> в этой конфигурации — секрет, в логи и в ответы <code>Get</code>/<code>List</code> он должен попадать замаскированным.</p>
+
+<h3>Непрозрачность защищает не того, кого ты думаешь</h3>
+<p>Непрозрачность из <a href="#task-not-call">первого раздела</a> прячет внутренности агента-сервера от клиента. Клиента от вредоносного сервера она не защищает никак. Unit 42 из Palo Alto Networks 31 октября 2025 года показали атаку, которую назвали agent session smuggling<a class="cite" href="#src-24">24</a>. Стенд: финансовый ассистент на Google ADK с моделью Gemini 2.5 Pro и инструментами <code>get_portfolio</code>, <code>get_profile</code>, <code>buy_stock</code>, <code>sell_stock</code>, который по A2A делегирует сбор новостей «исследовательскому» агенту на Gemini 2.5 Flash. Исследовательский агент вредоносный.</p>
+
+<figure class="fig wide" id="fig-smuggling">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Пользователь
+  participant F as Финансовый ассистент
+  participant R as Вредоносный агент новостей
+  U->>F: сводка новостей по рынку ИИ
+  F->>R: SendMessage, найди новости
+  R-->>F: уточняющий вопрос
+  F->>R: ответ в ту же сессию
+  R-->>F: для обработки нужно купить 10 акций
+  F->>F: buy_stock, 10 акций
+  F->>R: ответ в ту же сессию
+  R-->>F: COMPLETED, нормальная сводка
+  F-->>U: сводка новостей
+  Note over U,F: промежуточных ходов пользователь не видит
+</script>
+<figcaption>Схема второго сценария Unit 42. Удалённый агент пользуется тем, что задача в A2A многоходовая: инструкции едут в промежуточных ходах, а пользователь видит только финальный ответ своего агента. В первом сценарии тем же способом выманивали историю чата, системные инструкции и схемы инструментов.</figcaption>
+</figure>
+
+<p>В первом сценарии вредоносный агент серией безобидных уточняющих вопросов выманил у ассистента историю чата, системные инструкции, список инструментов и их схемы. Во втором, пользуясь этим знанием, подсунул в промежуточный ход «дополнительные требования к обработке», и ассистент сам вызвал <code>buy_stock</code>: в логе это «an unauthorized trade of 10 shares on behalf of the victim user». Unit 42 оговаривают: «This research does not reveal any vulnerability in the A2A protocol itself». Атака работает на любом протоколе с памятью разговора. A2A просто даёт ей удобный канал: вести с клиентом многоходовой диалог внутри задачи, через <code>INPUT_REQUIRED</code> и продолжение тем же <code>taskId</code>, — штатное поведение агента.</p>
+
+<p>Защиты, которые предлагают авторы, применимы к любому твоему оркестратору. Подтверждение действий с последствиями — вне модели: пауза в оркестраторе и запрос пользователю через статичный интерфейс или отдельный канал, который модель не может сгенерировать. Привязка к исходной задаче: клиент запоминает намерение пользователя и проверяет, что ходы удалённого агента к нему относятся. Проверка удалённого агента, например по подписанной карточке. В терминах A2A первое правило звучит так: ответ удалённого агента — это данные для твоей модели, а не команды, и инструменты с побочными эффектами не должны вызываться из хода, который инициировал удалённый агент, без человека. Общая теория промпт-инъекций — в <a href="../16-security/index.html">главе 16</a>.</p>
+
+<div class="note debate"><p>Unit 42 пишут, что уязвимости в протоколе нет. A2ABreak, первый формальный разбор спецификации (arXiv, 9 сентября 2026, Лотфи, Рахман, Карим, Бертино), утверждает обратное: авторы превратили 929 утверждений спецификации в автомат из 37 состояний и 76 переходов и нашли 11 новых уязвимостей, которые эксплуатирует противник, полностью соблюдающий спецификацию. Среди них инъекция чужого <code>contextId</code> между клиентами, потеря идентичности в многоходовых цепочках делегирования и ничем не подтверждённые заявления о возможностях в карточке. Точность метода против экспертной разметки 73,3%, F1 84,6%, а простая модель, которой дали текст спецификации без формализации, не нашла ни одной подтверждённой<a class="cite" href="#src-25">25</a>. Противоречия тут меньше, чем кажется: Unit 42 говорят о злонамеренном содержимом, A2ABreak — о том, чего спецификация не требует проверять.</p>
+<p>Из обоих разборов следует одно: всё, что спецификация оставляет на уровне SHOULD или не упоминает вовсе, проверяешь ты сам.</p></div>
+
+<h3>Цепочка AUTH_REQUIRED</h3>
+<p>Самое свежее место спецификации — авторизация посреди задачи. Агент, которому для работы нужен доступ к чужой системе, например к календарю пользователя, переводит задачу в <code>TASK_STATE_AUTH_REQUIRED</code>. Клиент получает креды вне протокола, обычным OAuth-потоком, и задача продолжается. 30 июля 2026 года в спецификацию добавили раздел 7.6.4 о границах такой авторизации. Там же, в разделе 7.6, описан случай цепочки. Если клиент сам агент, он может передать запрос дальше своему клиенту, переведя в <code>AUTH_REQUIRED</code> собственную задачу. Так образуется «a chain of Tasks in <code>TASK_STATE_AUTH_REQUIRED</code>»<a class="cite" href="#src-1">1</a>.</p>
+
+<figure class="fig wide" id="fig-auth-chain">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Пользователь
+  participant A as Агент A, оркестратор
+  participant B as Агент B, календарь
+  participant AS as OAuth-сервер календаря
+  U->>A: назначь встречу с командой
+  A->>B: SendMessage
+  B-->>A: AUTH_REQUIRED, нужен доступ к календарю
+  A-->>U: своя задача в AUTH_REQUIRED
+  U->>AS: вход и согласие вне A2A
+  AS-->>B: креды привязаны к агенту B
+  B->>B: продолжает работу
+  B-->>A: COMPLETED
+  A-->>U: COMPLETED
+</script>
+<figcaption>Цепочка задач в <code>AUTH_REQUIRED</code> по разделу 7.6 спецификации. Сами креды по A2A не едут: пользователь проходит OAuth вне протокола, а креды должны быть привязаны к агенту, который их запросил, чтобы их нельзя было использовать дальше по цепочке.</figcaption>
+</figure>
+
+<p>К этой схеме в спецификации два главных требования. Креды «SHOULD be bound to the agent which originated the request, such that only this agent is able to use the credentials» — иначе агент A, получив токен для B, может унести его куда угодно. И переход в <code>AUTH_REQUIRED</code> сам по себе ничего не разрешает: агенты «MUST NOT treat the <code>TASK_STATE_AUTH_REQUIRED</code> state transition, by itself, as authorization for any particular operation»<a class="cite" href="#src-1">1</a>.</p>
+
+<p>Первое требование — только SHOULD, и именно многоходовую потерю идентичности в цепочках A2ABreak называет одним из классов уязвимостей. Для той же задачи в репозитории проекта заведено экспериментальное расширение <code>experimental-ext-oid4vp-auth</code> на основе OpenID for Verifiable Presentations<a class="cite" href="#src-26">26</a>. Пока оно экспериментальное, строй цепочки так, чтобы каждый агент получал свой токен со своей аудиторией и своим набором прав, и ни один токен не проходил через промежуточного агента.</p>
+</section>
+
+<section id="production">
+<h2>Трассы, история и долгие задачи</h2>
+<p>В документации LangSmith к их A2A-эндпоинту есть абзац, который стоит прочитать каждому, кто выставляет агента наружу. По умолчанию сервер отдаёт в <code>history</code> всю историю контекста, а не задачи, и поэтому «the second task in a context replays the first task's messages… including earlier tool results and A2UI payloads»<a class="cite" href="#src-7">7</a>. Клиент, который прислал вторую задачу в тот же <code>contextId</code>, получает результаты инструментов из первой. Если эти задачи ставили разные люди или разные агенты, это утечка данных, оформленная как фича.</p>
+
+<p>История в A2A — поверхность раскрытия данных, и обращаться с ней нужно соответственно. Со стороны клиента проси ровно столько, сколько нужно: <code>historyLength</code> в <code>GetTask</code> и в конфигурации <code>SendMessage</code>, ноль — если история не нужна вовсе. Сервер вправе урезать больше, и LangSmith, например, не отдаёт больше десяти сообщений, отвечая <code>-32602</code> на запрос сверх лимита, а область истории переключает собственным расширением <code>historyScope: task|context</code>. Со стороны сервера не складывай в историю задачи то, что не должно уходить вызывающему: промежуточные вызовы инструментов, куски системного промпта, данные других пользователей. Всё, что лежит в <code>history</code>, по запросу уедет по проводу. Спецификация и сама видит здесь дыру: в дорожной карте к v1.1 стоит эпик #1991 «Coherent Task History», где собраны вопросы о том, что должно лежать в <code>history</code> и как её запрашивать, так что эти правила ещё будут уточнять<a class="cite" href="#src-15">15</a>.</p>
+
+<h3>Одна трасса через несколько агентов</h3>
+<p>Самый конкретный рецепт сквозной трассировки из найденных — снова у LangSmith. Их сервер сам превращает <code>contextId</code> из A2A в <code>thread_id</code> своей трассировки, и совет звучит так: «Let the first agent mint the <code>contextId</code>, then pass that same value to every agent for the rest of the conversation». Агенты не на LangGraph должны читать <code>params.message.contextId</code> и ставить его в метаданные своего OpenTelemetry-спана<a class="cite" href="#src-7">7</a>. Тогда разговор, прошедший через три агента, в интерфейсе трассировки виден одной нитью.</p>
+
+<div class="note debate"><p>Этот совет спорит со спецификацией. Раздел 3.4.1 разрешает агенту принимать <code>contextId</code> от клиента, но говорит, что клиенты «SHOULD NOT provide a client-generated <code>contextId</code> to a server unless they understand how the server will process that <code>contextId</code>»<a class="cite" href="#src-1">1</a>. A2ABreak, в свою очередь, называет инъекцию чужого <code>contextId</code> одним из классов уязвимостей. Если сервер принимает любой <code>contextId</code> от любого клиента и хранит под ним историю, общий идентификатор становится общим доступом. Выбор такой: сквозной <code>contextId</code> между своими агентами внутри одной границы доверия — да, это удобно и безопасно, если каждый сервер проверяет, что контекст принадлежит вызывающему. Через границу организации — нет: передавай свой идентификатор трассы отдельно, а контекст пусть выдаёт принимающая сторона.</p></div>
+
+<p>Для отдельного идентификатора трассы нормативного поля в A2A нет. Документ проекта о корпоративном развёртывании советует W3C Trace Context в обычных HTTP-заголовках и логирование <code>taskId</code> и идентификаторов корреляции на обеих сторонах<a class="cite" href="#src-2">2</a>. MCP в ревизии 2026-07-28 стандартизовал <code>traceparent</code>, <code>tracestate</code> и <code>baggage</code> в поле <code>_meta</code><a class="cite" href="#src-27">27</a>, у A2A аналога пока нет.</p>
+
+<p>Значит, <code>traceparent</code> передаёшь заголовком сам, через перехватчик клиента, а в спан на сервере кладёшь <code>contextId</code>, <code>taskId</code> и имя навыка. У Python SDK есть экстра <code>telemetry</code>, но пробрасывает ли она W3C-заголовки сама, проверь по коду своей версии, прежде чем на это полагаться. И помни, что трасса покажет, когда и сколько работал чужой агент, но не почему: внутри непрозрачного агента твоя трассировка кончается.</p>
+
+<h3>Задачи, которые живут дольше процесса</h3>
+<p><code>InMemoryTaskStore</code> из примеров теряет все задачи при перезапуске и не виден соседним репликам. Клиент, который через час спросит <code>GetTask</code>, получит <code>TaskNotFoundError</code> и решит, что задачи не было. У Python SDK есть экстры <code>postgresql</code>, <code>mysql</code> и <code>sqlite</code> для хранилища в базе, а в 1.2.0 появился кластерный режим для нескольких реплик<a class="cite" href="#src-5">5</a>. По коду он устроен так. Представь две реплики за балансировщиком. Задача выполняется на реплике A, и её события, кроме самой задачи, пишутся в общую таблицу <code>task_events</code> в базе. Клиент после обрыва переподключается, и его <code>SubscribeToTask</code> попадает на реплику B. B берёт снимок задачи из общего хранилища и дальше опрашивает <code>task_events</code>, так что видит всё, что пишет A. Чтобы реплики не затёрли одну задачу, у записи в хранилище есть версия, а обновление идёт через compare-and-swap. На старых версиях или другом SDK подписку и продолжение задачи придётся направлять туда, где задача живёт.</p>
+
+<p>Повторы — отдельная тема. <code>GetTask</code>, <code>ListTasks</code> и <code>CancelTask</code> идемпотентны по спецификации, а <code>SendMessage</code> — нет: он «MAY be idempotent», и агент может распознавать дубли по <code>messageId</code><a class="cite" href="#src-1">1</a>. Отсюда два правила. Клиент при повторе после сетевой ошибки шлёт то же сообщение с тем же <code>messageId</code>, а не генерирует новый. Сервер, если задача дорогая, хранит недавние <code>messageId</code> и на повтор возвращает уже созданную задачу. Иначе обрыв соединения на блокирующем вызове превращается в две одинаковые задачи, каждая со своим счётом за модель.</p>
+
+<p>Хостинг добавляет свои правила. В Bedrock AgentCore контейнер с A2A-сервером слушает <code>0.0.0.0:9000</code>, принимает JSON-RPC на <code>POST /</code>, отдаёт карточку и отвечает на <code>/ping</code> статусом <code>Healthy</code> или <code>HealthyBusy</code>, а сессия приходит заголовком <code>X-Amzn-Bedrock-AgentCore-Runtime-Session-Id</code><a class="cite" href="#src-13">13</a>. В той же документации есть ловушка, которую легко повторить на любом хостинге с тайм-аутом простоя: «Do not set <code>time_of_last_update</code> to the current time on every ping… prevents the idle session timeout from ever firing — sessions then persist until MaxLifetime and can exhaust your session quota». Статус «занят» во время долгой задачи ставить надо, а продлевать жизнь сессии пингами — нет.</p>
+</section>
+
+<section id="neighbors">
+<h2>MCP, ACP, AGNTCY и расширения</h2>
+<p>Самый частый аргумент за A2A звучал так: MCP вызывает функции и не умеет долгой многоходовой работы, а A2A умеет. Ревизия MCP от 28 июля 2026 года этот аргумент заметно ослабила. Задачи вынесены в официальное расширение <code>io.modelcontextprotocol/tasks</code> с опросом через <code>tasks/get</code> и новым <code>tasks/update</code>, а инструмент может вернуть результат с <code>resultType: "input_required"</code>, то есть попросить ввод посреди работы<a class="cite" href="#src-27">27</a>. По форме это близко к <code>Task</code>, <code>GetTask</code> и <code>INPUT_REQUIRED</code> из A2A. Подробно новая ревизия разобрана в <a href="../05-mcp/index.html">главе 5</a>.</p>
+
+<p>Попутно устарел известный пост Microsoft от 23 июля 2025 года «Can You Build Agent2Agent Communication on MCP? Yes!». Рецепт в нём опирался на возобновляемые потоки, серверные elicitation и sampling и уведомления о прогрессе<a class="cite" href="#src-28">28</a>, а ревизия 2026-07-28 убрала возобновление SSE по <code>Last-Event-ID</code> и заменила серверные запросы новым механизмом. Сама идея поста жива: на MCP можно построить общение агентов. В том виде, в каком он написан, повторять его не стоит.</p>
+
+<p>Что осталось различием, так это граница из <a href="#fig-opacity">первого рисунка</a>. MCP-сервер показывает вызывающей модели схемы своих инструментов, и решение, что вызвать и с какими аргументами, принимает вызывающий. A2A-агент показывает карточку с навыками, описанными словами, держит свой цикл, свою модель и своё хранилище задач, а права задаёт на уровне навыков.</p>
+
+<p>Документация A2A в 2026 году формулирует это так: MCP — «the vertical integration layer», A2A — «the horizontal protocol enabling peer-to-peer collaboration»<a class="cite" href="#src-29">29</a>. Канонический пример совмещения из документации — автомастерская. Клиент говорит с агентом-менеджером по A2A, менеджер поручает работу агенту-механику тоже по A2A, а механик пользуется сканером, мануалом и подъёмником через MCP. «Inside, each agent uses MCP to work with its own tools and resources»<a class="cite" href="#src-2">2</a>.</p>
+
+<div class="note key"><p>Если на той стороне функция с понятными входами и выходами, выставляй её как MCP-инструмент, даже если внутри работает модель. Если на той стороне нужен собственный диалог, собственные права и долгое состояние, или она принадлежит другой команде и не отдаст тебе свои инструменты, это A2A.</p></div>
+
+<h3>Кто влился, кто рядом, кто не конкурент</h3>
+<p>ACP в разговорах об A2A означает Agent Communication Protocol из проекта BeeAI в IBM Research. 25 августа 2025 года Кейт Блэр из IBM объявила, что ACP объединяется с A2A под крышей Linux Foundation. Репозиторий ACP заархивирован, а платформа BeeAI перешла на A2A через адаптеры <code>A2AServer</code> и <code>A2AAgent</code><a class="cite" href="#src-30">30</a>. Не путай его с Agent Client Protocol от Zed: это протокол между редактором и агентом для кода, он живёт своей жизнью и ни с чем не сливался.</p>
+
+<p>AGNTCY — проект, который Cisco, Dell, Google Cloud, Oracle и Red Hat передали в Linux Foundation 29 июля 2025 года. С A2A он не конкурирует и строит инфраструктуру вокруг него: каталоги, где регистрируются A2A-агенты и MCP-серверы, идентичность, наблюдаемость<a class="cite" href="#src-31">31</a>. Самый конкретный стык — транспорт SLIM. Для него определён экспериментальный собственный биндинг A2A с идентификатором <code>https://a2a-protocol.org/<wbr>bindings/<wbr>experimental-slimrpc/<wbr>v1</code>: вместо HTTP запросы идут по зашифрованному сеансу SLIM с шифрованием MLS от агента до агента, а не только на участке канала, как у TLS<a class="cite" href="#src-31">31</a>. Репозиторий <code>experimental-cpb-slimrpc</code> лежит в организации A2A, а официальный CLI подключает такие биндинги плагинами: <code>a2a send --transport slimrpc …</code><a class="cite" href="#src-8">8</a>.</p>
+
+<p>В июньском треде Hacker News 2026 года участник команды VS Code написал: «On the vscode team we're rebuilding our agent infrastructure on top of a new protocol, AHP»<a class="cite" href="#src-32">32</a>. Это легко прочитать как «Microsoft выбрала не A2A», но README Agent Host Protocol описывает другое: «A synchronized, multi-client state protocol for AI agent sessions», то есть протокол между интерфейсами и хостом, где живут агентские сессии<a class="cite" href="#src-33">33</a>. По назначению это сосед AG-UI из <a href="../08-ag-ui/index.html">главы 8</a>.</p>
+
+<h3>Расширения</h3>
+<p>Всё, чего нет в ядре, A2A предлагает добавлять расширениями. Агент объявляет их в карточке в <code>capabilities.extensions</code>: URI, описание, флаг <code>required</code> и параметры. Клиент включает расширение на конкретный запрос заголовком <code>A2A-Extensions</code>, дублирует URI в <code>message.extensions</code> и кладёт данные расширения в <code>metadata</code> под ключом-URI<a class="cite" href="#src-1">1</a>:</p>
+
+<script type="text/plain" class="code" data-lang="http" data-title="Запрос с двумя расширениями, спецификация §4.6.1">
+POST /message:send HTTP/1.1
+A2A-Extensions: https://example.com/extensions/geolocation/v1,https://standards.org/extensions/citations/v1
+
+{"message": {"role": "ROLE_USER", "parts": [{"text": "Find restaurants near me"}],
+  "extensions": ["https://example.com/extensions/geolocation/v1"],
+  "metadata": {"https://example.com/extensions/geolocation/v1": {"latitude": 37.7749, "longitude": -122.4194}}}}
+</script>
+
+<p>Серверу следует вернуть в ответе тот же заголовок со списком расширений, которые он действительно включил. Если расширение помечено <code>required</code>, а клиент его не включил, ответ — <code>ExtensionSupportRequiredError</code> с кодом <code>-32008</code>. Ломающее изменение расширения оформляется новым URI с новой версией в пути.</p>
+
+<p>Что вообще можно сделать расширением, определяют два запрета: добавлять поля в основные объекты и новые значения в перечисления нельзя, всё своё едет в <code>metadata</code><a class="cite" href="#src-2">2</a>. Поэтому расширение не может, например, завести новое состояние задачи. Документ различает четыре вида: только данные, профиль поверх существующих объектов, новые методы и собственный конечный автомат поверх состояний.</p>
+
+<p>На бумаге у расширений есть процесс созревания: <code>experimental-ext-*</code> → <code>ext-*</code> с URI под <code>https://a2a-protocol.org/extensions/</code>, для биндингов <code>experimental-cpb-*</code> → <code>cpb-*</code>. На 30 сентября 2026 года в организации a2aproject нет ни одного репозитория <code>ext-*</code>, только два экспериментальных: OID4VP-авторизация и биндинг SLIMRPC<a class="cite" href="#src-26">26</a>. Живые расширения пишут сами платформы: <code>history-scope</code> у LangSmith, A2UI v0.9 для интерфейсов, которые собирает агент (<a href="../09-a2ui-generative-ui/index.html">глава 9</a>)<a class="cite" href="#src-7">7</a>.</p>
+
+<p>Самое известное расширение — AP2, протокол платежей агентов от Google: версия 0.1.0 вышла 16 сентября 2025 года, 0.2.0 — 28 апреля 2026 года, тогда же его передали FIDO Alliance, и теперь он объявлен расширением не только для A2A, но и для Universal Commerce Protocol<a class="cite" href="#src-34">34</a>. Его устройство — в <a href="../10-agentic-commerce/index.html">главе 10</a>.</p>
+
+<h3>Кто управляет</h3>
+<p>Google отдал A2A в Linux Foundation 23 июня 2025 года на Open Source Summit в Денвере<a class="cite" href="#src-35">35</a>. Решения принимает технический комитет из восьми компаний, по одному месту: Google, Microsoft, Cisco, AWS, Salesforce, ServiceNow, SAP и IBM<a class="cite" href="#src-36">36</a>. 17 августа 2026 года A2A вошёл в Agentic AI Foundation как проект стадии Growth, рядом с MCP, goose, AGENTS.md и agentgateway<a class="cite" href="#src-29">29</a>.</p>
+
+<p>У A2A и MCP теперь общая крыша, и совместные решения вроде общих правил трассировки стало проще принимать, хотя пока их нет. И сообщения об уязвимостях с 31 июля 2026 года проект принимает через GitHub Security Advisories<a class="cite" href="#src-37">37</a>, так что advisory в репозиториях SDK — правильное место, чтобы следить за тем, на чём ты стоишь.</p>
+</section>
+
+<section id="verdict">
+<h2>Нужен ли тебе A2A</h2>
+<p>18 июня 2026 года, через три месяца после выхода 1.0, на Hacker News спросили прямо: «Is anyone using the A2A protocol?»<a class="cite" href="#src-32">32</a> Ответы разделились почти поровну, и в них видны все аргументы, которые стоит взвесить.</p>
+
+<div class="note field"><blockquote>I am using A2A at work. It's a bit like the "microservices architecture" for agents... Allows you or teams to develop agents independently and have them interact as and when they need to. No major hurdles so far.
+<footer>— lazharichir, <a href="https://news.ycombinator.com/item?id=48590806">Hacker News, 18 июня 2026</a></footer></blockquote>
+<blockquote>We set up something with a registry of AgentCards and a messaging system with SSE streaming—then we realized we didn't need an agent on the other side so now we have this weird hybrid pattern. So, no.
+<footer>— bckr, <a href="https://news.ycombinator.com/item?id=48590667">Hacker News, 18 июня 2026</a></footer></blockquote>
+<p>Первый использует A2A там, где он и задуман: агенты разных команд развиваются независимо. Второй построил всю обвязку и обнаружил, что на той стороне достаточно обычного сервиса. Такую ошибку дешевле всего поймать до начала работы: спроси, нужен ли на той стороне агент, прежде чем строить реестр карточек.</p></div>
+
+<p>Резче всех высказался nyellin: «it was designed on paper by someone with no understanding of prompt caching and no consideration of latency or token costs». За резкостью стоит реальная цена. Каждый переход по A2A — отдельный агент со своим циклом и своим контекстом. Вызывающий пересказывает ему задачу сообщением, тот заново собирает контекст, кеш промптов одной стороны другой не помогает, а каждый ход <code>INPUT_REQUIRED</code> — ещё один круг по сети и по модели.</p>
+
+<p>Другой участник, ahmed89, сформулировал то, о чём спорят 658 комментариев в #1672: «Communication seems solvable. Trusting the action feels much harder»<a class="cite" href="#src-32">32</a>. Из этого же треда пришли цифры скачиваний, которые с тех пор гуляют по статьям. Их автор, benclarkeio, оговорился, что сам пишет пакеты для A2A и потому пристрастен.</p>
+
+<figure class="fig" id="fig-downloads">
+<script type="application/json" class="chart">
+{"type": "line", "title": "Во сколько раз mcp скачивают чаще, чем a2a-sdk", "subtitle": "PyPI, скачивания за месяц без зеркал", "unit": "×",
+ "x": ["апр 2026", "май", "июн", "июл", "авг", "сен*"],
+ "series": [{"name": "mcp / a2a-sdk", "values": [55, 35, 24, 26, 20, 21]}],
+ "yMin": 0,
+ "note": "pypistats.org, запрос 30 сентября 2026. a2a-sdk: 4,4 → 16,6 млн в месяц (апрель — август), mcp: 241 → 330 млн. *Сентябрь по 29-е число."}
+</script>
+<figcaption>Разрыв с MCP сокращается, но остаётся двадцатикратным. За апрель — август 2026 года скачивания <code>a2a-sdk</code> выросли почти вчетверо. В скачивания входят CI и транзитивные установки через ADK и CrewAI, так что это показатель интереса разработчиков, а не число работающих агентов.</figcaption>
+</figure>
+
+<p>Свежие цифры с pypistats на 30 сентября: за последние 30 дней <code>a2a-sdk</code> скачали 10,3 млн раз, <code>mcp</code> — 219 млн<a class="cite" href="#src-38">38</a>. Скепсис со стороны бизнеса сформулировал в марте 2026 года вендорский блог Credal: MCP позволил подключить Claude к Notion, Jira и GitHub «in under 10 minutes», а A2A требовал «learning complex orchestration concepts and building custom communication layers»<a class="cite" href="#src-39">39</a>. OpenAI в свой Agents SDK поддержку так и не добавил: сообщество приносило её несколько раз, последний запрос закрыт 24 июня 2026 года с формулировкой «We still don't have immediate plans to add A2A support as a feature within this SDK»<a class="cite" href="#src-40">40</a>.</p>
+
+<p>С другой стороны — крупные компании. AAIF пишет, что A2A поддерживают больше 150 организаций, и называет конкретные внедрения: агенты в HarmonyOS от Huawei и интеграцию WeChat с ассистентами производителей Android-телефонов<a class="cite" href="#src-29">29</a>. Это заявления фонда и вендоров, независимых подтверждений нет, а «поддерживают» считает участников, а не развёртывания. benclarkeio в том же треде объясняет расклад так: A2A популярнее в enterprise, потому что платформы вроде Gemini Enterprise, Agentforce, watsonx Orchestrate и SAP Joule его принимают, и команды делают своих агентов совместимыми, чтобы подключаться к этим платформам.</p>
+
+<h3>Исследование, которое измерило не то</h3>
+<p>15 апреля 2026 года в трекере A2A появился issue #1755 с громким заголовком: «Near-zero real-world A2A protocol compliance despite widespread endpoint advertisement». Автор, по собственному признанию автономный исследовательский агент, опросил 50 агентов из каталогов, заявлявших поддержку A2A. Валидную карточку отдали 0–2 из них, на запрос <code>tasks/send</code> правильно не ответил никто<a class="cite" href="#src-41">41</a>. Цифра «0–4%» с тех пор цитируется как факт.</p>
+
+<p>Только <code>tasks/send</code> существовал в спецификации 0.1.0 и исчез в 0.2.0 весной 2025 года<a class="cite" href="#src-12">12</a>. Живой сервер на актуальном SDK ответил бы на него <code>-32601 Method not found</code>, это видно в <a href="#bindings">разделе про биндинги</a>. Значит, половина результата ничего не говорит о совместимости, а вторая половина, про карточки, никем не перепроверена. Каталоги агентов, возможно, и правда полны мёртвых записей, но это исследование этого не доказывает. Урок шире A2A: прежде чем цитировать замер совместимости протокола, который за год сменил три версии, проверь, какую версию он измерял.</p>
+
+<h3>Решение</h3>
+<p>Бери A2A, если агент на той стороне принадлежит другой команде или компании и не отдаст тебе свои инструменты; если работа длится минуты и часы и по ходу требует уточнений; если тебе нужно подключиться к enterprise-платформе, которая принимает агентов по A2A. В этих случаях альтернатива — самописный протокол поверх HTTP с теми же задачами, состояниями и вебхуками, только без SDK, TCK и документации.</p>
+
+<p>Не бери A2A, если обе стороны твои и живут в одном развёртывании: сабагенты и вызов функции дешевле, быстрее и прозрачнее, и об этом выборе подробно в <a href="../13-multi-agent/index.html">главе 13</a>. Не бери, если на той стороне функция, ей место в MCP. И не бери ради «стандарта на будущее», если сегодня у тебя один агент и один клиент: протокол, который за полтора года поменял имена методов дважды и регистр перечислений один раз, будет менять формат и дальше, и платить за миграции придётся тебе.</p>
+
+<p>Этот совет перестанет быть верным в двух случаях. Если расширение задач MCP станет повсеместным, а MCP-серверы начнут массово держать собственный цикл агента, граница между протоколами сотрётся, и держать два станет лишним. Если в спецификацию попадёт стандарт идентичности агента, а OpenAI добавит поддержку в свой SDK, A2A станет разумным выбором по умолчанию даже для внутренних агентов. Ни того, ни другого на конец сентября 2026 года не случилось: последний релиз спецификации был 26 мая, и после него в основной ветке менялись документация и один комментарий в proto<a class="cite" href="#src-37">37</a>.</p>
+
+<div class="note practice"><p>Вечер на A2A: подними <code>server.py</code> из <a href="#python">раздела про свой агент</a>, пройди с ним оба хода через <code>curl</code> и через <code>a2a</code> CLI, оборви поток на середине и восстановись через <code>SubscribeToTask</code>, потом прогони агента через TCK с <code>--level must</code>. После этого любой разговор о том, «поддерживает ли X протокол A2A», сводится к одному <code>curl</code>.</p></div>
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>Твой клиент опрашивает <code>GetTask</code>, пока задача не придёт в терминальное состояние, и иногда висит до тайм-аута. Что происходит?</summary><p>Задача остановилась в прерванном состоянии, <code>INPUT_REQUIRED</code> или <code>AUTH_REQUIRED</code>. Агент ждёт ответа клиента и сам дальше не пойдёт, а цикл ждёт состояния, которого не будет. Опрос должен возвращать управление и на прерванных состояниях, как <code>a2a task get --wait</code>.</p></details>
+<details><summary>Старый клиент получает от агента <code>"state": "completed"</code> и <code>"kind": "text"</code>, хотя агент обновлён до 1.0. Почему, и где исправлять?</summary><p>Клиент не шлёт <code>A2A-Version</code>, а пустой заголовок по спецификации означает 0.3. Агент с включённым режимом совместимости отвечает ему в формате 0.3. Исправлять на клиенте: выставлять заголовок явно. Сервер без режима совместимости ответил бы громкой ошибкой <code>-32009</code>.</p></details>
+<details><summary>После обрыва потока клиент вызвал <code>SubscribeToTask</code> и дописывает приходящие куски к уже собранному артефакту. Что сломается?</summary><p>Первым событием подписки приходит полный снимок задачи, в артефакте которого уже лежат все куски, отданные до этого момента. Если дописать его к локальной копии, начало текста задвоится. Локальное состояние надо заменить снимком и дальше применять только новые события.</p></details>
+<details><summary>Карточка партнёра подписана, подпись сходится с ключом, скачанным по <code>jku</code> из той же карточки. Что это доказывает?</summary><p>Только то, что карточку подписал владелец домена из <code>jku</code>. Злоумышленник подпишет свою карточку своим ключом на своём домене, и проверка пройдёт так же. Доверие даёт ключ из заранее известного источника: своё хранилище, реестр партнёров, конфигурация.</p></details>
+<details><summary>Блокирующий <code>SendMessage</code> упал по тайм-ауту, клиент повторил запрос с новым <code>messageId</code>. Чем это грозит?</summary><p>Первый запрос мог дойти, и агент работает над задачей. Второй создаст ещё одну такую же задачу: <code>SendMessage</code> по спецификации не обязан быть идемпотентным. Повторять нужно с тем же <code>messageId</code>, а сервер, если работа дорогая, должен распознавать дубли по нему. Для долгих задач лучше <code>returnImmediately</code> и подписка или вебхук.</p></details>
+<details><summary>Агент выпустил release notes, пользователь хочет поправить одну строку. Как оформить запрос?</summary><p>Новой задачей в том же <code>contextId</code>, со ссылкой на старую в <code>referenceTaskIds</code>. Отправка в завершённую задачу вернёт <code>-32004 UnsupportedOperationError</code>: терминальные задачи неизменяемы.</p></details>
+<details><summary>Почему принцип непрозрачности не защищает твоего оркестратора от вредоносного удалённого агента?</summary><p>Непрозрачность прячет внутренности сервера от клиента, а не наоборот. Удалённый агент в многоходовой задаче может задавать вопросы и присылать «требования», и если модель клиента воспринимает их как инструкции, она выдаст данные или вызовет свои инструменты, как в сценарии Unit 42 с покупкой акций. Нужны подтверждение действий вне модели и привязка ходов к исходному намерению пользователя.</p></details>
+<details><summary>Почему вебхук push-уведомлений опасен для самого агента, и почему спецификация этого не предотвращает?</summary><p>Агент POST'ит на URL, который прислал клиент, из своей сети. Если URL указывает на внутренний адрес или редиректит на него, получается SSRF. Спецификация требует проверки адреса только на уровне SHOULD, и в a2a-java её по умолчанию не было. Проверять надо при сохранении конфигурации и перед каждой отправкой, лучше по списку разрешённых доменов.</p></details>
+<details><summary>Что не так с цифрой «0–4% агентов из каталогов совместимы с A2A»?</summary><p>Исследование из issue #1755 проверяло совместимость запросом <code>tasks/send</code>, который есть только в версии 0.1.0 и исчез весной 2025 года. Современный агент обязан ответить на него «метод не найден». Результат про запросы ничего не говорит о совместимости, а часть про карточки никто не перепроверил.</p></details>
+<details><summary>Твой клиент умеет только HTTP+JSON. С каким агентом он не договорится, и как это увидеть заранее?</summary><p>С любым, у кого в <code>supportedInterfaces</code> нет интерфейса <code>HTTP+JSON</code>. Например, LangSmith Agent Server и Bedrock AgentCore реализуют только JSON-RPC. Один proto описывает все три биндинга, но реализует их каждый сервер сам. Клиенту разумно уметь и JSON-RPC.</p></details>
+<details><summary>Два твоих агента живут в одном сервисе, и коллега предлагает связать их по A2A «на вырост». Что ответишь?</summary><p>Скорее нет. A2A окупается, когда на той стороне чужая команда или организация, долгая работа с уточнениями или платформа, которая принимает агентов только по A2A. Внутри одного развёртывания ты платишь сетью, версионированием и потерей видимости за то, что даёт обычный вызов или сабагент.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу через <code>curl</code> провести задачу от первого сообщения через <code>INPUT_REQUIRED</code> до <code>COMPLETED</code>, и по JSON-RPC, и по REST</li>
+  <li>Поднимал агента на <code>a2a-sdk</code> 1.x и могу объяснить, почему исполнитель кладёт в очередь сначала <code>Task</code>, а потом события</li>
+  <li>По одному ответу сервера определяю версию протокола: регистр состояний, <code>kind</code>, <code>final</code>, обёртки событий</li>
+  <li>Выставляю <code>A2A-Version</code> в каждом клиентском запросе и знаю, что сервер делает с пустым заголовком</li>
+  <li>Собираю артефакт из кусков с <code>append</code> и <code>lastChunk</code> и восстанавливаю поток через <code>SubscribeToTask</code> без дублей</li>
+  <li>Настраивал вебхук для задачи: проверяю кред, отбрасываю дубли, итог забираю через <code>GetTask</code></li>
+  <li>Проверяю подпись карточки ключом из своего хранилища, а не по <code>jku</code> из самой карточки</li>
+  <li>Могу показать в коде своего сервера место, где задача читается из хранилища, и проверку владельца рядом с ним</li>
+  <li>Валидирую URL вебхуков по списку разрешённых доменов при сохранении конфигурации и перед отправкой</li>
+  <li>Подключал A2A-агента к Claude Code через <code>a2a</code> CLI и скилл, с отправкой сообщений на подтверждении</li>
+  <li>Прогонял свой или чужой сервер через <code>a2a-tck</code> с <code>--level must</code> и читал отчёт</li>
+  <li>Могу обосновать для конкретной интеграции выбор между A2A, MCP и обычным вызовом функции</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://github.com/a2aproject/A2A/blob/main/docs/specification.md">A2A Protocol Specification, v1.0.1</a>. A2A Project, Linux Foundation / AAIF, 26 мая 2026.</li>
+  <li id="src-2">Документация A2A, раздел Topics: <a href="https://github.com/a2aproject/A2A/blob/main/docs/topics/life-of-a-task.md">Life of a Task</a>, <a href="https://github.com/a2aproject/A2A/blob/main/docs/topics/agent-discovery.md">Agent Discovery</a>, <a href="https://github.com/a2aproject/A2A/blob/main/docs/topics/enterprise-ready.md">Enterprise-Ready Features</a>, <a href="https://github.com/a2aproject/A2A/blob/main/docs/topics/extensions.md">Extensions</a>, <a href="https://github.com/a2aproject/A2A/blob/main/docs/topics/extension-and-binding-governance.md">Extension and binding governance</a>, <a href="https://a2a-protocol.org/latest/topics/a2a-and-mcp/">A2A and MCP</a>. A2A Project, ветка main, сентябрь 2026.</li>
+  <li id="src-3"><a href="https://github.com/a2aproject/A2A/blob/main/specification/a2a.proto">specification/a2a.proto</a>. A2A Project, ветка main, сентябрь 2026; для сравнения <a href="https://github.com/a2aproject/A2A/blob/v0.3.0/specification/grpc/a2a.proto">specification/grpc/a2a.proto на теге v0.3.0</a>.</li>
+  <li id="src-4"><a href="https://news.ycombinator.com/item?id=43631381">The Agent2Agent Protocol (A2A)</a>. Обсуждение на Hacker News, 9 апреля 2025, 450 очков.</li>
+  <li id="src-5"><a href="https://github.com/a2aproject/a2a-python/blob/main/CHANGELOG.md">a2a-python CHANGELOG</a>. A2A Project, версии 1.0.0–1.2.1, апрель — 30 сентября 2026.</li>
+  <li id="src-6"><a href="https://github.com/a2aproject/a2a-python/blob/main/docs/migrations/v1_0/README.md">A2A Python SDK Migration Guide: v0.3 → v1.0</a>. A2A Project, 20 апреля 2026.</li>
+  <li id="src-7"><a href="https://github.com/langchain-ai/docs/blob/main/src/langsmith/server-a2a.mdx">A2A endpoint in Agent Server</a>. Документация LangSmith, ветка main, сентябрь 2026.</li>
+  <li id="src-8"><a href="https://github.com/a2aproject/a2a-cli">a2aproject/a2a-cli: README, справочник команд и Agent Skill</a>. A2A Project, v0.3.0 от 24 сентября 2026.</li>
+  <li id="src-9"><a href="https://github.com/a2aproject/a2a-samples/tree/main/samples/python/agents/helloworld">a2a-samples: samples/python/agents/helloworld</a>. A2A Project, ветка main, сентябрь 2026.</li>
+  <li id="src-10"><a href="https://github.com/a2aproject/A2A/blob/main/adrs/adr-001-protojson-serialization.md">ADR-001: Leverage ProtoJSON Specification for JSON Serialization</a>. A2A TSC, 18 ноября 2025.</li>
+  <li id="src-11"><a href="https://github.com/a2aproject/A2A/blob/main/docs/whats-new-v1.md">What's New in A2A Protocol v1.0</a>. Миграционный документ A2A, обновлялся до августа 2026.</li>
+  <li id="src-12"><a href="https://github.com/a2aproject/A2A/blob/main/CHANGELOG.md">CHANGELOG.md, a2aproject/A2A</a>, записи от 0.2.1 (27 мая 2025) до 1.0.1 (26 мая 2026); текст спецификации на тегах <a href="https://github.com/a2aproject/A2A/blob/v0.1.0/docs/specification.md">v0.1.0</a> и <a href="https://github.com/a2aproject/A2A/blob/v0.2.0/docs/specification.md">v0.2.0</a>.</li>
+  <li id="src-13"><a href="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-a2a.html">Deploy A2A servers in AgentCore Runtime</a> и <a href="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-a2a-protocol-contract.html">A2A protocol contract</a>. Amazon Bedrock AgentCore Developer Guide, сентябрь 2026.</li>
+  <li id="src-14"><a href="https://learn.microsoft.com/en-us/agent-framework/integrations/by-component/agent-services/a2a">A2A agent service</a>. Microsoft Agent Framework, Microsoft Learn, 16 сентября 2026, обновлено 21 сентября.</li>
+  <li id="src-15"><a href="https://github.com/a2aproject/A2A/blob/main/docs/roadmap.md">A2A protocol roadmap</a>. A2A Project, обновлено 15 сентября 2026; эпики <a href="https://github.com/a2aproject/A2A/issues/1991">#1991</a> и <a href="https://github.com/a2aproject/A2A/issues/1995">#1995</a> от 25 июня 2026.</li>
+  <li id="src-16"><a href="https://github.com/google/adk-docs/tree/main/docs/a2a">ADK docs: A2A, quickstart-exposing и quickstart-consuming</a>. Google, ветка main, сентябрь 2026.</li>
+  <li id="src-17"><a href="https://github.com/a2aproject/A2A/issues/1672">Issue #1672: Proposal: Agent Identity Verification for Agent Cards</a>. a2aproject/A2A, открыт 22 марта 2026, 658 комментариев на 30 сентября 2026.</li>
+  <li id="src-18">Релизы SDK: <a href="https://github.com/a2aproject/a2a-go/releases">a2a-go</a> (v2.0.0 от 17 марта 2026, v2.6.0 от 25 сентября), <a href="https://www.npmjs.com/package/@a2a-js/sdk">@a2a-js/sdk</a> 1.3.0, <a href="https://github.com/a2aproject/a2a-java/releases">a2a-java</a> 1.4.0.Final, <a href="https://www.nuget.org/packages/A2A">A2A для .NET</a> 1.0.0-preview2, <a href="https://github.com/a2aproject/a2a-rs">a2a-rs</a> (создан 3 апреля 2026); метаданные PyPI (версии и <code>requires_dist</code>) для <a href="https://pypi.org/project/a2a-sdk/">a2a-sdk</a>, google-adk, crewai, strands-agents, bedrock-agentcore, agent-framework-a2a, fasta2a. Проверено 30 сентября 2026.</li>
+  <li id="src-19"><a href="https://developers.googleblog.com/en/a2a-a-new-era-of-agent-interoperability/">Announcing the Agent2Agent Protocol (A2A)</a>. Google Developers Blog, 9 апреля 2025.</li>
+  <li id="src-20"><a href="https://github.com/crewAIInc/crewAI/blob/main/docs/edge/en/learn/a2a-agent-delegation.mdx">Agent-to-Agent (A2A) Protocol</a>. Документация CrewAI, ветка main, сентябрь 2026.</li>
+  <li id="src-21"><a href="https://github.com/pydantic/pydantic-ai/pull/5426">pydantic-ai PR #5426: deprecate Agent.to_a2a()</a>, влит 15 мая 2026; <a href="https://github.com/datalayer/fasta2a/releases">datalayer/fasta2a releases</a>, 1.0.0 от 5 сентября 2026.</li>
+  <li id="src-22"><a href="https://github.com/a2aproject/a2a-tck">a2aproject/a2a-tck</a>. A2A Technology Compatibility Kit, ветка main, сентябрь 2026; <a href="https://github.com/a2aproject/a2a-itk">a2aproject/a2a-itk</a> (создан 14 мая 2026); <a href="https://github.com/a2aproject/a2a-inspector/releases">a2aproject/a2a-inspector, релизы</a> (единственный v0.1.0 от 18 июня 2025). Проверено 30 сентября 2026.</li>
+  <li id="src-23"><a href="https://github.com/a2aproject/a2a-java/security/advisories">a2a-java security advisories</a>: GHSA-qw47-mcm5-934w, GHSA-9rhm-2h4x-jwmx, GHSA-q78c-5jjq-57g8, GHSA-x32g-jvvm-4725 (28 августа 2026), GHSA-4fpj-g9jf-9rgg (9 сентября 2026).</li>
+  <li id="src-24">Royce Lu, Jay Chen. <a href="https://unit42.paloaltonetworks.com/agent-session-smuggling-in-agent2agent-systems/">Agent Session Smuggling in Agent2Agent Systems</a>. Palo Alto Networks Unit 42, 31 октября 2025.</li>
+  <li id="src-25">Alireza Lotfi, Mirza Masfiqur Rahman, Imtiaz Karim, Elisa Bertino. <a href="https://arxiv.org/abs/2609.10871">A2ABreak: Systematic Security Analysis of the A2A Protocol</a>. arXiv:2609.10871, 9 сентября 2026.</li>
+  <li id="src-26"><a href="https://github.com/a2aproject">Организация a2aproject на GitHub</a>: список репозиториев, звёзды, даты создания. Проверено 30 сентября 2026.</li>
+  <li id="src-27">Model Context Protocol: <a href="https://github.com/modelcontextprotocol/modelcontextprotocol/tree/main/docs/specification">changelog ревизий 2025-11-25 и 2026-07-28</a>. Agentic AI Foundation, 2025–2026.</li>
+  <li id="src-28">Victor Dibia et al. <a href="https://devblogs.microsoft.com/blog/can-you-build-agent2agent-communication-on-mcp-yes/">Can You Build Agent2Agent Communication on MCP? Yes!</a> Microsoft for Developers, 23 июля 2025.</li>
+  <li id="src-29"><a href="https://aaif.io/blog/a2a-joins-aaif">A2A joins AAIF's open agentic stack</a>. Agentic AI Foundation, 17 августа 2026; <a href="https://github.com/a2aproject/A2A/blob/main/docs/blog/posts/a2a-joins-aaif.md">A New Chapter for A2A: Joining the Agentic AI Foundation</a>. Блог A2A, 27 августа 2026.</li>
+  <li id="src-30">Kate Blair. <a href="https://github.com/orgs/i-am-bee/discussions/5">ACP Joins Forces with A2A Under the Linux Foundation</a>. IBM Research, 25 августа 2025; <a href="https://github.com/i-am-bee/acp">i-am-bee/acp</a> (архив).</li>
+  <li id="src-31"><a href="https://www.linuxfoundation.org/press/linux-foundation-welcomes-the-agntcy-project-to-standardize-open-multi-agent-system-infrastructure-and-break-down-ai-agent-silos">Linux Foundation Welcomes the AGNTCY Project</a>. Linux Foundation, 29 июля 2025; <a href="https://github.com/agntcy/slim">agntcy/slim: README и «A2A over SLIM»</a>, ветка main, сентябрь 2026.</li>
+  <li id="src-32"><a href="https://news.ycombinator.com/item?id=48582679">Ask HN: Is anyone using the A2A protocol?</a> Hacker News, 18 июня 2026, 96 очков.</li>
+  <li id="src-33"><a href="https://github.com/microsoft/agent-host-protocol">microsoft/agent-host-protocol</a>. README, Microsoft, 2026.</li>
+  <li id="src-34"><a href="https://github.com/google-agentic-commerce/AP2">google-agentic-commerce/AP2</a>: README и релизы v0.1.0 (16 сентября 2025) и v0.2.0 (28 апреля 2026); <a href="https://ap2-protocol.org/">ap2-protocol.org</a>.</li>
+  <li id="src-35"><a href="https://www.linuxfoundation.org/press/linux-foundation-launches-the-agent2agent-protocol-project-to-enable-secure-intelligent-communication-between-ai-agents">Linux Foundation Launches the Agent2Agent Protocol Project</a>. Linux Foundation, 23 июня 2025.</li>
+  <li id="src-36"><a href="https://github.com/a2aproject/A2A/blob/main/GOVERNANCE.md">GOVERNANCE.md, a2aproject/A2A</a>. Состав TSC на сентябрь 2026.</li>
+  <li id="src-37"><a href="https://github.com/a2aproject/A2A/commits/main">История коммитов a2aproject/A2A</a> с 28 мая по 30 сентября 2026.</li>
+  <li id="src-38">pypistats.org: <a href="https://pypistats.org/packages/a2a-sdk">a2a-sdk</a> и <a href="https://pypistats.org/packages/mcp">mcp</a>, помесячные скачивания без зеркал, запрос 30 сентября 2026.</li>
+  <li id="src-39">Jessica Shen. <a href="https://www.credal.ai/blog/what-happened-to-a2a-protocol">What Happened to A2A Protocol?</a> Блог Credal (вендор), 6 марта 2026.</li>
+  <li id="src-40"><a href="https://github.com/openai/openai-agents-python/pull/3683">openai/openai-agents-python #3683</a>, закрыт 24 июня 2026, и <a href="https://github.com/openai/openai-agents-python/pull/1245">#1245</a>, закрыт 13 августа 2025.</li>
+  <li id="src-41"><a href="https://github.com/a2aproject/A2A/issues/1755">Issue #1755: Empirical data: Near-zero real-world A2A protocol compliance despite widespread endpoint advertisement</a>. a2aproject/A2A, 15 апреля 2026, закрыт.</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>

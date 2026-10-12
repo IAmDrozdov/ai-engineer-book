@@ -1,0 +1,1025 @@
+<!doctype html>
+<html lang="ru" data-chapter="12">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deep agents: устройство Claude Code, Cursor и OpenClaw — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 12</b> из 17, часть «Архитектура»</p>
+  <h1>Deep agents: устройство Claude Code, Cursor и OpenClaw</h1>
+  <p class="lead">В июле 2026 года инженеры Systima поставили логирующий прокси между Claude Code и API и посчитали, сколько токенов уходит в модель до того, как она прочтёт вопрос пользователя: около 33 тысяч. OpenCode на той же модели отправил 6,9 тысячи, а автор Pi уверяет, что его агенту хватает меньше тысячи. Всё это разница в харнессе — коде, который решает, что положить в запрос, когда отдать работу сабагенту, что забыть и у кого спросить разрешения.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="overhead">
+<h2>Что харнесс отправляет вместо тебя</h2>
+<p>Из примерно 33 тыс. токенов Claude Code 2.1.207 около 24 тыс. приходится на JSON-схемы 27 инструментов. Остальное — системный промпт из трёх блоков на 27 344 символа и 7 997 символов обвязки первого сообщения в тегах <code>&lt;system-reminder&gt;</code><a class="cite" href="#src-1">1</a>. У OpenCode 1.17.18 из 6,9 тыс. на десять инструментов уходит 4,8 тыс., а промпт идёт одним блоком на 9 324 символа, без обвязки. Мерили на одной модели, <code>claude-sonnet-4-5</code>, по три прогона на харнесс. Тот же прокси показал и вторую вещь: когда агент раздал работу двум сабагентам, общий расход токенов вырос в 4,2 раза.</p>
+<p>Системные напоминания (system reminders) харнесс подкладывает рядом с сообщением пользователя: туда идут <code>CLAUDE.md</code>, правила стиля вывода, уведомления о том, что файл изменился на диске, строки атрибуции<a class="cite" href="#src-2">2</a>. Отсюда поведение, которое будто берётся ниоткуда, вроде трейлера <code>Co-Authored-By</code> в коммите: его просит не модель, а напоминание.</p>
+
+<figure class="fig" id="fig-overhead">
+<script type="application/json" class="chart">
+{"type": "stack", "title": "Что уходит в модель до вопроса пользователя", "subtitle": "Claude Code 2.1.207 и OpenCode 1.17.18, одна модель, логирующий прокси", "unit": "токенов",
+ "categories": ["Claude Code", "OpenCode"],
+ "series": [
+  {"name": "Схемы инструментов", "values": [24000, 4800]},
+  {"name": "Промпт и напоминания", "values": [9000, 2100]}
+ ],
+ "note": "Замер Systima, 12 июля 2026, claude-sonnet-4-5, по три прогона. Итоги (≈33 000 и ≈6 900) и долю схем авторы дают округлёнными; второй сегмент — разность."}
+</script>
+<figcaption>Больше двух третей стартового запроса Claude Code занимают описания инструментов, а не промпт. У OpenCode инструментов десять, у Claude Code в той версии было 27.</figcaption>
+</figure>
+
+<p>Эти тысячи — буквальный ответ на вопрос, что такое <dfn>харнесс</dfn> (harness, «упряжь»). Документация Claude Code определяет его так: «the tools, context management, and execution environment that turn a language model into a capable coding agent. Claude Code is the harness; Claude is the model inside it»<a class="cite" href="#src-2">2</a>. В LangChain ту же мысль сжали в формулу Agent = Model + Harness: модель даёт интеллект, а промпты, инструменты, цикл, управление контекстом, песочницу и хуки даёт харнесс<a class="cite" href="#src-3">3</a>. Цикл из двадцати строк из <a href="../01-llm-api-agent-loop/index.html">главы 1</a> — его сердцевина, и почти всё интересное в современных агентах наросло вокруг неё.</p>
+<p>Из замера не следует, что Claude Code расточителен. В справочнике его инструментов на сентябрь 2026 года есть запуск сабагентов, отложенная загрузка других инструментов (<code>ToolSearch</code>), фоновые задачи с потоковым выводом (<code>Monitor</code>), планировщик по cron, git worktree, сообщения другим сессиям<a class="cite" href="#src-4">4</a>. Каждая схема — возможность, за которую платят местом в окне на каждом ходе. Схемы MCP-инструментов по умолчанию как раз откладываются: в окне лежат только их имена, а полная схема подгружается через <code>ToolSearch</code><a class="cite" href="#src-2">2</a>, так что 24 тыс. — цена встроенных инструментов. Кеш префикса делает эти токены дешёвыми (<a href="../02-context-engineering/index.html">глава 2</a>), но место в окне и внимание модели они занимают всё равно. Марио Цехнер, автор Pi, сделал противоположную ставку: четыре инструмента (<code>read</code>, <code>write</code>, <code>edit</code>, <code>bash</code>) и меньше тысячи токенов на промпт вместе с ними<a class="cite" href="#src-5">5</a>. Какая ставка выигрывает на бенчмарках, разобрано в <a href="#evidence">разделе о цифрах</a>.</p>
+
+<h3>Три окна в закрытый харнесс</h3>
+<p>Исходники Claude Code закрыты, но заглянуть внутрь можно тремя способами. Первый — документация и Claude Agent SDK. SDK — тот же харнесс в виде библиотеки для Python и TypeScript, «the same tools, agent loop, and context management that power Claude Code»<a class="cite" href="#src-6">6</a>. Версии идут вровень с CLI: 29 сентября 2026 года вышли Claude Code 2.1.285 и пакет <code>@anthropic-ai/claude-agent-sdk</code> 0.3.285, у Python-пакета <code>claude-agent-sdk</code> своя нумерация, 0.2.162<a class="cite" href="#src-7">7</a>. Чейнджлог CLI расписан по каждой версии<a class="cite" href="#src-8">8</a>, и больше десятка решений в этой главе датированы по нему.</p>
+<p>Второе окно открылось случайно. 30 марта 2026 года в npm ушла версия 2.1.88 с файлом <code>cli.js.map</code>, внутри которого лежали исходники. Тред на Hacker News набрал 2 095 очков, за утечкой последовали DMCA-запросы к зеркалам, а Борис Черный из команды Claude Code назвал случившееся ошибкой разработчика<a class="cite" href="#src-9">9</a>. Пересказы утечки до сих пор ходят по блогам с названиями KAIROS, autoDream и coordinator mode.</p>
+<div class="note warn"><p>KAIROS, autoDream и <code>coordinatorMode.ts</code> — код за фича-флагами, который на момент утечки не был выпущен. Не описывай их как возможности Claude Code, пока их нет в документации или чейнджлоге: флаг из марта говорит о планах, а не о том, что работает у тебя в терминале.</p></div>
+<p>Третье окно — постмортем Anthropic от 23 апреля 2026 года<a class="cite" href="#src-10">10</a>. Весной пользователи массово жаловались, что Claude в Claude Code поглупел и стал забывчивым. Причин нашли три, и все в харнессе. Четвёртого марта уровень рассуждений по умолчанию снизили с <code>high</code> до <code>medium</code>, чтобы не подвисал интерфейс, и вернули только седьмого апреля. Двадцать шестого марта выкатили ошибку кеширования, из-за которой история рассуждений очищалась на каждом ходе, а не один раз: модель теряла нить, лимиты таяли быстрее, и так продолжалось 15 дней, до десятого апреля. Шестнадцатого апреля в системный промпт добавили требование укладываться в 25 слов между вызовами инструментов, и вместе с другими изменениями это стоило 3% качества кода на Opus 4.6 и 4.7; откатили через четыре дня. Веса модели всё это время не менялись. Тред с разбором на Hacker News собрал 942 очка и 732 комментария.</p>
+<div class="note key"><p>Поведение агента зависит от модели и харнесса вместе. Когда кажется, что модель поглупела, сначала сверь версию харнесса с чейнджлогом, а уже потом ищи подмену модели.</p></div>
+</section>
+
+<section id="loop">
+<h2>Цикл на уровне сообщений</h2>
+<p>Agent SDK отдаёт работу харнесса потоком из пяти типов сообщений, и по ним видно, где кончается модель и начинается обвязка<a class="cite" href="#src-6">6</a>. Минимальный клиент из документации; как и там, обёртка <code>async def main()</code> с <code>asyncio.run(main())</code> опущена:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Поток сообщений Agent SDK (из документации)">
+async for message in query(prompt="Summarize this project"):
+    if isinstance(message, AssistantMessage):
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                print(f"Claude: {block.text}")
+            elif isinstance(block, ToolUseBlock):
+                print(f"Tool call: {block.name}")
+    if isinstance(message, ResultMessage):
+        if message.subtype == "success":
+            print(message.result)
+        else:
+            print(f"Stopped: {message.subtype}")
+</script>
+<p>Первым приходит <code>SystemMessage</code> с подтипом <code>init</code>: сессия создана, инструменты подключены. Дальше чередуются <code>AssistantMessage</code>, то есть сгенерированное моделью, и <code>UserMessage</code> с результатами инструментов. Роль <code>user</code> здесь формальная: в Messages API результат tool call возвращается от имени пользователя (<a href="../01-llm-api-agent-loop/index.html">глава 1</a>). Пара «вызов — результат» называется <dfn>ходом</dfn> (turn). Цикл заканчивается, когда модель ответила без единого <code>tool_use</code>, и тогда приходит <code>ResultMessage</code> со стоимостью, расходом токенов, <code>session_id</code> и подтипом: <code>success</code> или причина остановки. Прочие подтипы <code>SystemMessage</code> сообщают о служебных событиях; например, <code>compact_boundary</code> отмечает место, где харнесс сжал историю.</p>
+
+<figure class="fig wide" id="fig-sdk-loop">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant A as Твой код
+  participant H as Харнесс (Agent SDK)
+  participant M as Модель
+  participant T as Инструменты
+  A->>H: query(prompt)
+  H-->>A: SystemMessage init
+  H->>M: промпт, схемы, история
+  M-->>H: text + tool_use Read, Grep
+  H-->>A: AssistantMessage
+  H->>T: Read и Grep параллельно
+  T-->>H: два результата
+  H-->>A: UserMessage с tool_result
+  H->>M: история + два tool_result
+  M-->>H: tool_use Edit
+  H->>T: Edit, строго по одному
+  T-->>H: результат правки
+  H->>M: история + tool_result
+  M-->>H: текст без tool_use
+  H-->>A: AssistantMessage
+  H-->>A: ResultMessage cost, usage, session_id
+</script>
+<figcaption>Два хода и финал. Модель только предлагает вызовы; исполняет их, решает про параллельность и собирает следующий запрос харнесс. Твой код видит всё это как поток сообщений, а не как один ответ.</figcaption>
+</figure>
+
+<p>Два ограничителя SDK стоит помнить. <code>max_turns</code> считает только ходы с инструментами. <code>max_budget_usd</code> считает деньги, включая траты сабагентов: когда бюджет кончился, фоновые сабагенты останавливаются, а новые не стартуют с ошибкой <code>Budget limit reached</code>. Порядок выполнения тоже выбирает харнесс. Читающие инструменты (<code>Read</code>, <code>Glob</code>, <code>Grep</code> и MCP-инструменты с аннотацией <code>readOnlyHint</code>) идут параллельно, изменяющие (<code>Edit</code>, <code>Write</code>, <code>Bash</code>) — строго по одному.</p>
+
+<h3>Codex: запрос как точный префикс</h3>
+<p>OpenAI в январе 2026 года расписала цикл Codex CLI до отдельных элементов запроса<a class="cite" href="#src-11">11</a>. Codex работает поверх Responses API и перед первым сообщением пользователя кладёт в <code>input</code> четыре элемента в фиксированном порядке. Сообщение с ролью <code>developer</code> описывает песочницу и правила одобрения. Касается оно только встроенного инструмента <code>shell</code>; инструменты MCP-серверов, как пишет OpenAI, «are not sandboxed by Codex». Затем идут необязательные <code>developer_instructions</code> из <code>config.toml</code>. Третьим — сообщение с ролью <code>user</code>, где склеены <code>AGENTS.override.md</code> и <code>AGENTS.md</code> из <code>$CODEX_HOME</code> и из каждой папки от корня git-репозитория до текущей, с общим лимитом 32 КиБ по умолчанию, и описания скиллов. Последним идёт <code>&lt;environment_context&gt;</code> с текущей папкой и шеллом.</p>
+
+<figure class="fig" id="fig-codex-prefix">
+<div class="layers">
+  <div class="layer" data-tone="soft"><b>instructions и tools</b><span>базовые инструкции и схемы инструментов</span></div>
+  <div class="layer" data-tone="soft"><b>developer: песочница и одобрения</b><span>правила для встроенного shell; MCP-инструменты Codex не изолирует</span></div>
+  <div class="layer" data-tone="soft"><b>developer_instructions</b><span>необязательный текст из config.toml</span></div>
+  <div class="layer" data-tone="soft"><b>user: AGENTS.md и скиллы</b><span>от $CODEX_HOME и корня репозитория до текущей папки, до 32 КиБ</span></div>
+  <div class="layer" data-tone="soft"><b>user: environment_context</b><span>текущая папка и шелл</span></div>
+  <div class="layer"><b>Разговор</b><span>сообщения, reasoning, function_call, function_call_output</span></div>
+  <div class="layer" data-tone="ok"><b>Новый ход</b><span>только дописывается в конец; всё выше берётся из кеша</span></div>
+</div>
+<figcaption>Запрос Codex сверху вниз. Голубые слои одинаковы весь разговор, а всё выше нового хода повторяет прошлый запрос байт в байт и берётся из кеша. Сменишь посреди сессии набор инструментов, модель, режим песочницы или папку — изменится один из верхних слоёв, и весь хвост под ним пойдёт мимо кеша.</figcaption>
+</figure>
+
+<p>Codex не пользуется <code>previous_response_id</code>, хотя Responses API умеет хранить историю на сервере: «primarily to keep requests fully stateless and to support Zero Data Retention (ZDR)». Цена такого решения — объём JSON, который клиент отправляет за сессию, растёт квадратично. Семплирование при этом остаётся линейным, потому что каждый новый запрос — старый плюс новые элементы в конце, и общий префикс провайдер берёт из кеша. Отсюда список того, что ломает кеш посреди разговора: смена набора инструментов, модели, режима песочницы или одобрений, текущей папки. Рецепт OpenAI — не править старое сообщение, а дописать новое. Был и настоящий баг: MCP-инструменты перечислялись в нестабильном порядке, и префикс менялся без всякой причины. Подробный разбор таких поломок кеша — в <a href="../02-context-engineering/index.html">главе 2</a>.</p>
+<p>Компакция в Codex устроена в том же духе. Когда контекст превышает <code>auto_compact_limit</code>, харнесс вызывает эндпоинт <code>/responses/compact</code> и получает элементы, среди которых «a special <code>type=compaction</code> item with an opaque <code>encrypted_content</code>… that preserves the model's latent understanding». Это сводка, которую может прочитать только модель; чем такой подход отличается от текстовой сводки Claude Code, видно в <a href="#compaction">разделе о компакции</a>.</p>
+
+<h3>Харнесс под конкретную модель</h3>
+<p>Cursor в декабре 2025 года рассказал, как подстраивал своего агента под модели OpenAI Codex, и первая же фраза поста снимает иллюзию универсального агента: «Every model in Cursor's agent harness has specific instructions and tools made available to optimize that model inside the Cursor environment»<a class="cite" href="#src-12">12</a>. Инструменты переименовали ближе к привычным командам шелла вроде <code>rg</code>, и прижилось это у всех моделей. Модель попросили вызывать <code>read_lints</code> после каждой правки. Следы рассуждений (reasoning traces) между ходами теперь сохраняют обязательно: когда их убрали, GPT-5-Codex потерял 30% на внутреннем Cursor Bench, а у OpenAI GPT-5 без них терял на SWE-bench всего 3%.</p>
+<p>В промпте Cursor была просьба беречь токены, и Codex начал отказываться от больших задач с объяснением «I'm not supposed to waste tokens…». Инструкция, безобидная для одной модели, для другой стала запретом. Летом 2026 года Cursor по похожей причине пропустил GPT-5.6 Sol: модель «appears more sensitive to literal and emphasized wording… we encountered runaway spirals»<a class="cite" href="#src-13">13</a>. В LangChain отмечают обратную сторону: модель, которую дообучали с конкретным харнессом в цикле, к нему переобучается, и Codex-модели тянутся к <code>shell</code> и <code>apply_patch</code><a class="cite" href="#src-3">3</a>.</p>
+<div class="note practice"><p>Сменил модель в своём агенте — прогони eval заново и перечитай системный промпт. Инструкция, написанная под прошлую модель, у новой может сработать буквальнее и превратиться в запрет.</p></div>
+</section>
+
+<section id="pillars">
+<h2>Четыре столпа Чейза и ревизия 2026 года</h2>
+<p>«It's basically a no-op. It's just context engineering strategy to keep the agent on track» — так Харрисон Чейз из LangChain 30 июля 2025 года описал инструмент <code>TodoWrite</code> в Claude Code<a class="cite" href="#src-14">14</a>. Пост назывался «Deep Agents» и дал имя целому классу систем. Обычный агент, по Чейзу, мелкий (shallow): LLM в цикле вызывает инструменты и на длинных задачах теряет нить. <dfn>Глубокий агент</dfn> (deep agent) добавляет к тому же циклу четыре вещи: подробный системный промпт с примерами использования инструментов, инструмент планирования, сабагентов и файловую систему как общую рабочую память. Образцами служили Claude Code, Manus и Deep Research.</p>
+<p>В те же выходные LangChain выложила пакет <code>deepagents</code>. На 29 сентября 2026 года это версия 0.7.20 на PyPI и 1.14.1 для JavaScript, а в README он называется «batteries-included agent harness» поверх LangGraph: сабагенты, подключаемые файловые бэкенды, сжатие длинных тредов с выгрузкой вывода на диск, шелл, постоянная память, одобрение вызовов человеком и скиллы<a class="cite" href="#src-15">15</a>. Пакет давно перерос четыре пункта из поста, и за год два из этих пунктов сдвинулись.</p>
+
+<figure class="fig wide" id="fig-anatomy">
+<script type="text/x-mermaid">
+flowchart TD
+  prompt["Системный промпт<br/>+ CLAUDE.md, AGENTS.md"]
+  skills["Скиллы"]
+  compact["Компакция"]
+  hooks["Хуки"]
+  loop{{"Цикл: модель и инструменты"}}:::accent
+  plan["Todo-инструмент"]:::mute
+  sub["Сабагенты"]
+  fs[("Файлы и git")]:::ok
+  perm["Разрешения<br/>и песочница"]:::warn
+  verify["Проверка:<br/>тесты, линтер"]:::ok
+  prompt -- "в начало запроса" --> loop
+  skills -- "тело по вызову" --> loop
+  compact -- "сводка вместо истории" --> loop
+  hooks -- "до и после вызова" --> loop
+  loop -. "по желанию" .-> plan
+  loop -- "задача и итог" --> sub
+  loop -- "состояние" --> fs
+  loop -- "каждый вызов" --> perm
+  loop -- "перед финишем" --> verify
+</script>
+<figcaption>Харнесс образца осени 2026 года. Из четырёх столпов Чейза планировщик стал необязательным (пунктир), а вокруг цикла появились скиллы, компакция, классификатор разрешений и внешняя проверка, которых в посте 2025 года не было.</figcaption>
+</figure>
+
+<h3>Планировщик переехал в артефакты</h3>
+<p>No-op работал из-за устройства внимания. Manus в июле 2025 года описывала тот же приём как декламацию (recitation): агент на каждом шаге переписывает <code>todo.md</code> и тем выталкивает общий план в конец контекста, в зону свежего внимания<a class="cite" href="#src-16">16</a>. Средняя задача Manus тогда занимала около 50 вызовов инструментов, и без такого повтора цель тонула в середине истории. Инструмент ничего не исполняет, он только заставляет модель пересказать план своими словами.</p>
+<p>Новые модели научились держать план сами, и инструмент стал стоить больше, чем давал. Claude Code прошёл этот путь в два шага. 22 января 2026 года, в версии 2.1.16, <code>TodoWrite</code> заменили системой задач с зависимостями (<code>TaskCreate</code>, <code>TaskUpdate</code> и соседи). 14 августа, в 2.1.233, убрали и её: инструменты учёта задач больше не предлагаются Opus 4.8, Sonnet 5, Fable 5, Mythos 5 и более новым моделям<a class="cite" href="#src-8">8</a>. Объяснение из справочника инструментов: «On newer models, Claude keeps track of multi-step work without a written checklist, and the tools' definitions and reminders take up context»<a class="cite" href="#src-4">4</a>. Фоновые и облачные сессии получают их по-прежнему, а в интерактивную их можно вернуть переменной окружения:</p>
+<script type="text/plain" class="code" data-lang="bash" data-title="Вернуть todo-инструменты на новой модели">
+CLAUDE_CODE_ENABLE_TODO_TOOLS=1 claude
+</script>
+<p>В <code>deepagents</code> то же случилось 29 июля 2026 года: с версии 0.7 планирование включается только явно, отдельным middleware<a class="cite" href="#src-15">15</a>. У Pi инструмента планирования не было никогда: Цехнер сознательно выбросил из своего агента план, todo и сабагентов<a class="cite" href="#src-5">5</a>.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="deepagents ≥ 0.7: планирование по желанию (из документации)">
+from deepagents import create_deep_agent
+from langchain.agents.middleware import TodoListMiddleware
+
+agent = create_deep_agent(
+    model="anthropic:claude-sonnet-5",
+    middleware=[TodoListMiddleware()],
+)
+</script>
+
+<figure class="fig wide" id="fig-planning-retreat">
+<svg class="diagram" viewBox="0 0 760 310" role="img" aria-label="Как инструмент планирования уходил из Claude Code, deepagents и Pi">
+  <text class="t-mute" x="235" y="36" text-anchor="middle">июль 2025, пост Чейза</text>
+  <text class="t-mute" x="445" y="36" text-anchor="middle">январь 2026</text>
+  <text class="t-mute" x="655" y="36" text-anchor="middle">июль–август 2026</text>
+  <text class="t-title" x="20" y="87">Claude Code</text>
+  <rect class="box" x="150" y="50" width="170" height="64" rx="6"/>
+  <text class="t-title" x="235" y="76" text-anchor="middle">TodoWrite</text>
+  <text class="t-sub" x="235" y="96" text-anchor="middle">no-op по Чейзу</text>
+  <path class="arrow" d="M320,82 L358,82"/>
+  <rect class="box--soft" x="360" y="50" width="170" height="64" rx="6"/>
+  <text class="t-title" x="445" y="76" text-anchor="middle">Task-инструменты</text>
+  <text class="t-sub" x="445" y="96" text-anchor="middle">v2.1.16, 22 января</text>
+  <path class="arrow" d="M530,82 L568,82"/>
+  <rect class="box--mute" x="570" y="50" width="170" height="64" rx="6"/>
+  <text class="t-title" x="655" y="72" text-anchor="middle">Выключены</text>
+  <text class="t-sub" x="655" y="90" text-anchor="middle">v2.1.233</text>
+  <text class="t-sub" x="655" y="106" text-anchor="middle">Opus 4.8 и новее</text>
+  <text class="t-title" x="20" y="167">deepagents</text>
+  <rect class="box" x="150" y="130" width="170" height="64" rx="6"/>
+  <text class="t-title" x="235" y="156" text-anchor="middle">write_todos</text>
+  <text class="t-sub" x="235" y="176" text-anchor="middle">по умолчанию</text>
+  <path class="arrow arrow--dash" d="M320,162 L568,162"/>
+  <text class="t-mute" x="445" y="152" text-anchor="middle">без изменений</text>
+  <rect class="box--mute" x="570" y="130" width="170" height="64" rx="6"/>
+  <text class="t-title" x="655" y="152" text-anchor="middle">По желанию</text>
+  <text class="t-sub" x="655" y="170" text-anchor="middle">v0.7, 29 июля</text>
+  <text class="t-sub" x="655" y="186" text-anchor="middle">TodoListMiddleware</text>
+  <text class="t-title" x="20" y="237">Pi</text>
+  <rect class="box--ghost" x="150" y="210" width="590" height="44" rx="6"/>
+  <text class="t-sub" x="445" y="237" text-anchor="middle">Планировщика не было: четыре инструмента, меньше 1 тыс. токенов</text>
+  <text class="t-green" x="150" y="290">На смену пришли: plan mode, /goal, план-файлы в репозитории, feature list</text>
+</svg>
+<figcaption>Два эталонных харнесса за год сделали планировщик необязательным, третий обходился без него с самого начала. План при этом не исчез: он переехал в режим планирования, условие завершения и файлы, которые можно проверить снаружи.</figcaption>
+</figure>
+
+<p>В Claude Code вместо инструмента теперь режим планирования (<code>EnterPlanMode</code> и <code>ExitPlanMode</code>), где модель исследует код и пишет план, ничего не меняя, и <code>/goal</code> из версии 2.1.139 (11 мая 2026 года): «set a completion condition and Claude keeps working across turns until it's met»<a class="cite" href="#src-8">8</a>. Команда <code>/goal</code> появилась и в Cursor в августе<a class="cite" href="#src-17">17</a>, а у Codex цели с автоматическим продолжением включены по умолчанию<a class="cite" href="#src-18">18</a>. В OpenAI планы выполнения лежат в репозитории как версионируемые файлы<a class="cite" href="#src-19">19</a>, у Anthropic для многосессионной работы план — JSON-список фич (о нём в <a href="#long-running">разделе про длинные задачи</a>). Общее у всех одно: план проверяется снаружи файлом, тестом или условием и не живёт только в голове модели.</p>
+
+<h3>Подробный промпт или карта</h3>
+<p>Второй спорный столп — подробный системный промпт. Чейз писал, что без длинных промптов агенты «would not be nearly as deep»<a class="cite" href="#src-14">14</a>. Промпт самого харнесса и правда длинный, это те 27 тыс. символов в трёх блоках из замера Systima. Проблемы начались, когда ту же идею перенесли на пользовательские файлы инструкций.</p>
+<p>OpenAI за пять месяцев построила внутренний продукт примерно на миллион строк, где, по её словам, нет ни одной строки кода, набранной руками: около 1 500 смёрженных PR, 3,5 PR на инженера в день<a class="cite" href="#src-19">19</a>. Первым делом там попробовали «one big AGENTS.md», и подход провалился предсказуемо. «Context is a scarce resource», «Too much guidance becomes non-guidance», файл «rots instantly», и проверить его механически нельзя. Вместо него — «give Codex a map, not a 1,000-page instruction manual». <code>AGENTS.md</code> сократили примерно до ста строк оглавления, а знание разложили по структурированной папке <code>docs/</code>, свежесть которой проверяет CI.</p>
+<div class="note field">
+<blockquote>These files load unconditionally, they often contain descriptions irrelevant to the task at hand, and they stack from your working directory upward. The result is wasted tokens and confusion from injecting irrelevant instructions into the session.
+<footer>— sermakarevich, <a href="https://news.ycombinator.com/item?id=48407998">Show HN: Lessons learned from running Claude Code swarms at scale, июнь 2026</a></footer></blockquote>
+<p>Автор гонял 10–15 агентов Claude Code параллельно и назвал <code>CLAUDE.md</code> «a terrible abstraction»<a class="cite" href="#src-20">20</a>. Файлы грузятся целиком, всегда и стопкой от текущей папки вверх, так что каждый агент получает инструкции, не имеющие отношения к его задаче.</p>
+</div>
+<div class="note debate"><p>Чейз считает длинный промпт признаком глубокого агента, OpenAI и полевые отчёты видят в нём источник шума. Противоречие во многом мнимое: длинный промпт харнесса пишут один раз и проверяют evals, а твой <code>CLAUDE.md</code> или <code>AGENTS.md</code> грузится в каждую сессию и стареет вместе с кодом. На твоём месте разумно держать его картой на сотню строк (документация Claude Code советует укладываться в 200<a class="cite" href="#src-2">2</a>), а подробности уносить в скиллы и <code>docs/</code>, которые грузятся по запросу.</p></div>
+<p>Два других столпа, сабагенты и файловая система, за год только выросли. К ним добавились три вещи, которых у Чейза не было: скиллы с загрузкой по запросу, компакция с выгрузкой вывода на диск и цикл проверки, который не даёт агенту объявить работу сделанной. В «The Anatomy of an Agent Harness» (март 2026 года) LangChain уже перечисляет их как равноправные части харнесса<a class="cite" href="#src-3">3</a>.</p>
+<div class="note key"><p>Deep agent в 2026 году определяется не набором инструментов, а тем, как харнесс держит длинную задачу: изолирует контекст сабагентами, выносит состояние в файлы, грузит знания по запросу, сжимает историю и проверяет результат чем-то внешним.</p></div>
+</section>
+
+<section id="subagents">
+<h2>Сабагент — способ выбросить контекст</h2>
+<p>В документации Claude Code есть пошаговый разбор сессии, где сабагент-исследователь читает файлы на 6 100 токенов и возвращает родителю сводку на 420. Подпись к шагу: «that's the context savings»<a class="cite" href="#src-2">2</a>. Прочитанное остаётся в чужом окне и умирает вместе с ним, в этом и вся экономия.</p>
+<p>Граница проведена жёстко<a class="cite" href="#src-6">6</a><a class="cite" href="#src-21">21</a>. <dfn>Сабагент</dfn> стартует без истории родителя. Внутрь попадают его собственный системный промпт из описания агента, строка <code>prompt</code> из вызова инструмента <code>Agent</code>, проектный <code>CLAUDE.md</code> (если не выставлен <code>omitClaudeMd: true</code>) и разрешённые инструменты. Результаты инструментов родителя, его системный промпт и скиллы туда не попадают, скиллы — если их не перечислили явно. Наружу уходит одно последнее сообщение сабагента, которое становится результатом вызова <code>Agent</code>. Раньше этот инструмент назывался <code>Task</code>, и SDK советует проверять в своих обработчиках оба имени.</p>
+
+<figure class="fig" id="fig-subagent-boundary">
+<svg class="diagram" viewBox="0 0 760 300" role="img" aria-label="Что пересекает границу между родителем и сабагентом">
+  <rect class="box--soft" x="20" y="40" width="250" height="220" rx="8"/>
+  <text class="t-title" x="145" y="70" text-anchor="middle">Контекст родителя</text>
+  <text class="t-sub" x="40" y="105">история разговора</text>
+  <text class="t-sub" x="40" y="135">результаты инструментов</text>
+  <text class="t-sub" x="40" y="165">системный промпт</text>
+  <text class="t-sub" x="40" y="195">скиллы родителя</text>
+  <text class="t-mute" x="40" y="235">+ 420 токенов итога</text>
+  <rect class="box" x="490" y="40" width="250" height="220" rx="8"/>
+  <text class="t-title" x="615" y="70" text-anchor="middle">Окно сабагента</text>
+  <text class="t-sub" x="510" y="105">свой системный промпт</text>
+  <text class="t-sub" x="510" y="130">строка prompt</text>
+  <text class="t-sub" x="510" y="155">проектный CLAUDE.md</text>
+  <text class="t-sub" x="510" y="180">свои инструменты</text>
+  <text class="t-mute" x="510" y="235">файлы: 6 100 токенов</text>
+  <path class="arrow arrow--pen" d="M270,100 L488,100"/>
+  <text class="t-pen" x="380" y="90" text-anchor="middle">строка prompt</text>
+  <path class="arrow arrow--red" d="M270,160 L356,160"/>
+  <path class="line" d="M364,146 L364,174"/>
+  <text class="t-red" x="278" y="190">история не идёт</text>
+  <path class="arrow" d="M490,220 L272,220"/>
+  <text class="t-title" x="380" y="210" text-anchor="middle">итог, одно сообщение</text>
+  <text class="t-mute" x="380" y="288" text-anchor="middle">Пример из документации Claude Code: прочитано 6 100 токенов, вернулось 420</text>
+</svg>
+<figcaption>Внутрь сабагента проходит только строка задачи, наружу — только его последнее сообщение. Всё, что сабагент прочитал, остаётся в его окне и не попадает к родителю.</figcaption>
+</figure>
+
+<p>Сабагента описывают Markdown-файлом с YAML-фронтматтером в <code>.claude/agents/</code> проекта или в <code>~/.claude/agents/</code>. Обязательны только <code>name</code> и <code>description</code><a class="cite" href="#src-21">21</a>:</p>
+<script type="text/plain" class="code" data-lang="yaml" data-title=".claude/agents/code-reviewer.md (из документации)" data-hl="4,6">
+---
+name: code-reviewer
+description: Reviews code for quality and best practices
+tools: Read, Glob, Grep
+model: sonnet
+permissionMode: acceptEdits
+maxTurns: 10
+skills: api-conventions, error-handling-patterns
+memory: project
+omitClaudeMd: false
+---
+</script>
+<p>Из полей, появившихся в 2026 году, пригодятся <code>effort</code>, <code>isolation: worktree</code> (сабагент работает в отдельной git-копии), <code>background</code> и <code>memory</code> — постоянная память сабагента в <code>.claude/agent-memory/&lt;name&gt;/</code>, которая подмешивается в его системный промпт (о таких файлах — <a href="../11-agent-memory/index.html">глава 11</a>). Встроенных сабагентов три: Explore для быстрого поиска только на чтение, Plan для исследования в режиме планирования и универсальный general-purpose. С версии 2.1.198 (1 июля 2026 года) Explore больше не работает на Haiku, а наследует модель основной сессии с потолком Opus<a class="cite" href="#src-8">8</a>, так что старый совет «Explore дешёвый, пусть ищет» уже неверен.</p>
+<p>Сабагенты умеют порождать своих сабагентов, и харнесс это ограничивает. Глубина вложенности по умолчанию равна трём с версии 2.1.219 (24 июля 2026 года; в двух предыдущих версиях была единица), одновременно работают до 20 сабагентов, а бюджет считает расходы всего дерева<a class="cite" href="#src-22">22</a><a class="cite" href="#src-6">6</a>. Переменная <code>CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION</code>, которая встречается в старых инструкциях, с версии 2.1.224 ничего не делает.</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Лимиты дерева сабагентов, значения по умолчанию">
+CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH   3           (1 = без вложенности)
+CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS   20
+max_budget_usd / maxBudgetUsd          без лимита  (включает траты сабагентов)
+</script>
+<p>Изоляция не бесплатна. Сабагент заново читает то, что родитель уже знал, и в замере Systima раздача работы двум сабагентам увеличила расход токенов в 4,2 раза<a class="cite" href="#src-1">1</a>. Если задача помещается в одно окно без мусора, сабагент её только удорожит.</p>
+<p>Есть и цена менее очевидная. Итоговое сообщение сабагента родитель читает как результат инструмента, и сабагент, начитавшийся чужих файлов, может принести в нём инъекцию. С версии 2.1.210 Claude Code перед передачей сканирует этот текст: в поддельные управляющие теги вроде <code>&lt;system-reminder&gt;</code> вставляет обратный слэш, экранирует строки, начинающиеся с <code>Human:</code> или <code>Assistant:</code>, и помечает упоминания настроек разрешений<a class="cite" href="#src-6">6</a>. В auto mode, где вызовы одобряет классификатор, а не человек (о нём в <a href="#permissions">разделе о разрешениях</a>), к этому добавляются классификаторы на передаче задачи (могут запретить) и на возврате результата (только предупреждают)<a class="cite" href="#src-23">23</a>.</p>
+
+<h3>Форк: сабагент, который помнит всё</h3>
+<p>С версии 2.1.232 (13 августа 2026 года) в интерактивных сессиях по умолчанию включён другой вид сабагента — форк. Он «inherits the full conversation and prompt cache instead of starting fresh», и все сабагенты, которых запускает Claude, теперь по умолчанию уходят в фон<a class="cite" href="#src-8">8</a>. Запросить форк можно и руками:</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Форк из интерактивной сессии (пример из документации)">
+> /subtask draft unit tests for the parser changes so far
+</script>
+<p>Форк решает другую задачу. Обычный сабагент нужен ради чистого окна, форк — ради параллельной работы без повторного чтения. Он стартует с кешированного префикса родителя и потому дёшев на старте, но всю историю родителя несёт с собой и от шума не спасает. С версии 2.1.285 форки работают в режиме разрешений родителя и не могут выйти из режима планирования<a class="cite" href="#src-8">8</a>. Выключается фича переменной <code>CLAUDE_CODE_FORK_SUBAGENT=0</code>.</p>
+
+<h3>Четыре ступени оркестрации</h3>
+<p>Над сабагентами в Claude Code надстроены ещё два механизма, и все четыре различаются прежде всего тем, где живёт план<a class="cite" href="#src-21">21</a>.</p>
+<figure class="fig" id="fig-ladder">
+<div class="layers">
+  <div class="layer" data-tone="soft"><b>Форк</b><span>вся история и кеш родителя, работает в фоне; план в общей истории. По умолчанию с 2.1.232</span></div>
+  <div class="layer"><b>Сабагент</b><span>чистое окно, возвращает одно сообщение; план у родителя. Вложенность до 3, одновременно до 20</span></div>
+  <div class="layer" data-tone="violet"><b>Команда агентов</b><span>независимые сессии, почтовые ящики, общий список задач; план у лида. Экспериментальная, токены растут с размером команды</span></div>
+  <div class="layer" data-tone="accent"><b>Workflow</b><span>скрипт на JavaScript исполняет рантайм; план в коде, в окно приходит только итог. До 16 агентов параллельно, до 1 000 за прогон</span></div>
+</div>
+<figcaption>Лестница оркестрации Claude Code на сентябрь 2026 года. Чем ниже ступень, тем меньше решений о следующем шаге принимает модель по ходу разговора и тем больше их зафиксировано заранее.</figcaption>
+</figure>
+<p>Команды агентов (agent teams) появились как research preview в версии 2.1.32 (5 февраля 2026 года) и включаются переменной <code>CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1</code><a class="cite" href="#src-8">8</a>. Главная сессия становится лидом и запускает тиммейтов, полноценные независимые сессии Claude Code со своими окнами. Они пишут друг другу через почтовые ящики в <code>~/.claude/teams/{team}/inboxes/{agent}.json</code> и сами разбирают задачи из общего списка с файловой блокировкой. Документация прямо предупреждает о цене: токенов уходит примерно пропорционально размеру команды, а когда тиммейты работают в режиме планирования, около 7 раз больше, чем в обычной сессии<a class="cite" href="#src-21">21</a>. Есть и ловушка: «while agent teams are enabled, a subagent that Claude names launches as a teammate». Claude сам даёт сабагенту имя, чтобы потом ему написать, и команда собирается без твоей просьбы.</p>
+<p>Dynamic workflows вышли в версии 2.1.154 (28 мая 2026 года)<a class="cite" href="#src-8">8</a>. Claude пишет на JavaScript скрипт из вызовов <code>agent()</code>, <code>parallel()</code>, <code>pipeline()</code> и <code>phase()</code>, а исполняет его отдельный рантайм. Циклы, ветвления и промежуточные результаты живут в переменных скрипта, в окно Claude приходит только итог<a class="cite" href="#src-21">21</a>:</p>
+<script type="text/plain" class="code" data-lang="javascript" data-title="Сохранённый workflow (из документации)" data-hl="5,8-10">
+export const meta = {
+  name: 'audit-routes',
+  description: 'Audit every route handler for missing auth checks',
+}
+const found = await agent('List every .ts file under src/routes/.', {
+  schema: { type: 'object', required: ['files'], properties: { files: { type: 'array', items: { type: 'string' } } } },
+})
+const audits = await pipeline(found.files, file =>
+  agent(`Audit ${file} for missing authentication checks.`, { label: file }),
+)
+return audits.filter(Boolean)
+</script>
+<p>Тело скрипта — обычный JavaScript с <code>await</code> и <code>return</code> на верхнем уровне: его исполняет рантайм, и как самостоятельный модуль такой файл не запустится. Рантайм следит и за воспроизводимостью: <code>Date.now()</code>, <code>Math.random()</code> и <code>new Date()</code> без аргументов внутри скрипта бросают исключение, чтобы прерванный и перезапущенный прогон повторил те же вызовы <code>agent()</code>. Пределы жёсткие: до 16 агентов одновременно (с версии 2.1.269 настраивается от 1 до 256), до 1 000 агентов за прогон и до 4 096 элементов на один вызов <code>parallel()</code> или <code>pipeline()</code>. Выше 25 агентов или 1,5 млн прогнозных токенов появляется предупреждение <code>Large workflow</code><a class="cite" href="#src-21">21</a>. Ключевое слово для запуска сначала было <code>workflow</code>, с версии 2.1.160 стало <code>ultracode</code>, а с 2.1.284 (28 сентября) Ultracode — отдельный переключатель в <code>/effort</code>, который больше не поднимает effort до <code>xhigh</code><a class="cite" href="#src-8">8</a>. В блоге о запуске команда Claude Code назвала три сбоя, против которых всё это придумано: агентная лень (агент останавливается раньше времени), предвзятость агента к собственной работе при проверке и дрейф цели на длинном прогоне<a class="cite" href="#src-24">24</a>.</p>
+<p>У конкурентов лестница короче, но похожа. В Codex сабагенты включены по умолчанию, а между их потоками переключаются командой <code>/agent</code><a class="cite" href="#src-18">18</a>. Cursor с августа 2026 года запускает сабагентов на отдельных виртуальных машинах, а 10 сентября выпустил Projects с координатором, который «doesn't write code itself» и раздаёт работу тысячам сабагентов<a class="cite" href="#src-17">17</a>. Как выбирать топологию для своей системы, разбирает <a href="../13-multi-agent/index.html">глава 13</a>; внутри Claude Code хватает простого правила.</p>
+<div class="note practice"><p>Нужен ответ без мусора в окне — обычный сабагент. Нужно параллельно сделать что-то, для чего важен весь разговор, — форк. Несколько долгих исполнителей, которые должны спорить друг с другом, — команда, если готов платить. Десятки однотипных задач по списку — workflow: план в коде, а не в чьей-то голове.</p></div>
+</section>
+
+<section id="files">
+<h2>Файлы вместо контекста</h2>
+<p>В январе 2026 года Cursor провёл A/B-тест: описания инструментов MCP-серверов перестали класть в промпт и начали синхронизировать в папку, по одной на сервер, откуда агент читает их сам, когда нужно. В прогонах, где вызывался хотя бы один MCP-инструмент, общий расход токенов упал на 46,9%, хотя разброс между прогонами был большой<a class="cite" href="#src-25">25</a>. Плоский поиск по инструментам в Cursor тоже рассматривали и выбрали папки.</p>
+<p>Этот приём — один из пяти, которые Cursor объединил под названием <dfn>dynamic context discovery</dfn>: заранее давать меньше деталей и оставлять агенту возможность самому достать нужное из файлов. Длинный вывод инструмента пишется в файл, агент читает его хвост и при необходимости дочитывает. История чата после суммаризации остаётся файлом, в котором можно искать. Знания уезжают в Agent Skills. Описания MCP-инструментов лежат по папкам. Вывод встроенного терминала синхронизируется в файлы.</p>
+
+<figure class="fig" id="fig-discovery">
+<script type="text/x-mermaid">
+flowchart TD
+  inv["Вызов: shell, MCP, терминал"]
+  big["Длинный вывод"]:::warn
+  file[("Файл в рабочей папке")]
+  stub["В окно: путь и хвост"]:::accent
+  grep["Агент: tail, grep, чтение с offset"]
+  slice["В окно: нужный срез"]:::ok
+  mcp[("Папка описаний MCP")]:::mute
+  hist[("История чата файлом")]:::mute
+  inv -- "результат" --> big
+  big -- "харнесс пишет на диск" --> file
+  big -- "вместо вывода" --> stub
+  stub -- "модель решает, что нужно" --> grep
+  grep -- "читает" --> file
+  grep -- "только нужные строки" --> slice
+  mcp -. "по требованию" .-> grep
+  hist -. "поиск после сводки" .-> grep
+</script>
+<figcaption>Dynamic context discovery в Cursor. Большой результат не попадает в окно целиком: харнесс кладёт его на диск и отдаёт модели путь с хвостом, а дальше модель сама решает, какой кусок стоит дочитать.</figcaption>
+</figure>
+
+<p>В сентябре 2026 года Cursor отчитался, что дала та же линия на длинных прогонах<a class="cite" href="#src-26">26</a>. Системный промпт урезали примерно на 66%, описания встроенных инструментов вынесли из постоянного контекста и сократили там на 60%, холодных промахов кеша стало на 20% меньше. Даже номера строк пошли под нож: их ставят у каждой десятой строки, а не у каждой, и это срезало 1,6% токенов, читаемых из кеша. Итог — минус 7% стоимости для пользователей «without reducing agent quality», по замеру самого Cursor. Ни один из этих рычагов не трогает модель.</p>
+<p>Принцип старше обоих постов Cursor. Manus в 2025 году называла его восстановимым сжатием: «the content of a web page can be dropped from the context as long as the URL is preserved»<a class="cite" href="#src-16">16</a>. Выбросить из окна можно всё, к чему остался путь назад. Файловая система в такой схеме работает внешней памятью без ограничения размера, и агент сам решает, что поднять обратно. Остальные приёмы сжатия разобраны в <a href="../02-context-engineering/index.html">главе 2</a>.</p>
+<p>Anthropic довела ту же идею до архитектуры. В Managed Agents (пост от 8 апреля 2026 года) три виртуализированные части: сессия, то есть «the append-only log of everything that happened», харнесс, то есть цикл, который вызывает Claude и маршрутизирует вызовы инструментов, и песочница<a class="cite" href="#src-27">27</a>. «The session is not Claude's context window»: журнал живёт вне окна, харнесс берёт из него срез через <code>getEvents()</code> и сам решает, что показать модели. Инструменты вызываются через <code>execute(name, input) → string</code>, а упавший харнесс поднимается вызовом <code>wake(sessionId)</code>. После того как харнесс отделили от контейнера, задержка до первого токена упала примерно на 60% по медиане и больше чем на 90% в 95-м перцентиле. Токены доступа к git и к MCP в песочницу, где выполняется код Claude, при этом не попадают вообще.</p>
+
+<h3>Скиллы и их бюджет</h3>
+<p>Скиллы применяют тот же принцип к знаниям: в контексте постоянно лежит только короткое описание, тело грузится при вызове (формат и уровни загрузки — <a href="../06-skills/index.html">глава 6</a>). Но и описания занимают место, и у Claude Code для них есть бюджет, о котором долго знали только из полевых отчётов. Теперь он описан в документации: «The listing always contains every skill name, but if you have many skills, Claude Code drops some descriptions to fit the listing's character budget… The budget scales at 1% of the model's context window. When the listing overflows, Claude Code drops descriptions starting with the skills you invoke least»<a class="cite" href="#src-21">21</a>. Описание вместе с <code>when_to_use</code> обрезается на 1 536 символах. Бюджет настраивается ключом <code>skillListingBudgetFraction</code> и переменной <code>SLASH_COMMAND_TOOL_CHAR_BUDGET</code>, а <code>/skill-doctor</code> с версии 2.1.252 показывает, сколько контекста стоит каждый скилл<a class="cite" href="#src-8">8</a>.</p>
+<div class="note field">
+<blockquote>You can't create 10K skills, as that would eat your entire usable context.
+<footer>— sermakarevich, <a href="https://news.ycombinator.com/item?id=48407998">Hacker News, июнь 2026</a></footer></blockquote>
+<p>Тот же автор заметил, что редко вызываемые скиллы пропадают из фоновых сессий, и не нашёл этому объяснения в документации<a class="cite" href="#src-20">20</a>. Теперь механизм описан: имя скилла остаётся в списке, а описание исчезает, и модели становится не по чему понять, что скилл подходит к задаче.</p>
+</div>
+<p>Рой агентов Cursor пришёл к тому же с другой стороны. Агенты сами ведут общую папку Field Guide, и её <code>index.md</code> автоматически подмешивается в каждого агента<a class="cite" href="#src-13">13</a>. В контексте лежит индекс, всё остальное доступно по ссылке.</p>
+<div class="note practice"><p>Открой <code>/context</code> в своём проекте и найди, что Claude Code держит в окне постоянно. Большие справочники из <code>CLAUDE.md</code> можно превратить в скиллы или файлы в <code>docs/</code>, а длинные логи — в файлы, которые агент грепает, а не читает целиком.</p></div>
+</section>
+
+<section id="compaction">
+<h2>Когда окно кончается</h2>
+<p>Claude Code на моделях с родным окном в миллион токенов (Sonnet 5 и 5.5, Fable, Opus 4.7 и новее через API Anthropic) сжимает историю «at about 967K tokens by default»<a class="cite" href="#src-22">22</a>. Размер окна, на котором срабатывает автокомпакция, настраивается от 100 тыс. до 1 млн командой <code>/autocompact 500k</code>, флагом <code>--autocompact</code> или переменной <code>CLAUDE_CODE_AUTO_COMPACT_WINDOW</code>. Старая переменная <code>CLAUDE_AUTOCOMPACT_PCT_OVERRIDE</code>, которую до сих пор советуют в блогах, «can't raise the threshold»: ею порог можно только опустить<a class="cite" href="#src-22">22</a>.</p>
+<p>Сжатие идёт в два приёма: сначала из истории вычищаются старые результаты инструментов, потом разговор суммаризируется<a class="cite" href="#src-2">2</a>. По документации, сводка сохраняет запросы и намерения пользователя, ключевые технические решения, просмотренные и изменённые файлы с важными фрагментами кода, ошибки и их исправления, незаконченные задачи и текущую работу, а «full tool outputs and intermediate reasoning are gone»<a class="cite" href="#src-2">2</a>. После сводки харнесс заново читает до пяти недавно изменённых файлов и возвращает тела вызванных скиллов: первые 5 000 токенов каждого, всего не больше 25 000, начиная с последнего вызванного<a class="cite" href="#src-21">21</a>. <code>CLAUDE.md</code> и auto memory перечитываются с диска. Инструкции, которые ты давал только в чате, могут пропасть.</p>
+<div class="note warn"><p>Если один результат инструмента так велик, что окно заполняется сразу после сжатия, Claude Code после нескольких попыток прекращает автокомпакцию и показывает ошибку, а не крутится вечно<a class="cite" href="#src-2">2</a>. В самописном харнессе такого предохранителя нет, пока ты его не напишешь, и цикл «сжал, заполнил, сжал» сожжёт бюджет.</p></div>
+<p>Сводкой можно управлять. Компактор ищет в <code>CLAUDE.md</code> раздел с инструкциями для суммаризации и «matches on intent», так что заголовок может быть любым<a class="cite" href="#src-6">6</a>. Хук <code>PreCompact</code> срабатывает перед сжатием с полем <code>trigger</code>, равным <code>manual</code> или <code>auto</code>, и успевает сохранить полную расшифровку, а в потоке SDK на месте сжатия появляется <code>SystemMessage</code> с подтипом <code>compact_boundary</code>.</p>
+<script type="text/plain" class="code" data-lang="markdown" data-title="CLAUDE.md: что сохранить при компакции (пример из документации)">
+# Summary instructions
+
+When summarizing this conversation, always preserve:
+- The current task objective and acceptance criteria
+- File paths that have been read or modified
+- Test results and error messages
+- Decisions made and the reasoning behind them
+</script>
+<p>Три харнесса из этой главы сжимают историю тремя разными способами, четвёртый не сжимает вовсе, и разница видна, когда что-то пошло не так.</p>
+<table>
+<thead><tr><th>Харнесс</th><th>Что уходит в следующий запрос</th><th>Что с оригиналом</th></tr></thead>
+<tbody>
+<tr><th>Claude Code</th><td>Текстовая сводка, перечитанные файлы, тела вызванных скиллов</td><td>Уходит из запроса; сохранить полную версию можно хуком <code>PreCompact</code></td></tr>
+<tr><th>Codex</th><td>Элемент <code>type=compaction</code> с непрозрачным <code>encrypted_content</code><a class="cite" href="#src-11">11</a></td><td>Заменён; прочитать, что сохранила сводка, нельзя</td></tr>
+<tr><th>Pi</th><td>Запись-сводка вместо старых сообщений</td><td>«The original entries remain in the session tree»<a class="cite" href="#src-5">5</a></td></tr>
+<tr><th>Amp</th><td>Ничего: компакции нет, вместо неё Handoff — черновик промпта для новой ветки и список нужных файлов<a class="cite" href="#src-28">28</a></td><td>Старая ветка остаётся целой; в новую переходит только выбранное под следующую задачу</td></tr>
+</tbody>
+</table>
+<p>Для отладки удобнее всего Pi: сессия там дерево, и к любой точке до сжатия можно вернуться. Сводку Claude Code хотя бы можно прочитать и увидеть, что потерялось. Сводку Codex не видит никто, кроме модели, зато OpenAI обещает, что она сохраняет больше, чем текст. Если пишешь свой харнесс, делай как в Pi: сжимай то, что уходит в модель, но не выбрасывай оригинал.</p>
+<p>Компакция — не единственный ответ на переполнение. Для Sonnet 4.5 Anthropic делала полный сброс контекста: новый агент с чистым окном и файлом передачи дел. У модели была «тревога контекста» (context anxiety): чувствуя приближение лимита, она сворачивала работу раньше времени<a class="cite" href="#src-29">29</a>. На Opus 4.5 тревога «largely removed», и сбросы заменили автокомпакцией Agent SDK. Приём, без которого год назад было не обойтись, стал лишним грузом, как потом и спринты из <a href="#long-running">раздела о длинных задачах</a>.</p>
+<p>Amp пошёл в обратную сторону и 23 октября 2025 года убрал компакцию совсем: по словам команды, она «encourages long, meandering threads… stacking summary on top of summary»<a class="cite" href="#src-28">28</a>. Вместо неё пишешь цель, например «<code>/handoff</code> now implement this for teams as well», и Amp по текущей ветке готовит черновик промпта для новой, который можно поправить до отправки.</p>
+<div class="note field">
+<blockquote>Больше 200к пихать в модель бессмысленно… Lost in the middle, 2023 год.
+<footer>— Никита Пастухов, <a href="https://t.me/s/fastnewsdev">телеграм-канал fastnewsdev, сентябрь 2026</a></footer></blockquote>
+<p>Миллионные окна практиков не убедили<a class="cite" href="#src-30">30</a>. Многие режут работу на этапы, каждый в отдельной сессии до 100–200 тыс. токенов, и каждая сессия начинается с файла плана. При таком подходе автокомпакция почти не срабатывает, а её место занимает файл, который пишет сам агент.</p>
+</div>
+</section>
+
+<section id="permissions">
+<h2>Кто нажимает «да»</h2>
+<p>По внутренним данным Anthropic на март 2026 года, пользователи Claude Code одобряли 93% запросов на разрешение<a class="cite" href="#src-23">23</a>. При такой доле кнопка «да» перестаёт быть проверкой и становится привычкой. Ответом стал <dfn>auto mode</dfn>, в котором решение принимает классификатор. 25 марта Anthropic подробно описала, как он устроен.</p>
+<p>Вызов инструмента проходит три уровня. На первом стоят встроенный список безопасных инструментов и правила пользователя. При входе в auto mode широкие правила вроде разрешения на любой шелл или на интерпретаторы <code>python*</code> отбрасываются, чтобы опасные вызовы не проходили по ним в обход классификатора. На втором уровне пропускаются без классификатора правки файлов внутри проекта. Всё остальное уходит на третий уровень, к классификатору расшифровки. На март это Sonnet 4.6, и работает он в две стадии: быстрый фильтр отвечает «да» или «нет» одним токеном, а цепочку рассуждений запускает, только если первая стадия насторожилась.</p>
+<p>Самое интересное здесь — чего классификатор не видит. Он «sees only user messages and the agent's tool calls; we strip out Claude's own messages and tool outputs». Рассуждения агента вырезаны, чтобы агент не мог уговорить судью. Вывод инструментов вырезан, чтобы до судьи не добралась инъекция из прочитанной страницы. Против инъекций работает отдельный слой на входе: серверный зонд сканирует результаты инструментов и дописывает предупреждение в контекст самого агента.</p>
+
+<figure class="fig" id="fig-automode">
+<script type="text/x-mermaid">
+flowchart TD
+  inv["Вызов инструмента"]
+  t1["Уровень 1: allowlist<br/>и правила пользователя"]
+  t2["Уровень 2: правка<br/>внутри проекта?"]
+  s1["Стадия 1: да или нет<br/>одним токеном"]:::accent
+  s2["Стадия 2: рассуждение"]:::violet
+  run["Выполнить"]:::ok
+  deny["Отказ"]:::warn
+  probe["Зонд инъекций<br/>на выводе инструмента"]:::mute
+  inv -- "каждый вызов" --> t1
+  t1 -- "в списке" --> run
+  t1 -- "нет" --> t2
+  t2 -- "да" --> run
+  t2 -- "нет" --> s1
+  s1 -- "безопасно" --> run
+  s1 -- "подозрительно" --> s2
+  s2 -- "одобрено" --> run
+  s2 -- "опасно" --> deny
+  run -- "результат" --> probe
+  probe -. "предупреждение агенту" .-> inv
+</script>
+<figcaption>Конвейер auto mode в Claude Code. Дорогая вторая стадия запускается только на подозрительных вызовах. Классификатор видит сообщения пользователя и вызовы инструментов, но не рассуждения агента и не вывод инструментов: вывод проверяет отдельный зонд.</figcaption>
+</figure>
+
+<p>Anthropic опубликовала и неудобные цифры. Первая стадия на реальном трафике (10 тыс. вызовов) ложно тревожит в 8,5% случаев, весь конвейер — в 0,4%. Зато пропусков у полного конвейера больше: 17% на выборке из 52 реальных случаев, когда агент делал больше, чем просили, и 5,7% на тысяче синтетических попыток эксфильтрации. Вторая стадия убирает ложные тревоги ценой пропусков: «The 17% false-negative rate… is the honest number». Более поздний внешний замер auto mode против непрямых инъекций разобран в <a href="../16-security/index.html">главе 16</a>.</p>
+
+<figure class="fig" id="fig-automode-rates">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Ошибки классификатора auto mode", "unit": "%", "decimals": 1,
+ "categories": ["Ложные тревоги", "Пропуски: агент превысил задачу", "Пропуски: эксфильтрация"],
+ "series": [
+  {"name": "Только стадия 1", "values": [8.5, 6.6, 1.8]},
+  {"name": "Весь конвейер", "values": [0.4, 17, 5.7]}
+ ],
+ "note": "Anthropic, 25 марта 2026. Реальный трафик n = 10 000; реальные случаи превышения задачи n = 52; синтетическая эксфильтрация n = 1 000."}
+</script>
+<figcaption>Вторая стадия почти убирает ложные тревоги, которые раздражают пользователя, но пропускает больше опасного. Каждое шестое реальное превышение задачи проходит мимо полного конвейера.</figcaption>
+</figure>
+
+<p>Несмотря на эти 17%, auto mode стал режимом по умолчанию, в несколько приёмов. 14 августа 2026 года — для новых сессий на тарифах Pro, Max и Team<a class="cite" href="#src-8">8</a>. В версии 2.1.284 (28 сентября) — для интерактивных сессий в терминале и VS Code на всех тарифах и у всех провайдеров, а в 2.1.285 — для <code>claude -p</code> и Python Agent SDK у сторонних провайдеров<a class="cite" href="#src-8">8</a>. Явно режим задаётся в настройках:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="settings.json (из документации)">
+{
+  "permissions": {
+    "defaultMode": "auto"
+  }
+}
+</script>
+<p>Раз кнопку «да» жмёт классификатор, полезно знать, чем откатываться. Claude Code на каждом ходе снимает чекпойнт файлов, к которому возвращает <code>/rewind</code>; хранятся 100 последних, по умолчанию около 30 дней. Но чекпойнт видит только правки файловых инструментов: изменения через Bash (<code>rm</code>, <code>mv</code>, <code>cp</code>) и большинство правок сабагентов он не вернёт<a class="cite" href="#src-22">22</a>. После <code>rm</code> спасёт только git.</p>
+
+<h3>Три вендора, одна схема</h3>
+<p>Cursor пришёл к тому же 11 июня 2026 года и сделал Auto-review режимом по умолчанию для новых пользователей<a class="cite" href="#src-31">31</a>. Маленькая рассуждающая модель работает агентным классификатором в том же RPC-потоке, что и основной агент, и перед разрешением может сама открыть скрипт через <code>ReadFile</code>, <code>Grep</code>, <code>Glob</code> и <code>ListDir</code>. Отказ уходит не пользователю, а основному агенту как обратная связь. Блокируется около 4% проверенных действий, примерно в 7% чатов пользователя хоть раз отвлекают, а у некоторых корпоративных клиентов раньше блокировалось до 40% действий. Для оценки собрали 6 122 размеченные строки из примерно 12 часов внутренних сессий и синтетических атак и прогоняли их по нескольку раз, чтобы поймать «мигание» (flapping), то есть разные вердикты на одном и том же входе.</p>
+<p>В Codex граница проведена жёстче<a class="cite" href="#src-18">18</a>. Агент работает в песочнице <code>read-only</code> или <code>workspace-write</code> и просит одобрения, только когда ему нужно выйти за её пределы. С <code>approvals_reviewer = "auto_review"</code> такой запрос уходит отдельному агенту-ревьюеру, который возвращает решение с обоснованием. При отказе основной агент должен «find a materially safer path or stop and ask the user». По документации, «Auto-review is a reviewer swap, not a permission grant»: ревьюер не расширяет <code>writable_roots</code>, не включает сеть и не ослабляет защищённые пути.</p>
+<p>Под всеми тремя классификаторами лежит песочница операционной системы, и классификатор её не заменяет. Claude Code на macOS использует Seatbelt, на Linux — bubblewrap. Писать можно в текущую папку, в папки из <code>--add-dir</code> и во временную, а читать по умолчанию можно почти всё, включая <code>~/.ssh</code> и <code>~/.aws/credentials</code>, если не закрыть их через <code>sandbox.credentials</code>. Сеть идёт через прокси вне песочницы, заранее разрешённых доменов нет. Настройки, хуки и <code>.git/{HEAD,objects,refs}</code> защищены, и никакое правило <code>allow</code> их не открывает<a class="cite" href="#src-22">22</a>. Codex делит то же на режим песочницы (<code>read-only</code>, <code>workspace-write</code>, <code>danger-full-access</code>) и политику одобрений, на тех же Seatbelt и bwrap с seccomp, с защищёнными <code>.git</code>, <code>.agents</code> и <code>.codex</code> и выключенной по умолчанию сетью. Как устроены песочницы и что они не ловят, разбирает <a href="../16-security/index.html">глава 16</a>.</p>
+<div class="note key"><p>Классификатор решает, нужно ли спрашивать; песочница решает, что вообще физически возможно. При 17% пропусков первое без второго не работает.</p></div>
+
+<h3>Хуки и чужие полномочия</h3>
+<p>Детерминированный слой поверх всего этого — хуки. Хук <code>PreToolUse</code> видит вызов до выполнения и может запретить его, вернув JSON; код выхода 2 блокирует вызов независимо от вывода<a class="cite" href="#src-22">22</a>. Обработчиком может быть шелл-команда, HTTP-эндпоинт, MCP-инструмент, одноразовый вопрос к модели или экспериментальный агент-проверяющий. Проектные хуки работают только в доверенной рабочей папке, пользовательские из <code>~/.claude</code> — всегда.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Ответ PreToolUse-хука, запрещающий вызов (из документации)">
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Destructive command blocked by hook"
+  }
+}
+</script>
+<p><code>PreToolUse</code> — лишь одна из точек, где хук врезается в цикл. Для харнесса важны вот эти<a class="cite" href="#src-22">22</a>:</p>
+<table>
+<thead><tr><th>Событие</th><th>Где в цикле</th><th>Что может хук</th></tr></thead>
+<tbody>
+<tr><th><code>SessionStart</code></th><td>Старт, продолжение, <code>/clear</code>, после компакции (источник <code>compact</code>)</td><td>Добавить контекст; заблокировать нельзя</td></tr>
+<tr><th><code>UserPromptSubmit</code></th><td>До того, как промпт дойдёт до модели</td><td>Заблокировать промпт: код 2 или <code>decision: "block"</code></td></tr>
+<tr><th><code>PreToolUse</code></th><td>До исполнения вызова</td><td>Запретить: код 2 или <code>permissionDecision: "deny"</code></td></tr>
+<tr><th><code>PostToolUse</code></th><td>После успешного вызова</td><td>Вызов уже прошёл; <code>decision: "block"</code> возвращает модели причину</td></tr>
+<tr><th><code>PreCompact</code></th><td>Перед сжатием, <code>trigger</code>: <code>manual</code> или <code>auto</code></td><td>Сохранить расшифровку или отменить сжатие</td></tr>
+<tr><th><code>SubagentStart</code>, <code>SubagentStop</code></th><td>Запуск и конец сабагента</td><td><code>SubagentStop</code> может не дать сабагенту закончить</td></tr>
+<tr><th><code>Stop</code></th><td>Модель ответила без вызовов</td><td>Не дать закончить; на этом стоит плагин ralph-wiggum</td></tr>
+<tr><th><code>TeammateIdle</code>, <code>TaskCreated</code>, <code>TaskCompleted</code></th><td>Команды агентов</td><td>Вернуть тиммейта к работе, отклонить задачу или её закрытие</td></tr>
+</tbody>
+</table>
+<p>Хуки из <code>settings.json</code> срабатывают и в главном агенте, и в сабагентах. У Agent SDK есть второй вид: колбэки, переданные в <code>query()</code>, работают рядом с файловыми хуками, тоже срабатывают внутри сабагентов и получают <code>agent_id</code> и <code>agent_type</code>, так что политику можно различать по агенту<a class="cite" href="#src-6">6</a>. В Codex хуки тоже стабильная функция, включённая по умолчанию<a class="cite" href="#src-18">18</a>.</p>
+<p>Чем больше агентов, тем важнее, чьим голосом говорит сообщение. С версии 2.1.166 сообщения, которые другие сессии Claude присылают через <code>SendMessage</code>, «no longer carry user authority»: получатель отказывается выполнять пересланные просьбы о разрешениях, а auto mode их блокирует<a class="cite" href="#src-8">8</a>. Промпты вызовов <code>agent()</code> внутри workflow с версии 2.1.277 размечаются как текст скрипта, чтобы классификатор не принял их за слова пользователя. Сами <code>SendMessage</code> и <code>ListAgents</code> для переписки между твоими сессиями появились в 2.1.224, в первую неделю августа<a class="cite" href="#src-8">8</a>. В русскоязычных пересказах эту дату смешали с 14 августа, когда auto mode стал режимом по умолчанию, и вышло «входящие сообщения от других сессий принимаются автоматически»<a class="cite" href="#src-30">30</a>. По чейнджлогу всё наоборот: пересланное сообщение полномочий пользователя не несёт.</p>
+</section>
+
+<section id="long-running">
+<h2>Агент на много окон</h2>
+<p>Весь оркестратор, которым Николас Карлини из Anthropic собрал компилятор C, помещается в восемь строк<a class="cite" href="#src-32">32</a>:</p>
+<script type="text/plain" class="code" data-lang="bash" data-title="Цикл Карлини (переносы строк восстановлены из HTML)">
+#!/bin/bash
+while true; do
+  COMMIT=$(git rev-parse --short=6 HEAD)
+  LOGFILE="agent_logs/agent_${COMMIT}.log"
+  claude --dangerously-skip-permissions \
+    -p "$(cat AGENT_PROMPT.md)" \
+    --model claude-opus-X-Y &> "$LOGFILE"
+done
+</script>
+<p>Шестнадцать таких циклов параллельно, около 2 000 сессий Claude Code на Opus 4.6 и $20 000 на API дали компилятор на Rust в 100 тыс. строк, который собирает Linux 6.9 для x86, ARM и RISC-V. Каждый агент клонирует голый репозиторий <code>/upstream</code> в свой Docker-контейнер и захватывает задачу, записывая файл <code>current_tasks/&lt;task&gt;.txt</code>; если два агента схватили одно и то же, git при синхронизации заставит второго выбрать другое. Рядом с флагом <code>--dangerously-skip-permissions</code> в посте стоит приписка «(Run this in a container, not your actual machine)». Карлини опубликовал пост 5 февраля 2026 года, в тот же день, когда в Claude Code вышла экспериментальная функция agent teams, но компилятор собран не ей, а bash-циклом и git.</p>
+
+<h3>Два разных Ральфа</h3>
+<p>Такой цикл называют <dfn>Ralph loop</dfn>, по имени Ральфа Виггама из «Симпсонов». Джеффри Хантли описал технику в июле 2025 года как <code>while :; do cat PROMPT.md | claude-code; done</code><a class="cite" href="#src-33">33</a>, а в январе 2026 года сформулировал её жёстче: «Ralph is monolithic. Ralph works autonomously in a single repository as a single process that performs one task per loop». Мультиагентные системы он противопоставляет этому прямо: если микросервисы сами недетерминированы, выходит «a red hot mess». Настраивают Ральфа правкой спецификации, а не протоколом между агентами, и сам Хантли советует его только для новых проектов: на старом коде недетерминированный поиск даёт ложные «этого ещё нет» и агент переписывает уже написанное.</p>
+<p>Под одним названием живут два разных механизма, и путать их дорого.</p>
+<figure class="fig" id="fig-ralph">
+<div class="versus">
+  <div data-tone="soft"><h4>Внешний цикл: Хантли, Карлини</h4><ul>
+    <li><code>while true</code> в bash каждый раз запускает новый процесс <code>claude -p</code></li>
+    <li>каждая итерация начинается с чистого окна</li>
+    <li>состояние живёт только в файлах и git</li>
+    <li>остановка — Ctrl+C или условие в скрипте</li>
+  </ul></div>
+  <div data-tone="violet"><h4>Stop-хук: плагин ralph-wiggum</h4><ul>
+    <li>одна сессия, хук не даёт ей завершиться</li>
+    <li>тот же промпт возвращается в тот же разговор</li>
+    <li>контекст копится, его сжимает компакция</li>
+    <li>остановка по обещанию в выводе или по лимиту итераций</li>
+  </ul></div>
+</div>
+<figcaption>Два механизма под одним именем. Слева свежий контекст на каждом шаге и память только на диске, справа один длинный разговор, который держится на компакции.</figcaption>
+</figure>
+<p>Официальный плагин <code>ralph-wiggum</code> появился в репозитории Claude Code 16 ноября 2025 года<a class="cite" href="#src-34">34</a>. Его Stop-хук перехватывает попытку закончить и подаёт «the SAME prompt back», причём «the loop happens inside your current session». Контекст при этом не сбрасывается. Если тебе нужна чистая голова на каждой итерации, плагин её не даст; нужен внешний цикл.</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Запуск цикла в сессии (из README плагина)">
+/ralph-loop "Build a REST API for todos. Requirements: CRUD operations, input validation, tests. Output <promise>COMPLETE</promise> when done." --completion-promise "COMPLETE" --max-iterations 50
+</script>
+<p>Та же идея встречается под другими именами. OpenAI просит Codex проверять свои изменения, запрашивать ревью у других агентов и отвечать на замечания «in a loop until all agent reviewers are satisfied (effectively this is a Ralph Wiggum Loop)»<a class="cite" href="#src-19">19</a>. <code>PreCompletionChecklistMiddleware</code> в LangChain перехватывает выход агента и заставляет его пройти проверку, «similar to a Ralph Wiggum Loop»<a class="cite" href="#src-3">3</a>.</p>
+
+<h3>Инициализатор и журнал смены</h3>
+<p>Anthropic в ноябре 2025 года описала проблему длинной работы так: каждая новая сессия начинается без памяти о прошлых, как смена инженеров, которые не помнят, что делала предыдущая<a class="cite" href="#src-29">29</a>. Компакции для этого мало: сводка «doesn't always pass perfectly clear instructions to the next agent». Решением стали две роли с разными промптами. Агент-инициализатор работает один раз: пишет <code>init.sh</code>, который поднимает dev-сервер, журнал <code>claude-progress.txt</code>, список фич <code>feature_list.json</code> (в примере с клоном claude.ai — больше двухсот пунктов) и делает первый коммит. Агент-кодер в каждой следующей сессии читает всё это, делает одну фичу и оставляет репозиторий в чистом состоянии.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Элемент feature_list.json (из поста Anthropic)" data-hl="10">
+{
+ "category": "functional",
+ "description": "New chat button creates a fresh conversation",
+ "steps": [
+   "Navigate to main interface",
+   "Click the 'New Chat' button",
+   "Verify a new conversation is created",
+   "Check that chat area shows welcome state",
+   "Verify conversation appears in sidebar"
+ ],
+ "passes": false
+}
+</script>
+<p>Формат выбран не случайно: «the model is less likely to inappropriately change or overwrite JSON files compared to Markdown files». Флаг <code>passes</code> кодер может перевернуть только после проверки от начала до конца, а в промпте сказано: «It is unacceptable to remove or edit tests because this could lead to missing or buggy functionality».</p>
+
+<figure class="fig" id="fig-initializer">
+<script type="text/x-mermaid">
+flowchart TD
+  init["Сессия 1: инициализатор"]:::violet
+  files[("init.sh, feature_list.json,<br/>claude-progress.txt, git")]
+  start["Сессия N: pwd, журнал,<br/>список фич, git log"]
+  smoke["init.sh и смоук-тест"]
+  pick["Одна незакрытая фича"]:::accent
+  check["Проверка в браузере"]
+  done["Коммит, passes: true,<br/>запись в журнал"]:::ok
+  init -- "пишет один раз" --> files
+  files -- "читает в начале" --> start
+  start -- "поднимает приложение" --> smoke
+  smoke -- "работает" --> pick
+  pick -- "реализует" --> check
+  check -- "не прошло" --> pick
+  check -- "прошло" --> done
+  done -- "обновляет" --> files
+</script>
+<figcaption>Двухролевая схема Anthropic для работы на много окон. Память между сессиями целиком лежит в файлах и git, а каждая сессия начинается с одного и того же ритуала чтения и проверки, что приложение вообще живо.</figcaption>
+</figure>
+<p>Схема закрывает конкретные сбои, и каждый из них описан в посте. Агент пытался сделать всё приложение за раз, кончалось окно, и следующая сессия гадала, что было недоделано. Следующая сессия видела часть работы и объявляла проект готовым. Фичи отмечались как готовые без проверки. Отдельно отмечено, что Claude не проверял поведение от начала до конца, пока его об этом прямо не попросили: браузерную автоматизацию через Puppeteer MCP пришлось вписывать в промпт.</p>
+
+<h3>Планировщик, исполнитель, оценщик</h3>
+<p>Через четыре месяца, 24 марта 2026 года, Anthropic опубликовала второе поколение схемы<a class="cite" href="#src-29">29</a>. Главный враг теперь — самооценка: «agents tend to respond by confidently praising the work». Поэтому ролей стало три. Планировщик превращает одно-четыре предложения в спецификацию продукта, нарочно высокоуровневую. Исполнитель работает спринтами. Оценщик кликает по приложению через Playwright MCP и выставляет оценки с жёсткими порогами по каждому критерию. Перед каждым спринтом исполнитель и оценщик через файлы договариваются о <dfn>контракте спринта</dfn>, то есть о том, что будет считаться сделанным.</p>
+<figure class="fig" id="fig-three-roles">
+<script type="text/x-mermaid">
+flowchart TD
+  ask["Запрос: 1–4 предложения"]
+  planner["Планировщик"]:::violet
+  spec[("Спецификация продукта")]
+  gen["Исполнитель"]:::accent
+  contract[("Контракт спринта<br/>убран на Opus 4.6")]:::mute
+  judge["Оценщик<br/>Playwright MCP"]
+  done["Готово"]:::ok
+  ask -- "на вход" --> planner
+  planner -- "пишет" --> spec
+  spec -- "читает" --> gen
+  gen -- "предлагает" --> contract
+  judge -- "согласует" --> contract
+  gen -- "сборка готова" --> judge
+  judge -- "ниже порога" --> gen
+  judge -- "все критерии выше порога" --> done
+</script>
+<figcaption>Схема Anthropic из трёх ролей, март 2026 года. Оценщик кликает по живому приложению и возвращает работу, пока хоть один критерий ниже порога. На Opus 4.6 пунктирный контракт и спринты убрали: оценщик проверяет готовую сборку одним проходом, а не каждый спринт.</figcaption>
+</figure>
+<p>Это дорого. Игру-конструктор в ретростиле одиночный агент на Opus 4.5 сделал за 20 минут и $9, полный харнесс — за 6 часов и $200. С выходом Opus 4.6 харнесс начали упрощать, убирая компоненты по одному и проверяя, что сломается. Спринты ушли, оценщик стал делать один проход в конце. Цифровая звуковая рабочая станция (DAW) на упрощённом харнессе обошлась в $124,70 за 3 часа 50 минут, из которых $0,46 стоил планировщик, три раунда сборки — $71,08, $36,89 и $5,88, а три прохода оценщика — $3,24, $3,09 и $4,06. Главный вывод авторов переносится на любой харнесс: «every component in a harness encodes an assumption about what the model can't do on its own, and those assumptions are worth stress testing».</p>
+<div class="note key"><p>Каждый компонент харнесса — ставка на слабость текущей модели. Сбросы контекста, todo-инструмент и спринты были нужны, пока модель не справлялась без них, и стали лишним весом, когда справилась. Прогоняй свой харнесс без каждой детали при каждой смене модели.</p></div>
+
+<h3>Рои: двадцать агентов работают как три</h3>
+<p>Cursor в январе 2026 года попробовал другой масштаб и сначала провалился<a class="cite" href="#src-13">13</a>. Агенты координировались сами через общий файл с блокировками, и «Twenty agents would slow down to the effective throughput of two or three». Оптимистичная конкурентность оказалась устойчивее, но агенты стали осторожничать. Заработала иерархия: планировщики, которые рекурсивно порождают подпланировщиков, исполнители и судья на каждом цикле. Так за неделю собрали браузер, больше миллиона строк в тысяче файлов. Вывод Уилсона Лина: «The harness and models matter, but the prompts matter more».</p>
+<p>К июлю правила стали жёстче: планировщики никогда не пишут код, исполнители никогда не планируют. Git не выдерживал, и Cursor написал свою систему контроля версий примерно на 1 000 коммитов в секунду против примерно 1 000 в час у git. Появились нейтральный агент для слияний, отлов разросшихся файлов и та самая общая папка Field Guide. Старый рой за два часа делал 68 тыс. коммитов и больше 70 тыс. конфликтов, новый — меньше тысячи конфликтов. На задаче написать SQLite на Rust по руководству в 835 страниц новый харнесс за четыре часа проходил 73–85% отложенных тестов sqllogictest против 11–77% у старого. Разные сочетания моделей в итоге доходили до похожего качества, а вот цена отличалась почти в восемь раз: от $1 339 (Opus 4.8 планирует, Composer 2.5 исполняет) до $10 565 (GPT-5.5 везде), и на исполнителей уходило не меньше 69% токенов. Сами топологии роёв и их сбои разбирает <a href="../13-multi-agent/index.html">глава 13</a>.</p>
+</section>
+
+<section id="openclaw">
+<h2>OpenClaw: харнесс, который живёт в мессенджере</h2>
+<p>Раз в 30 минут OpenClaw будит своего агента без всякого сообщения от человека. Heartbeat — системная автоматизация, которая запускает обычный ход агента в главной сессии; если сказать нечего, модель отвечает <code>NO_REPLY</code>, и вывод глушится<a class="cite" href="#src-35">35</a>. Для Anthropic через OAuth или через установленный Claude CLI интервал по умолчанию час. Пробуждения от событий ограничены: не чаще раза в 30 секунд и не больше пяти запусков за минуту.</p>
+<script type="text/plain" class="code" data-lang="javascript" data-title="Настройка heartbeat, JSON5 (из документации OpenClaw)" data-hl="7,10-11">
+{
+  commands: {
+    ownerAllowFrom: ["telegram:123456789"],
+  },
+  agents: {
+    defaults: {
+      heartbeat: {
+        every: "30m",
+        target: "owner", // default: operator DM from ownerAllowFrom or channel allowFrom
+        directPolicy: "allow", // default: allow direct/DM targets; set "block" to suppress
+        lightContext: true, // optional: skip workspace bootstrap files for heartbeat runs
+        isolatedSession: true, // optional: fresh session each run (no conversation history)
+        // activeHours: { start: "08:00", end: "24:00" },
+      },
+    },
+  },
+}
+</script>
+<p>Работать без человека научились и кодовые агенты, но будит их задача, которую поставил ты:</p>
+<table>
+<thead><tr><th>Харнесс</th><th>Что работает, пока ты не смотришь</th></tr></thead>
+<tbody>
+<tr><th>Claude Code</th><td>Фоновые команды, чей вывод <code>Monitor</code> отдаёт потоком событий (с v2.1.98, апрель 2026), <code>/loop</code> с <code>ScheduleWakeup</code>, <code>CronCreate</code> в пределах сессии, облачные Routines через <code>RemoteTrigger</code><a class="cite" href="#src-4">4</a></td></tr>
+<tr><th>Codex</th><td>Демон app-server; с 0.155.0 (17 сентября 2026) активные цели переживают его перезапуск<a class="cite" href="#src-36">36</a></td></tr>
+<tr><th>Cursor</th><td>Подписки на PR, Slack и расписание, сабагенты на своих виртуальных машинах (август 2026)<a class="cite" href="#src-17">17</a></td></tr>
+<tr><th>Amp</th><td>Orbs: удалённые виртуалки агентов, которые засыпают без работы<a class="cite" href="#src-37">37</a></td></tr>
+<tr><th>OpenClaw</th><td>Heartbeat и cron в главной сессии владельца, ответ уходит в мессенджер</td></tr>
+</tbody>
+</table>
+<p>В последней строке и лежит главное отличие OpenClaw от всего, о чём шла речь выше. Фоновый кодовый агент доделывает поручение, а OpenClaw живёт постоянно, в WhatsApp, Telegram, Slack, Discord, iMessage и ещё двух десятках каналов, на ноутбуке владельца или на общем сервере команды, и сам решает, когда заговорить. Харнесс у него по составу тот же: цикл, инструменты, скиллы, память в файлах. Но вокруг добавлено то, чего у кодовых агентов нет: шлюз к каналам, расписание и посторонние люди в чатах.</p>
+<ol class="timeline">
+  <li><time>24 ноября 2025</time><p>Питер Штайнбергер создаёт репозиторий: сначала это Warelay, шлюз к WhatsApp, потом Clawd<a class="cite" href="#src-35">35</a><a class="cite" href="#src-7">7</a>.</p></li>
+  <li class="is-major"><time>27 января 2026</time><p>После «polite email asking for a name change (trademark stuff)» от Anthropic проект за ночь становится Moltbot. Вирусный рост начался за несколько дней до этого.</p></li>
+  <li class="is-major"><time>30 января 2026</time><p>Второе переименование, в OpenClaw: «Moltbot never quite rolled off the tongue».</p></li>
+  <li><time>31 января 2026</time><p>GHSA-g8p2-7wf7-98mq: удалённое выполнение кода в один клик, исправлено в 2026.1.29<a class="cite" href="#src-38">38</a>.</p></li>
+  <li><time>2 февраля 2026</time><p>Wiz описывает открытую базу Moltbook, соцсети для агентов: 1,5 млн API-токенов агентов, 35 тыс. email-адресов, около 17 тыс. владельцев; дыру закрыли примерно за три часа<a class="cite" href="#src-39">39</a>.</p></li>
+  <li><time>3 февраля 2026</time><p>SANS ISC выпускает руководство, как обнаружить OpenClaw в корпоративной сети<a class="cite" href="#src-40">40</a>.</p></li>
+  <li><time>5 февраля 2026</time><p>Snyk публикует ToxicSkills, аудит скиллов из ClawHub<a class="cite" href="#src-41">41</a>.</p></li>
+  <li class="is-major"><time>15 февраля 2026</time><p>Штайнбергер переходит в OpenAI. Сэм Альтман обещает, что OpenClaw будет «live in a foundation as an open source project that OpenAI will continue to support»<a class="cite" href="#src-42">42</a>.</p></li>
+  <li><time>4 апреля 2026</time><p>Anthropic переводит сторонние харнессы с лимитов подписки на отдельно оплачиваемый extra usage<a class="cite" href="#src-43">43</a>.</p></li>
+  <li><time>29 мая 2026</time><p>В 2026.5.28-beta.1 от Pi agent core остаётся только библиотека терминального интерфейса.</p></li>
+  <li class="is-major"><time>8 июля 2026</time><p>Объявлен OpenClaw Foundation, некоммерческая организация 501(c)(3) с 13 сотрудниками. OpenAI в README значится как «a donor, not an owner»<a class="cite" href="#src-35">35</a>.</p></li>
+  <li><time>11 сентября 2026</time><p>75 опубликованных уязвимостей за один день.</p></li>
+  <li><time>30 сентября 2026</time><p>Версия 2026.9.7, 390 896 звёзд и 82 210 форков на GitHub<a class="cite" href="#src-7">7</a>.</p></li>
+</ol>
+
+<h3>Gateway и его протокол</h3>
+<p>Сердце OpenClaw — Gateway, один долгоживущий демон на хост<a class="cite" href="#src-35">35</a>. Он держит соединения со всеми каналами (WhatsApp через Baileys, Telegram через grammY, Slack, Discord, Signal, iMessage, веб-чат) и, как сказано в документации, остаётся «the only place that opens a WhatsApp session». По умолчанию он слушает <code>127.0.0.1:18789</code> и говорит с клиентами по WebSocket текстовыми JSON-кадрами. Первый кадр обязан быть <code>connect</code> с токеном или паролем, дальше идут запросы, ответы и события:</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Кадры протокола Gateway (из документации)">
+Requests: {type:"req", id, method, params} -> {type:"res", id, ok, payload|error}
+Events:   {type:"event", event, payload, seq?, stateVersion?}
+</script>
+<p>Для методов с побочными эффектами, <code>send</code> и <code>agent</code>, обязательны ключи идемпотентности. Настройка <code>gateway.auth.mode = "none"</code> выключает аутентификацию вовсе, и документация просит держать её подальше от публичных адресов. Клиенты (приложение для macOS, CLI, веб-админка) подключаются без роли, а ноды — телефоны, планшеты, headless-машины — с <code>role: "node"</code>, идентификатором устройства и списком умений вроде <code>camera.*</code>, <code>screen.record</code>, <code>location.get</code>. Новое устройство нужно подтвердить; с loopback подтверждение может пройти автоматически, удалённое требует явного одобрения.</p>
+
+<figure class="fig wide" id="fig-gateway">
+<script type="text/x-mermaid">
+flowchart TD
+  ch["Каналы: WhatsApp, Telegram,<br/>Slack, iMessage и другие"]
+  cl["Клиенты: macOS, CLI, веб"]
+  sched["GatewayScheduler:<br/>heartbeat и cron"]
+  gw{{"Gateway, 127.0.0.1:18789"}}:::accent
+  nodes["Ноды: телефон, headless<br/>role: node"]:::violet
+  ws[("Файлы воркспейса:<br/>AGENTS.md, SOUL.md, USER.md")]
+  rt["Встроенный рантайм агента"]
+  tools["Инструменты: на хосте,<br/>если нет песочницы"]:::warn
+  db[("SQLite: сессии и состояние")]
+  ch -- "входящие сообщения" --> gw
+  cl -- "WebSocket, первый кадр connect" --> gw
+  sched -- "будит по расписанию" --> gw
+  gw -- "node.invoke" --> nodes
+  gw -- "ход агента" --> rt
+  ws -- "в первый ход сессии" --> rt
+  rt -- "вызовы" --> tools
+  rt -- "история и память" --> db
+  rt -- "ответ в канал" --> gw
+</script>
+<figcaption>Устройство OpenClaw. Ход агента запускает не только человек в чате, но и расписание, а инструменты по умолчанию выполняются прямо на хосте владельца. Через Gateway проходят и чужие сообщения, и команды управления, и вызовы устройств.</figcaption>
+</figure>
+
+<h3>Из чего собирается ход</h3>
+<p>В первый ход новой сессии рантайм подмешивает в системный промпт файлы из рабочей папки агента<a class="cite" href="#src-35">35</a>:</p>
+<table>
+<thead><tr><th>Файл</th><th>Назначение</th></tr></thead>
+<tbody>
+<tr><th><code>AGENTS.md</code></th><td>Рабочие инструкции и «память»</td></tr>
+<tr><th><code>SOUL.md</code></th><td>Персона, границы, тон</td></tr>
+<tr><th><code>IDENTITY.md</code></th><td>Имя агента, характер, эмодзи</td></tr>
+<tr><th><code>USER.md</code></th><td>Профиль владельца и как к нему обращаться</td></tr>
+<tr><th><code>BOOTSTRAP.md</code></th><td>Разовый ритуал первого запуска, после него удаляется</td></tr>
+<tr><th><code>MEMORY.md</code></th><td>Корневой файл долгой памяти, если он есть</td></tr>
+</tbody>
+</table>
+<p>По умолчанию на один файл отводится до 20 000 символов, на все вместе — до 60 000, у <code>USER.md</code> свой лимит в 4 000. <code>MEMORY.md</code> грузится только в главной личной сессии и не попадает в групповые чаты. Дневные журналы <code>memory/YYYY-MM-DD.md</code> достаются по запросу. Состояние живёт в SQLite, в <code>~/.openclaw/state/openclaw.sqlite</code>, а JSONL-расшифровки остались от старых версий. Как такие файлы памяти пишутся и стареют, разбирает <a href="../11-agent-memory/index.html">глава 11</a>.</p>
+<div class="note warn" data-label="Устарело"><p>Во многих гайдах и в платных наборах конфигов heartbeat управляется файлом <code>HEARTBEAT.md</code>. В текущей документации сказано: «The runtime never reads <code>HEARTBEAT.md</code>». Команда <code>openclaw doctor --fix</code> переносит его содержимое в рабочую запись heartbeat-монитора в базе, а сам heartbeat теперь запускает общий планировщик автоматизаций.</p></div>
+<p>Сообщения, которые приходят посреди работы, OpenClaw по умолчанию не ставит в очередь, а подмешивает в текущий прогон (steering). Проверка идёт перед запуском каждого ещё не начатого вызова инструмента, а пропущенные вызовы получают «synthetic paired results», чтобы у каждого <code>tool_use</code> остался свой результат и история не сломалась. Планировщик Gateway после сна запускает каждую просроченную задачу один раз, а не столько раз, сколько тиков пропущено.</p>
+<p>Отдельная история — Pi. Долго считалось, что OpenClaw построен на ядре Pi, и в январе так и было: версия 2026.1.29-beta.1 зависела от <code>pi-agent-core</code>, <code>pi-ai</code>, <code>pi-coding-agent</code> и <code>pi-tui</code>. Начиная с 2026.5.28-beta.1 от Pi осталась одна <code>@earendil-works/pi-tui</code><a class="cite" href="#src-7">7</a>, а документация говорит: «OpenClaw ships one embedded agent runtime… The embedded agent runtime is OpenClaw-owned». Почему ушли от чужого ядра и переписали его или скопировали, в чейнджлоге не сказано. README по-прежнему благодарит Марио Цехнера «for pi».</p>
+
+<h3>Скиллы из чужих рук</h3>
+<p>Скиллы OpenClaw ищет по цепочке: <code>skills/</code> в рабочей папке, <code>.agents/skills</code>, <code>~/.agents/skills</code>, <code>~/.openclaw/skills</code>, встроенные, затем папки из <code>skills.load.extraDirs</code><a class="cite" href="#src-35">35</a>. Ставят их из реестра ClawHub, и именно реестр стал первой большой проблемой. Аудит Snyk ToxicSkills 5 февраля 2026 года нашёл среди 3 984 скиллов из ClawHub и skills.sh 76 заведомо вредоносных, и 91% из них работали через промпт-инъекцию<a class="cite" href="#src-41">41</a>. Полная статистика аудита и то, почему цифру «36%» из заголовков легко прочитать неверно, — в <a href="../06-skills/index.html">главе 6</a>, там же разобран сам формат скиллов. Отдельная кампания, которую описал opensourcemalware, с 27 января по 2 февраля двумя волнами выложила 386 вредоносных скиллов (354 из них — от одного автора) под видом инструментов для криптотрейдинга с 500–700 строками правдоподобной документации; они собирали ключи бирж, связку ключей macOS, SSH-ключи и учётные данные git<a class="cite" href="#src-44">44</a>.</p>
+
+<h3>Один клик до выполнения кода</h3>
+<p>CVE-2026-25253 описана в NVD одной фразой: «OpenClaw (aka clawdbot or Moltbot) before 2026.1.29 obtains a <code>gatewayUrl</code> value from a query string and automatically makes a WebSocket connection without prompting, sending a token value», CVSS 8.8<a class="cite" href="#src-38">38</a>. Мав Левин из depthfirst расписал, как из этого получается выполнение кода<a class="cite" href="#src-45">45</a>.</p>
+<figure class="fig wide" id="fig-cve">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant X as attacker.com
+  participant V as Браузер жертвы
+  participant UI as Control UI
+  participant G as Gateway (порт 18789)
+  X->>V: страница со ссылкой
+  V->>UI: открывает ?gatewayUrl=attacker.com
+  UI->>UI: сохраняет адрес без подтверждения
+  UI->>X: connect с authToken владельца
+  Note over X: у токена scopes operator.admin и operator.approvals
+  V->>G: JS страницы открывает WebSocket на localhost
+  Note over G: заголовок Origin не проверяется
+  V->>G: exec.approvals.set, ask off
+  V->>G: config.patch, tools.exec.host = gateway
+  V->>G: node.invoke, command system.run
+  G-->>V: команда выполнена на хосте
+</script>
+<figcaption>Цепочка CVE-2026-25253. Песочницу никто не взламывал: украденный токен с широкими правами штатно выключил одобрения и вынес выполнение на хост через управляющий API, а браузер разрешил чужой странице подключиться к localhost по WebSocket.</figcaption>
+</figure>
+<p>Исправление добавило окно подтверждения при смене адреса Gateway. Уязвимость сидела не в песочнице и не в модели, а в управляющей плоскости: токен с правами администратора и одобрений, WebSocket-сервер без проверки <code>Origin</code> и настройка, которая молча принималась из адресной строки. Через два месяца пришла CVE-2026-33579: повышение привилегий через <code>/pair approve</code>, 9,4 по NVD и 9,9 по оценке CNA, исправлено в 2026.3.28.</p>
+<figure class="fig" id="fig-advisories">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Уязвимости OpenClaw по месяцу публикации", "unit": "шт.",
+ "emphasis": ["Февраль", "Март", "Сентябрь"],
+ "rows": [["Январь", 3], ["Февраль", 220], ["Март", 204], ["Апрель", 108], ["Май", 67], ["Июнь", 45], ["Июль", 0], ["Август", 0], ["Сентябрь", 75, "75 за 11 сентября"]],
+ "note": "GitHub Security Advisories репозитория openclaw/openclaw, всего 722 (14 критических, 249 высоких, 390 средних, 69 низких), на 30 сентября 2026 года."}
+</script>
+<figcaption>Волна уязвимостей пришла вслед за вирусным ростом: 424 advisories за февраль и март. После двух пустых месяцев 11 сентября вышла пачка из 75 штук за один день.</figcaption>
+</figure>
+<p>Побегов из песочницы среди этих уязвимостей мало. Типичные названия: «Heartbeat context inheritance bypasses sandbox via senderIsOwner escalation» (31 марта), «Dreaming could widen restricted sender authority», «Skill tool dispatch could skip owner-only policy» (обе из сентябрьской пачки)<a class="cite" href="#src-38">38</a>. Почти всё — путаница полномочий: чьим голосом пришло сообщение, от владельца или от постороннего в группе, какие права унаследовал ход, запущенный по расписанию, какой скоуп у сопряжённого устройства. README предупреждает «Treat inbound messages as untrusted input» и «Tools run on the host for the main session unless you configure sandboxing»<a class="cite" href="#src-35">35</a>.</p>
+<div class="note key"><p>У кодового агента во входе один доверенный человек. У постоянно живущего агента — владелец, посторонние в чатах, расписание и чужие устройства, и главная работа его харнесса в том, чтобы помнить, кто из них сейчас говорит и что ему можно.</p></div>
+
+<h3>Подписка, которой нельзя пользоваться</h3>
+<p>Вторая часть истории OpenClaw — отношения с вендорами моделей. В феврале 2026 года Anthropic напомнила, что условия использования запрещают работать с подпиской через сторонние харнессы. С 4 апреля это превратилось в деньги: «Starting April 4, third-party tools will draw from extra usage instead of subscription limits». Борис Черный объяснил: «our subscriptions weren't built for the usage patterns of these third-party tools»<a class="cite" href="#src-43">43</a>. 21 апреля документация OpenClaw сообщила, что снова можно пользоваться маршрутом через установленный Claude CLI, то есть вход Claude Code переиспользуется через исполняемый файл <code>claude</code><a class="cite" href="#src-35">35</a>. 13 мая Anthropic объявила отдельный ежемесячный кредит на Agent SDK, <code>claude -p</code> и сторонние инструменты, а 15 июня отложила изменение. В справке на 16 июня: «For now, nothing has changed: Claude Agent SDK, <code>claude -p</code>, and third-party app usage still draw from your subscription's usage limits»<a class="cite" href="#src-43">43</a>. OpenCode ещё 19 февраля убрал вход через Claude Pro/Max коммитом с сообщением «anthropic legal requests»<a class="cite" href="#src-46">46</a>.</p>
+<p>За четыре месяца правила менялись четыре раза, и это отдельный риск для любого открытого харнесса поверх чужой подписки. Технически харнесс может работать с любой моделью, но условия, на которых он её получает, пишет не он.</p>
+</section>
+
+<section id="evidence">
+<h2>Сколько процентов даёт харнесс</h2>
+<p>На лидерборде Terminal-Bench 4.0 на 30 сентября 2026 года первое место у Codex с GPT-6 Astra на максимальном effort: 58,18% за $3 267. Второе у Claude Code с Fable 5.1: 57,88% за $6 243,50<a class="cite" href="#src-47">47</a>. Поучительнее другие строки. Claude Code с Opus 5 проходит тот же набор на разных уровнях рассуждений: low — 34,85%, medium — 44,85%, high — 50,30%, max — 51,82%, а стоимость растёт с $2 394 до $5 969. Модель та же, харнесс тот же, повёрнута одна ручка, и разница 17 пунктов.</p>
+<figure class="fig" id="fig-tb4-effort">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Terminal-Bench 4.0: доля решённых задач по уровню effort", "unit": "%", "decimals": 2, "max": 60,
+ "categories": ["low", "medium", "high", "max"],
+ "series": [
+  {"name": "Claude Code + Opus 5", "values": [34.85, 44.85, 50.30, 51.82]},
+  {"name": "Codex + GPT-6 Astra", "values": [50.61, 54.24, null, 58.18]}
+ ],
+ "note": "tbench.ai, снимок 30 сентября 2026. Каждый столбик — 330 прогонов: 66 задач по пять раз. Строки Codex с effort high на лидерборде нет."}
+</script>
+<figcaption>Внутри одной пары «харнесс плюс модель» уровень рассуждений двигает результат сильнее, чем разница между лидерами. Сравнивая харнессы, фиксируй effort, иначе сравниваешь ручки.</figcaption>
+</figure>
+<p>TB 4.0 вышел в конце августа<a class="cite" href="#src-47">47</a>. Из набора удалили 8 задач, по две за насыщенность, отказы моделей, публичные решения и проблемы качества или совместимости, ещё 19 починили; всем агентам дали единый таймаут в 8 часов, а версии стали семантическими. С TB 2.x цифры несравнимы, и число «за 90% на Terminal-Bench» в чужом пресс-релизе почти наверняка относится к частично насыщенному TB 2.1. Модель Cognition SWE-2, по цифрам самого вендора в пересказе агрегатора tokenstead, набирает 92,8 на TB 2.1 и 27,3 на TB 4.0, где у Fable 5.1 и GPT-6 Astra 55,8 и 57,9<a class="cite" href="#src-48">48</a>.</p>
+<p>Самый чистый эксперимент именно с харнессом поставила LangChain в феврале 2026 года<a class="cite" href="#src-3">3</a>. Модель зафиксировали (<code>gpt-5.2-codex</code>), менялся только харнесс deepagents, и на Terminal-Bench 2.0 результат вырос с 52,8% до 66,5%, из тридцатки лидеров в пятёрку. Изменения были скучными. Одно middleware перехватывает попытку закончить и заставляет пройти чеклист проверки. Другое в начале работы раскладывает перед моделью текущую папку и доступные инструменты. Счётчик правок одного файла после нескольких правок подсказывает «consider reconsidering your approach». И предупреждения о том, сколько осталось времени.</p>
+<p>Бывает, что исход решает харнесс самого бенчмарка. Transluce в феврале разбиралась, почему GPT-5.1-Codex на официальном лидерборде Terminal-Bench набрал 36,9% против 43,4% у предыдущей GPT-5-Codex<a class="cite" href="#src-49">49</a>. Новая модель упиралась в таймаут в 49% прогонов против 29%. Она выбирала более длинные стратегии, а «Terminal-Bench's system prompt never mentions the time constraint». Если оставить только прогоны без таймаута, порядок меняется, и новая модель обгоняет старую примерно на 7 пунктов. Anthropic в том же месяце измерила шум инфраструктуры: та же модель в том же харнессе набирает на TB 2.0 на 6 пунктов больше, если снять ограничения ресурсов контейнера (p &lt; 0,01), а доля инфраструктурных ошибок падает с 5,8% до 0,5%<a class="cite" href="#src-50">50</a>. Часть разницы, которую приписывают харнессу, сидит в лимите памяти.</p>
+<p>Обратный результат получили в aistack в сентябре<a class="cite" href="#src-51">51</a>. Claude Code, Codex и Pi «как есть», с настройками по умолчанию, решали 64 задачи из SWE-Bench Pro на двух открытых моделях, развёрнутых на собственных H200. Доля решённых от харнесса почти не зависела. Зависела цена.</p>
+<table>
+<thead><tr><th>Харнесс</th><th>Модель</th><th class="num">Решено из 64</th><th class="num">Входных токенов, млн</th><th class="num">Стоимость прогона</th></tr></thead>
+<tbody>
+<tr><th>Claude Code</th><td>Qwen3.8-27B</td><td class="num">33</td><td class="num">445,8</td><td class="num">—</td></tr>
+<tr><th>Codex</th><td>Qwen3.8-27B</td><td class="num">31</td><td class="num">330,5</td><td class="num">$9</td></tr>
+<tr><th>Pi</th><td>Qwen3.8-27B</td><td class="num">28</td><td class="num">348,5</td><td class="num">$10,16</td></tr>
+<tr><th>Claude Code</th><td>GLM-5.3-Flash</td><td class="num">32</td><td class="num">480,2</td><td class="num">$45</td></tr>
+<tr><th>Codex</th><td>GLM-5.3-Flash</td><td class="num">33</td><td class="num">192,1</td><td class="num">$22,8</td></tr>
+<tr><th>Pi</th><td>GLM-5.3-Flash</td><td class="num">32</td><td class="num">366,4</td><td class="num">$45</td></tr>
+</tbody>
+</table>
+<p>Claude Code на обеих моделях съел больше всего входных токенов. Авторы заодно наткнулись на регрессию: в версии 2.1.233 Claude Code почти перестал попадать в префиксный кеш их сервера vLLM, 29,84% попаданий против примерно 97% у Codex и Pi. Issue #87227 о десятикратном росте задержки с собственным <code>ANTHROPIC_BASE_URL</code> на 30 сентября открыт, причина не установлена. К API Anthropic это исследование отношения не имеет: модели были открытые, а сервер свой.</p>
+<p>Стареют и сами бенчмарки. OpenAI перестала публиковать SWE-bench Verified: из 138 проверенных задач, на которых модели часто ошибались, у 59,4% оказались дефектные тесты, к тому же задачи утекли в обучающие данные; взамен рекомендован SWE-bench Pro<a class="cite" href="#src-52">52</a>. Для того же Verified мейнтейнеры SWE-bench ещё в июле 2025 года завели лидерборд, который сравнивает «LMs without fancy agent scaffolds»: все модели гоняют через mini-swe-agent, около 100 строк Python на класс агента и единственный инструмент bash, даже без tool calling API. С ним модели набирают больше 74%<a class="cite" href="#src-53">53</a>. На насыщенном бенчмарке минимальный харнесс почти упирается в потолок, и прибавку от хитрого харнесса там некуда положить. А рой Cursor при любом сочетании моделей дошёл до похожего качества, и различалась опять цена: от $1 339 до $10 565<a class="cite" href="#src-13">13</a>.</p>
+<div class="note debate"><p>«Харнесс важнее модели» — лозунг, а не закон. LangChain показывает +13,7 пункта от одного харнесса, aistack — почти ноль по доле решённых и двукратную разницу в цене. Обе цифры честные, просто харнессы менялись по-разному. Надёжно харнесс двигает цену и время; долю решённых он поднимает, когда добавляет внешнюю проверку и не даёт агенту закончить раньше срока. Сравнивая свои варианты, фиксируй модель, effort и ресурсы, меняй одну деталь и считай стоимость решённой задачи, а не одного запроса. Как это устроить, разбирает <a href="../17-evals/index.html">глава 17</a>.</p></div>
+</section>
+
+<section id="build">
+<h2>Свой deep agent за вечер</h2>
+<p>Торстен Болл из Amp в апреле 2025 года написал агента для правки кода меньше чем на 400 строк Go, с тремя инструментами: <code>read_file</code>, <code>list_files</code> и <code>edit_file</code><a class="cite" href="#src-37">37</a>. Pi через полгода обошёлся четырьмя, а mini-swe-agent — одним bash. Сам цикл маленький; глубоким агента делает то, что вокруг, и эти части можно добавлять по одной.</p>
+<p>Ниже набросок на Python поверх Messages API примерно на сотню строк. Код проверен на заглушке вместо API: сценарий с сабагентом, длинным выводом, запрещённой командой, выходом за рабочую папку и красным тестом отработал как задумано. С настоящей моделью этот листинг не запускался. Первая часть — инструменты и политика:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок: mini_agent.py, часть 1" data-hl="8-10,22-25">
+import pathlib, subprocess, sys
+import anthropic
+
+client = anthropic.Anthropic()
+MODEL = "claude-opus-5"
+WORK = pathlib.Path("workspace").resolve()
+SPILL_DIR = WORK / ".agent" / "outputs"
+INLINE_LIMIT = 4000                      # символов результата, которые идут в окно целиком
+VERIFY = "python -m pytest -q"           # внешняя проверка «готово»
+DENY = ("rm -rf", "git push", "sudo ", "curl ", "wget ")
+READ_ONLY_CMDS = {"ls", "cat", "rg", "grep", "find", "head", "tail", "wc", "git"}
+
+def schema(**props):
+    return {"type": "object", "properties": {k: {"type": "string"} for k in props}, "required": list(props)}
+
+TOOLS = [
+    {"name": "read_file", "description": "Read a text file in the workspace.", "input_schema": schema(path=1)},
+    {"name": "write_file", "description": "Create or overwrite a file in the workspace.",
+     "input_schema": schema(path=1, content=1)},
+    {"name": "bash", "description": "Run a shell command in the workspace. Long output is saved "
+     "to a file; you get its path and tail.", "input_schema": schema(command=1)},
+    {"name": "task", "description": "Give a read-only investigation to a subagent with a fresh "
+     "context. Only its final report comes back.", "input_schema": schema(prompt=1)},
+]
+SUB_TOOLS = [t for t in TOOLS if t["name"] in ("read_file", "bash")]
+SYSTEM = """You are a coding agent in the current workspace.
+PROGRESS.md is your log: read it first, update it after each step (done, next, failed).
+Send broad read-only searches to `task` so their output stays out of your context.
+You are done only when the test suite passes."""
+SUB_SYSTEM = "Investigate the codebase read-only. Reply with a short report: findings, paths, open questions."
+
+def inside(path):
+    p = (WORK / path).resolve()
+    if not p.is_relative_to(WORK):
+        raise PermissionError(f"{path} is outside the workspace")
+    return p
+
+def spill(kind, text):                   # длинный вывод уходит в файл, в окно — путь и хвост
+    if len(text) <= INLINE_LIMIT:
+        return text
+    SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    f = SPILL_DIR / f"{kind}-{len(list(SPILL_DIR.iterdir())) + 1}.txt"
+    f.write_text(text)
+    return f"[{len(text)} chars saved to {f.relative_to(WORK)}; last 1500 below]\n{text[-1500:]}"
+
+def permitted(cmd, read_only):
+    if any(bad in cmd for bad in DENY):
+        return False
+    return not read_only or cmd.split()[0] in READ_ONLY_CMDS
+</script>
+<p>Вторая часть — исполнение инструментов и сам цикл:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок: mini_agent.py, часть 2" data-hl="12-13,24-25,33-38">
+def execute(name, args, read_only):
+    try:
+        if name == "read_file":
+            return {"content": spill("read", inside(args["path"]).read_text())}
+        if name == "write_file" and not read_only:
+            p = inside(args["path"]); p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(args["content"])
+            return {"content": f"wrote {len(args['content'])} chars to {args['path']}"}
+        if name == "bash" and permitted(args["command"], read_only):
+            r = subprocess.run(args["command"], shell=True, cwd=WORK, capture_output=True, text=True, timeout=300)
+            return {"content": spill("bash", f"exit {r.returncode}\n{r.stdout}{r.stderr}")}
+        if name == "task" and not read_only:
+            return {"content": run(args["prompt"], SUB_TOOLS, SUB_SYSTEM, read_only=True, max_turns=20)}
+        return {"content": f"{name}: denied by harness policy", "is_error": True}
+    except Exception as e:
+        return {"content": f"{type(e).__name__}: {e}", "is_error": True}
+
+def verify():
+    r = subprocess.run(VERIFY, shell=True, cwd=WORK, capture_output=True, text=True, timeout=900)
+    return r.returncode == 0, (r.stdout + r.stderr)[-2000:]
+
+def run(prompt, tools, system, read_only=False, max_turns=60, checks=3):
+    log = WORK / "PROGRESS.md"
+    if not read_only and log.exists():   # как CLAUDE.md: файл с диска в начало сессии
+        prompt = f"<progress>\n{log.read_text()}\n</progress>\n\n{prompt}"
+    messages = [{"role": "user", "content": prompt}]
+    for _ in range(max_turns):
+        resp = client.messages.create(model=MODEL, max_tokens=16000, system=system,
+                                      tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": resp.content})
+        calls = [b for b in resp.content if b.type == "tool_use"]
+        if not calls:
+            if not read_only and checks > 0:
+                ok, report = verify()
+                if not ok:                # не даём закончить, пока проверка красная
+                    checks -= 1
+                    messages.append({"role": "user", "content": f"Tests still fail:\n{report}"})
+                    continue
+            return "".join(b.text for b in resp.content if b.type == "text")
+        messages.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": c.id, **execute(c.name, c.input, read_only)}
+            for c in calls]})
+    return "stopped: max_turns"
+
+if __name__ == "__main__":
+    print(run(sys.argv[1], TOOLS, SYSTEM))
+</script>
+<p>Каждая деталь здесь — уменьшенная копия чего-то из этой главы. <code>spill</code> повторяет dynamic context discovery: длинный вывод ложится в файл, а модель получает путь и хвост. <code>task</code> — сабагент: новый список сообщений, только читающие инструменты, наружу одна строка отчёта. Инструмента <code>task</code> у сабагента нет, так что глубина вложенности равна единице. <code>PROGRESS.md</code> подмешивается в начало сессии, как <code>CLAUDE.md</code>, а обновляет его сама модель через <code>write_file</code>: это память в файлах и журнал смены из схемы Anthropic. Когда модель отвечает без вызовов, харнесс не верит ей на слово и гоняет тесты, как Stop-хук плагина ralph-wiggum или <code>PreCompletionChecklistMiddleware</code>; счётчик <code>checks</code> не даёт этому превратиться в вечный цикл. Инструмента планирования нет, как в Claude Code на новых моделях.</p>
+<div class="note warn"><p><code>DENY</code> и <code>inside</code> — политика, а не песочница. Строковый фильтр обходится тривиально (<code>rm -r -f</code>, <code>python -c</code>), а <code>bash</code> может писать куда угодно. Запускай такой агент в контейнере с примонтированной рабочей папкой, как советует Карлини, и считай фильтр защитой от случайностей, а не от атаки.</p></div>
+<p>Чего здесь нет и что добавлять первым, когда агент начнёт упираться. Компакции: когда <code>usage.input_tokens</code> подберётся к порогу, суммаризируй старую часть истории, оригинал сохраняй на диск, как Pi, и ставь предохранитель от повторного сжатия. Кеша: <code>system</code> и <code>tools</code> здесь не меняются между ходами, и остаётся поставить точку кеширования (<a href="../02-context-engineering/index.html">глава 2</a>). Одобрения человеком перед записью за пределами рабочей папки. И журнала вызовов, без которого нечего будет отлаживать.</p>
+<p>Если писать цикл самому не хочется, в Python есть <code>deepagents</code>. Это пример из README; модель задаётся строкой провайдера<a class="cite" href="#src-15">15</a>:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="deepagents: быстрый старт (из README)">
+from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    model="openai:gpt-6-astra",
+    tools=[my_custom_tool],
+    system_prompt="You are a research assistant.",
+)
+result = agent.invoke({"messages": "Research LangGraph and write a summary"})
+</script>
+<p>Модель безопасности там сформулирована честно: «Deep Agents follows a "trust the LLM" model. The agent can do anything its tools allow. Enforce boundaries at the tool/sandbox level, not by expecting the model to self-police».</p>
+
+<h3>Открытые харнессы, которые стоит прочитать</h3>
+<table class="wide">
+<thead><tr><th>Харнесс</th><th>Что в нём интересно</th><th>Когда брать</th></tr></thead>
+<tbody>
+<tr><th>Pi</th><td>Четыре инструмента и меньше 1 тыс. токенов промпта, сессия хранится деревом, встроенных разрешений нет; расширения на TypeScript. В ноябре 2025 года Цехнер писал «pi does not and will not support MCP», в 2026-м MCP добавили<a class="cite" href="#src-5">5</a></td><td>Прочитать минимальный харнесс целиком и строить своё поверх, в контейнере</td></tr>
+<tr><th>OpenCode</th><td>Диагностики LSP подаются прямо в цикл агента, хотя language servers «can desync, eat memory, and slow sessions»<a class="cite" href="#src-54">54</a>. 211 тыс. звёзд, репозиторий переехал в <code>anomalyco/opencode</code>; вход через Claude Pro/Max убран в феврале 2026 года<a class="cite" href="#src-46">46</a></td><td>Нужен открытый терминальный агент под любого провайдера; подсмотреть обратную связь от компилятора без отдельной сборки</td></tr>
+<tr><th>Codex CLI</th><td>Rust, Apache-2.0, stateless-цикл на Responses API, сабагенты и Auto-review; версия 0.159.2 от 30 сентября<a class="cite" href="#src-7">7</a></td><td>Посмотреть, как собирать запрос под кеш префикса</td></tr>
+<tr><th>deepagents</th><td>Python и LangGraph, сабагенты, подключаемые файловые бэкенды, планирование по желанию</td><td>Агент внутри твоего Python-сервиса с любым провайдером</td></tr>
+<tr><th>Claude Agent SDK</th><td>Харнесс Claude Code как библиотека: те же инструменты, хуки, сабагенты, компакция<a class="cite" href="#src-6">6</a></td><td>Нужен именно Claude Code, встроенный в продукт</td></tr>
+</tbody>
+</table>
+<p>Если выбирать один: для чтения исходников бери Pi, он помещается в голову за вечер; для продакшена на Python — Claude Agent SDK, если ты и так на Claude, и <code>deepagents</code>, если нужен выбор провайдера. Выбор перестаёт быть верным, если тебе нужен постоянно живущий агент в мессенджерах: тогда смотри на OpenClaw, но с песочницей и с уроками из его advisories. Amp, из которого вышел пост Болла, в таблицу не попал: он закрытый, с декабря 2025 года это отдельная компания Amp Frontier Corporation<a class="cite" href="#src-37">37</a>, а его отказ от компакции разобран в <a href="#compaction">разделе о компакции</a>.</p>
+<div class="note warn"><p>Встроенный в сервис Agent SDK по умолчанию ведёт себя как Claude Code на машине, где он запущен. Если <code>settingSources</code> не задан, грузятся все три источника настроек: project, user и local. Managed policy, <code>~/.claude.json</code>, auto memory, MCP-коннекторы claude.ai и записи <code>sandbox.credentials</code> читаются независимо от <code>settingSources</code><a class="cite" href="#src-6">6</a>. Чтобы сессия одного клиента не подтянула память и настройки хоста, нужны оба условия: <code>settingSources: []</code> и <code>CLAUDE_CODE_DISABLE_AUTO_MEMORY=1</code>.</p></div>
+
+<h3>В Claude Code сегодня вечером</h3>
+<ol class="steps">
+  <li><b>Посмотри, что уходит в модель.</b> Открой <code>/context</code> в рабочем проекте и сравни с 33 тыс. токенов из замера Systima. Всё, что лежит там постоянно, оплачивается на каждом ходе.</li>
+  <li><b>Сократи CLAUDE.md до карты.</b> Длинные разделы перенеси в скиллы или <code>docs/</code>, а <code>/skill-doctor</code> покажет, сколько стоит каждый скилл и не выпадают ли описания из бюджета.</li>
+  <li><b>Отдели судью от исполнителя.</b> Заведи в <code>.claude/agents/</code> ревьюера с <code>tools: Read, Glob, Grep</code> и зови его после каждой фичи: агент, который писал код, склонен его хвалить.</li>
+  <li><b>Дай агенту внешнее «готово».</b> Поставь <code>/goal</code> с условием на зелёные тесты или запусти <code>/ralph-loop</code> с <code>--max-iterations</code>, чтобы конец работы определяла проверка, а не модель.</li>
+  <li><b>Для задачи на несколько сессий</b> заведи <code>feature_list.json</code> и журнал по образцу Anthropic, а первую сессию потрать только на инициализацию.</li>
+  <li><b>Проверь, нужен ли тебе планировщик.</b> Прогони одну и ту же задачу с <code>CLAUDE_CODE_ENABLE_TODO_TOOLS=1</code> и без и сравни число ходов и итог.</li>
+</ol>
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>Ты добавил в своего агента сабагента-исследователя, расход токенов вырос, а качество не изменилось. Почему так бывает и когда сабагент окупается?</summary><p>Сабагент стартует с чистым окном и заново читает то, что родитель, возможно, уже знал; в замере Systima два сабагента подняли расход в 4,2 раза. Окупается он, когда прочитать нужно много, а родителю достаточно короткого итога: тогда тысячи токенов остаются в чужом окне. Если задача помещается в одно окно без мусора, дешевле обойтись без сабагента или взять форк.</p></details>
+<details><summary>По Чейзу todo-инструмент держал агента в колее. Почему Claude Code в августе 2026 года убрал его с новых моделей?</summary><p>Инструмент ничего не исполнял и работал декламацией: модель пересказывала план, и он оказывался в конце контекста, в зоне свежего внимания. Новые модели держат многошаговую работу сами, а схемы инструментов и напоминания занимают контекст на каждом ходе. План переехал в режим планирования, <code>/goal</code> и файлы, которые проверяются снаружи.</p></details>
+<details><summary>Что случится, если посреди сессии Codex подключить ещё один MCP-сервер, и как внести изменение без потерь?</summary><p>Набор инструментов стоит в самом начале запроса, поэтому префикс изменится и весь разговор под ним пойдёт мимо кеша, а Codex и так отправляет всю историю на каждом ходе. Изменения, которые можно выразить текстом, OpenAI советует дописывать новым сообщением в конец, а порядок инструментов держать стабильным.</p></details>
+<details><summary>Чем форк отличается от обычного сабагента и когда форк — плохой выбор?</summary><p>Форк наследует всю историю родителя и его кеш префикса, поэтому дёшев на старте и сразу в курсе дела. Он не изолирует контекст: если смысл делегирования в том, чтобы не засорять окно, или история уже длинная и шумная, нужен обычный сабагент с чистым окном.</p></details>
+<details><summary>Классификатор auto mode не видит ни рассуждений агента, ни вывода инструментов. Зачем так сделано и чем за это платят?</summary><p>Рассуждения убраны, чтобы агент не мог уговорить судью, вывод инструментов — чтобы до судьи не добралась инъекция из прочитанной страницы; вывод проверяет отдельный зонд. Цена — судья решает без части контекста, и полный конвейер пропускает 17% реальных превышений задачи. Поэтому под классификатором должна оставаться песочница.</p></details>
+<details><summary>Ты запустил <code>/ralph-loop</code> на 50 итераций в расчёте, что каждая начнёт с чистой головы. Что не так?</summary><p>Плагин ralph-wiggum крутит цикл внутри той же сессии: Stop-хук не даёт ей закончиться и подаёт тот же промпт снова, контекст копится и сжимается компакцией. Свежее окно на каждой итерации даёт только внешний цикл в bash, который каждый раз запускает новый <code>claude -p</code> и хранит состояние в файлах и git.</p></details>
+<details><summary>Почему в схеме Anthropic список фич лежит в JSON, а не в Markdown, и что запрещено агенту-кодеру?</summary><p>По наблюдению Anthropic, модель реже без спроса переписывает JSON, чем Markdown. Кодеру запрещено удалять и править тесты, а флаг <code>passes</code> он переворачивает только после проверки от начала до конца, иначе следующая сессия получит ложную картину готовности.</p></details>
+<details><summary>В CVE-2026-25253 песочницу никто не взламывал. Как тогда код выполнился на хосте?</summary><p>Control UI принял адрес Gateway из параметра <code>gatewayUrl</code> и сам отправил туда токен владельца. Страница атакующего открыла из браузера жертвы WebSocket на localhost, потому что сервер не проверял <code>Origin</code>, и токеном с правами <code>operator.admin</code> и <code>operator.approvals</code> штатно выключила одобрения, перевела выполнение на хост и вызвала <code>system.run</code>.</p></details>
+<details><summary>Коллега предлагает перейти на харнесс X, потому что он «на 13 пунктов лучше на Terminal-Bench». Что спросить, прежде чем соглашаться?</summary><p>Какая версия бенчмарка (TB 2.x и TB 4.0 несравнимы), одинаковы ли модель, effort, ресурсы контейнера и таймауты, и сколько стоит одна решённая задача. Один только effort у Claude Code с Opus 5 двигает TB 4.0 на 17 пунктов, ограничения ресурсов — на 6, а в замере aistack харнессы решали почти одинаково при двукратной разнице в цене.</p></details>
+<details><summary>После компакции Claude Code «забыл» договорённость из чата, но помнит правило из CLAUDE.md. Почему и что с этим делать?</summary><p><code>CLAUDE.md</code> после сжатия перечитывается с диска, а разговор превращается в сводку, которая может потерять инструкцию. Постоянные правила держи в файле, а для сводки опиши, что сохранять, в разделе с инструкциями для суммаризации или сохраняй расшифровку хуком <code>PreCompact</code>.</p></details>
+<details><summary>Почему уязвимости OpenClaw в основном про полномочия, а не про побег из песочницы?</summary><p>У постоянно живущего агента много источников входа: владелец, посторонние в групповых чатах, расписание heartbeat и cron, сопряжённые устройства. Каждый ход надо запускать с правами того, кто его вызвал, и большинство advisories описывают случаи, когда харнесс путал, чьим голосом и с какими правами идёт ход.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу по потоку сообщений Agent SDK показать, где кончается модель и начинается харнесс, и объяснить, что ограничивают <code>max_turns</code> и <code>max_budget_usd</code></li>
+  <li>Смотрел <code>/context</code> в своём проекте и знаю, сколько токенов харнесс отправляет до моего вопроса и из чего они складываются</li>
+  <li>Держу <code>CLAUDE.md</code> картой до 200 строк, подробности вынес в скиллы или <code>docs/</code> и проверил их цену через <code>/skill-doctor</code></li>
+  <li>Написал сабагента в <code>.claude/agents/</code> с ограниченным набором инструментов и могу сказать, что он получает на вход и что возвращает</li>
+  <li>Для конкретной задачи выбираю между форком, сабагентом, командой агентов и workflow и объясняю, где в каждом случае живёт план</li>
+  <li>Настроил <code>PreToolUse</code>-хук, который запрещает необратимую команду, и проверил, что он срабатывает</li>
+  <li>Знаю, какой режим разрешений стоит у меня по умолчанию, и включил песочницу, а не полагаюсь на один классификатор</li>
+  <li>Вёл задачу на несколько сессий через <code>feature_list.json</code> и журнал прогресса или запускал Ральф-цикл с лимитом итераций</li>
+  <li>Различаю внешний Ральф-цикл и Stop-хук в сессии и выбираю нужный под задачу</li>
+  <li>Собрал минимального агента с циклом, сабагентом, выгрузкой длинного вывода в файл и проверкой перед завершением</li>
+  <li>Читая результат агентного бенчмарка, отделяю вклад харнесса от effort, инфраструктуры и версии бенчмарка</li>
+  <li>Могу нарисовать, как OpenClaw собирает ход из каналов, heartbeat и файлов воркспейса, и показать на схеме границы доверия</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://systima.ai/blog/claude-code-vs-opencode-token-overhead">Claude Code Is Way More Token-Hungry Than OpenCode</a>. Systima, 12 июля 2026.</li>
+  <li id="src-2"><a href="https://code.claude.com/docs/en/how-claude-code-works">How Claude Code works</a>, <a href="https://code.claude.com/docs/en/glossary">Glossary</a>, <a href="https://code.claude.com/docs/en/context-window">Explore the context window</a>. Документация Claude Code, Anthropic, на 30 сентября 2026.</li>
+  <li id="src-3">Вивек Триведи, <a href="https://www.langchain.com/blog/improving-deep-agents-with-harness-engineering">Improving Deep Agents with harness engineering</a> (17 февраля 2026) и <a href="https://www.langchain.com/blog/the-anatomy-of-an-agent-harness">The Anatomy of an Agent Harness</a> (10 марта 2026). Блог LangChain.</li>
+  <li id="src-4"><a href="https://code.claude.com/docs/en/tools-reference">Tools reference</a>, включая раздел Task tool availability. Документация Claude Code, Anthropic, для v2.1.268 и новее.</li>
+  <li id="src-5">Марио Цехнер, <a href="https://mariozechner.at/posts/2025-11-30-pi-coding-agent/">What I learned building an opinionated and minimal coding agent</a>, 30 ноября 2025; <a href="https://github.com/earendil-works/pi">earendil-works/pi</a>: README, docs/how-pi-works.md, docs/mcp.md, Earendil Inc., на 30 сентября 2026.</li>
+  <li id="src-6"><a href="https://code.claude.com/docs/en/agent-sdk/overview">Agent SDK overview</a>, <a href="https://code.claude.com/docs/en/agent-sdk/agent-loop">How the agent loop works</a>, <a href="https://code.claude.com/docs/en/agent-sdk/subagents">Subagents in the SDK</a>, <a href="https://code.claude.com/docs/en/agent-sdk/claude-code-features">Use Claude Code features in the SDK</a>. Документация Claude Agent SDK, Anthropic.</li>
+  <li id="src-7">Метаданные реестров <a href="https://registry.npmjs.org/">npm</a> и <a href="https://pypi.org/">PyPI</a> (версии и даты выпуска Claude Code, Agent SDK, Codex, OpenClaw с историей зависимостей, deepagents, Pi, OpenCode) и GitHub REST API (звёзды, форки, даты создания репозиториев), на 30 сентября 2026.</li>
+  <li id="src-8"><a href="https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md">Claude Code CHANGELOG.md</a>, записи до v2.1.285, и еженедельные обзоры <a href="https://code.claude.com/docs/en/whats-new">What's new</a> за недели 32–37 2026 года. Anthropic.</li>
+  <li id="src-9"><a href="https://news.ycombinator.com/item?id=47584540">Claude Code's source code has been leaked via a map file in their NPM registry</a>, Hacker News, 31 марта 2026; <a href="https://www.latent.space/p/ainews-the-claude-code-source-leak">[AINews] The Claude Code Source Leak</a>, Latent Space, 1 апреля 2026.</li>
+  <li id="src-10"><a href="https://www.anthropic.com/engineering/april-23-postmortem">An update on recent Claude Code quality reports</a>. Anthropic, 23 апреля 2026; обсуждение на <a href="https://news.ycombinator.com/item?id=47878905">Hacker News</a>.</li>
+  <li id="src-11"><a href="https://openai.com/index/unrolling-the-codex-agent-loop/">Unrolling the Codex agent loop</a>. OpenAI, январь 2026.</li>
+  <li id="src-12"><a href="https://cursor.com/blog/codex-model-harness">Improving Cursor's agent for OpenAI Codex models</a>. Cursor Team, 4 декабря 2025.</li>
+  <li id="src-13">Уилсон Лин, <a href="https://cursor.com/blog/scaling-agents">Scaling long-running autonomous coding</a> (14 января 2026) и <a href="https://cursor.com/blog/agent-swarm-model-economics">Agent swarms and the new model economics</a> (20 июля 2026). Блог Cursor.</li>
+  <li id="src-14">Харрисон Чейз, <a href="https://blog.langchain.com/deep-agents/">Deep Agents</a>. Блог LangChain, 30 июля 2025.</li>
+  <li id="src-15"><a href="https://github.com/langchain-ai/deepagents">langchain-ai/deepagents</a>, README, и <a href="https://docs.langchain.com/oss/python/deepagents/overview">Deep Agents overview</a>. LangChain, версия 0.7.20 на 30 сентября 2026.</li>
+  <li id="src-16">Ичао «Пик» Цзи, <a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>. Блог Manus, 18 июля 2025.</li>
+  <li id="src-17"><a href="https://cursor.com/changelog">Cursor changelog</a>: Cloud Agents and Cursor Harness Improvements (19 августа 2026), Cursor Projects (10 сентября 2026).</li>
+  <li id="src-18">Документация Codex: <a href="https://learn.chatgpt.com/docs/sandboxing/auto-review.md">Auto-review</a>, <a href="https://learn.chatgpt.com/docs/agent-configuration/subagents.md">Subagents</a>, <a href="https://learn.chatgpt.com/docs/agent-approvals-security">Agent approvals &amp; security</a>, <a href="https://learn.chatgpt.com/docs/config-file/config-basic">Config basics</a>. OpenAI, на 30 сентября 2026.</li>
+  <li id="src-19"><a href="https://openai.com/index/harness-engineering/">Harness engineering: leveraging Codex in an agent-first world</a>. OpenAI, без даты, не позднее 12 февраля 2026.</li>
+  <li id="src-20">sermakarevich, <a href="https://news.ycombinator.com/item?id=48407998">Show HN: Lessons learned from running Claude Code swarms at scale</a>. Hacker News, 5 июня 2026.</li>
+  <li id="src-21">Документация Claude Code: <a href="https://code.claude.com/docs/en/sub-agents">Create custom subagents</a>, <a href="https://code.claude.com/docs/en/agent-teams">Orchestrate teams of Claude Code sessions</a>, <a href="https://code.claude.com/docs/en/workflows">Orchestrate subagents at scale with dynamic workflows</a>, <a href="https://code.claude.com/docs/en/skills">Extend Claude with skills</a>. Anthropic, на 30 сентября 2026.</li>
+  <li id="src-22">Документация Claude Code: <a href="https://code.claude.com/docs/en/env-vars">Environment variables</a>, <a href="https://code.claude.com/docs/en/model-config">Model configuration</a>, <a href="https://code.claude.com/docs/en/sandboxing">Configure the sandboxed Bash tool</a>, <a href="https://code.claude.com/docs/en/hooks">Hooks reference</a>, <a href="https://code.claude.com/docs/en/checkpointing">Checkpointing</a>. Anthropic, на 30 сентября 2026.</li>
+  <li id="src-23"><a href="https://www.anthropic.com/engineering/claude-code-auto-mode">How we built Claude Code auto mode: a safer way to skip permissions</a>. Anthropic, 25 марта 2026.</li>
+  <li id="src-24"><a href="https://claude.com/blog/a-harness-for-every-task-dynamic-workflows-in-claude-code">A harness for every task: dynamic workflows in Claude Code</a>. Команда Claude Code, 2 июня 2026.</li>
+  <li id="src-25">Джедайя Кац, <a href="https://cursor.com/blog/dynamic-context-discovery">Dynamic context discovery</a>. Блог Cursor, 6 января 2026.</li>
+  <li id="src-26">Джедайя Кац, Коннор О’Киф и Кэлвин Йи, <a href="https://cursor.com/blog/improved-token-efficiency">Improved token efficiency for longer agent runs</a>. Блог Cursor, 23 сентября 2026.</li>
+  <li id="src-27"><a href="https://www.anthropic.com/engineering/managed-agents">Scaling Managed Agents: Decoupling the brain from the hands</a>. Anthropic, 8 апреля 2026.</li>
+  <li id="src-28"><a href="https://ampcode.com/news/handoff">Handoff (No More Compaction)</a>. Amp, 23 октября 2025.</li>
+  <li id="src-29">Джастин Янг, <a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents">Effective harnesses for long-running agents</a> (26 ноября 2025); Притхви Раджасекаран, <a href="https://www.anthropic.com/engineering/harness-design-long-running-apps">Harness design for long-running application development</a> (24 марта 2026). Anthropic Engineering.</li>
+  <li id="src-30">Никита Пастухов, телеграм-канал <a href="https://t.me/s/fastnewsdev">fastnewsdev</a>, посты № 360 и № 370, сентябрь 2026.</li>
+  <li id="src-31">Дэвид Гомес и Трэвис Макпик, <a href="https://cursor.com/blog/agent-autonomy-auto-review">Governing agent autonomy with Auto-review</a>. Блог Cursor, 11 июня 2026.</li>
+  <li id="src-32">Николас Карлини, <a href="https://www.anthropic.com/engineering/building-c-compiler">Building a C compiler with a team of parallel Claudes</a>. Anthropic, 5 февраля 2026.</li>
+  <li id="src-33">Джеффри Хантли, <a href="https://ghuntley.com/ralph/">Ralph Wiggum as a software engineer</a> (14 июля 2025) и <a href="https://ghuntley.com/loop/">everything is a ralph loop</a> (17 января 2026).</li>
+  <li id="src-34"><a href="https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum">Ralph Wiggum Plugin</a>, README. Репозиторий anthropics/claude-code, плагин добавлен 16 ноября 2025.</li>
+  <li id="src-35">OpenClaw: <a href="https://github.com/openclaw/openclaw">README</a> (v2026.9.7); документация <a href="https://docs.openclaw.ai/start/lore">Lore</a>, <a href="https://docs.openclaw.ai/concepts/architecture">Gateway architecture</a>, <a href="https://docs.openclaw.ai/concepts/agent">Agent runtime</a>, <a href="https://docs.openclaw.ai/concepts/agent-workspace">Agent workspace</a>, <a href="https://docs.openclaw.ai/gateway/heartbeat">Heartbeat</a>, <a href="https://docs.openclaw.ai/providers/anthropic">Anthropic</a>; блог: <a href="https://openclaw.ai/blog/introducing-openclaw-foundation">The OpenClaw Foundation</a>, 8 июля 2026.</li>
+  <li id="src-36"><a href="https://github.com/openai/codex/releases">Релизы openai/codex на GitHub</a>, rust-v0.155.0 от 17 сентября 2026.</li>
+  <li id="src-37">Торстен Болл, <a href="https://ampcode.com/how-to-build-an-agent">How to Build an Agent</a> (15 апреля 2025) и <a href="https://ampcode.com/notes/orbs-explained">Orbs, Explained</a> (25 августа 2026); <a href="https://ampcode.com/news/amp-inc">Amp Frontier Corporation</a>, 2 декабря 2025.</li>
+  <li id="src-38"><a href="https://github.com/openclaw/openclaw/security/advisories">GitHub Security Advisories репозитория openclaw/openclaw</a>, 722 на 30 сентября 2026, включая GHSA-g8p2-7wf7-98mq от 31 января 2026; NVD: <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-25253">CVE-2026-25253</a> (1 февраля 2026) и <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-33579">CVE-2026-33579</a> (31 марта 2026).</li>
+  <li id="src-39"><a href="https://www.wiz.io/blog/exposed-moltbook-database-reveals-millions-of-api-keys">Hacking Moltbook: exposed Moltbook database reveals millions of API keys</a>. Блог Wiz, 2 февраля 2026.</li>
+  <li id="src-40"><a href="https://isc.sans.edu/diary/32678">Detecting and Monitoring OpenClaw (clawdbot, moltbot) in your environment</a>. SANS Internet Storm Center, 3 февраля 2026.</li>
+  <li id="src-41">Лука Бойрер-Келлнер и соавторы, <a href="https://snyk.io/blog/toxicskills-malicious-ai-agent-skills-clawhub/">ToxicSkills</a>. Блог Snyk, 5 февраля 2026.</li>
+  <li id="src-42"><a href="https://techcrunch.com/2026/02/15/openclaw-creator-peter-steinberger-joins-openai/">OpenClaw creator Peter Steinberger joins OpenAI</a>. TechCrunch, 15 февраля 2026.</li>
+  <li id="src-43"><a href="https://www.theregister.com/2026/04/06/anthropic_closes_door_on_subscription/">Anthropic closes door on subscription use of OpenClaw</a>, The Register, 6 апреля 2026; <a href="https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan">Use the Claude Agent SDK with your Claude plan</a>, Claude Help Center, обновлено 16 июня 2026.</li>
+  <li id="src-44"><a href="https://opensourcemalware.com/blog/clawdbot-skills-ganked-your-crypto">Malicious ClawHub Skills Target OpenClaw Users</a>. OpenSourceMalware, 1 февраля 2026 (обновлено 2–3 февраля).</li>
+  <li id="src-45">Мав Левин, <a href="https://depthfirst.com/post/1-click-rce-to-steal-your-moltbot-data-and-keys">1-Click RCE To Steal Your OpenClaw Data and Keys (CVE-2026-25253)</a>. depthfirst, 1 февраля 2026.</li>
+  <li id="src-46"><a href="https://github.com/anomalyco/opencode/commit/973715f">Коммит 973715f «anthropic legal requests»</a>. anomalyco/opencode, 19 февраля 2026.</li>
+  <li id="src-47">Райан Мартен, <a href="https://www.tbench.ai/news/terminal-bench-4-0">Terminal-Bench 4.0</a>, конец августа 2026; <a href="https://www.tbench.ai/leaderboard/terminal-bench/4.0">лидерборд Terminal-Bench 4.0</a>, снимок 30 сентября 2026.</li>
+  <li id="src-48"><a href="https://tokenstead.ai/models/swe-2">SWE-2</a>, карточка модели с цифрами вендора. tokenstead, сентябрь 2026.</li>
+  <li id="src-49"><a href="https://transluce.org/docent/blog/terminal-bench">Why does GPT-5.1 Codex underperform GPT-5 Codex on Terminal-Bench?</a> Transluce, 11 февраля 2026.</li>
+  <li id="src-50"><a href="https://www.anthropic.com/engineering/infrastructure-noise">Quantifying infrastructure noise in agentic coding evals</a>. Anthropic, 5 февраля 2026.</li>
+  <li id="src-51"><a href="https://aistack.imec-int.com/blog/harness-cost">Does your harness matter more than your model?</a> aistack, сентябрь 2026; <a href="https://github.com/anthropics/claude-code/issues/87227">anthropics/claude-code#87227</a>, открыт 17 августа 2026.</li>
+  <li id="src-52"><a href="https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/">Why SWE-bench Verified no longer measures frontier coding capabilities</a>. OpenAI, не позднее 23 февраля 2026.</li>
+  <li id="src-53"><a href="https://github.com/SWE-agent/mini-swe-agent">SWE-agent/mini-swe-agent</a>, README, на 30 сентября 2026; <a href="https://news.ycombinator.com/item?id=44746077">Show HN: New SWE-bench leaderboard compares LMs without fancy agent scaffolds</a>, Hacker News, 31 июля 2025.</li>
+  <li id="src-54"><a href="https://outofcontext.dev/blog/goose-claude-code-opencode-pi/">Terminal Agents in 2026: Goose, Claude Code, OpenCode, and Pi Compared</a>. outofcontext.dev, 25 июня 2026.</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>

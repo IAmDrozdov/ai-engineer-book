@@ -1,0 +1,1250 @@
+<!doctype html>
+<html lang="ru" data-chapter="10">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AP2, UCP и интернет агентов — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 10</b> из 17, часть «Протоколы»</p>
+  <h1>AP2, UCP и интернет агентов</h1>
+  <p class="lead">23 августа 2026 года в трекер AP2 пришёл отчёт: пользователь выдал агенту мандат с лимитом 5000 рупий, агент провёл платёж на 7500, и эталонный верификатор не нашёл нарушений. Подписи были целы. Держатель мандата просто не раскрыл верификатору список ограничений, а то, чего не показали, проверять было нечему. Протоколы агентной коммерции заняты в основном тем, чтобы доказать продавцу, что человек действительно разрешил эту покупку, и ломается при этом обычно не криптография, а код вокруг неё.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="map">
+<h2>Четыре вопроса к незнакомому агенту</h2>
+<p>Представь агента с задачей «купи беговые кроссовки не дороже $100» и магазин, в котором этот агент ни разу не был. Человека магазин узнаёт по cookie, логину и истории заказов. Здесь же приходит HTTP-клиент с незнакомым User-Agent, и прежде чем продать ему что-то, магазину нужно ответить на четыре вопроса. Протоколы из этой главы отвечают каждый на свой.</p>
+
+<p>Первый вопрос — кто стучится. Годами ответ собирали из IP-адреса и строки User-Agent, а подделать можно и то и другое. В 2026 году ответом стала подпись HTTP-запроса по RFC 9421 ключом, который лежит в опубликованном каталоге. Эту схему описывает Web Bot Auth, черновик рабочей группы IETF<a class="cite" href="#src-1">1</a>, и на ней же построены Visa Trusted Agent Protocol и Mastercard Agent Pay<a class="cite" href="#src-2">2</a>.</p>
+
+<p>Дальше агенту надо понять, что здесь вообще можно сделать. Ему нужен машиночитаемый манифест магазина: какие есть операции, по какому транспорту, какими способами оплаты. UCP кладёт его в <code>/.well-known/ucp</code><a class="cite" href="#src-3">3</a>, ACP с апреля 2026 года — в <code>/.well-known/acp.json</code><a class="cite" href="#src-4">4</a>. Для текста и документации есть <code>llms.txt</code>. В августе 2026 года вышла его вторая версия<a class="cite" href="#src-5">5</a>.</p>
+
+<p>Самый молодой и самый хрупкий слой отвечает на вопрос, разрешил ли это человек. Агент может ошибиться, выдумать, поддаться инъекции, и продавцу нужна не его уверенность, а подпись пользователя над конкретной корзиной или над рамкой, в которой агент волен действовать. Такие подписанные документы называются <dfn>мандатами</dfn>. Их формат задают AP2<a class="cite" href="#src-6">6</a> и Verifiable Intent от Mastercard<a class="cite" href="#src-7">7</a>, а в ACP ту же роль играет <code>allowance</code>, лимит, зашитый в платёжный токен.</p>
+
+<p>Остаются деньги. Для товаров это карточные токены: Shared Payment Token в Stripe, сетевые токены Visa и Mastercard. Списывает по ним PSP магазина (payment service provider, платёжный провайдер вроде Stripe или Adyen), а номер карты агент не видит никогда. Для оплаты API-вызовов появился другой путь, оплата прямо внутри HTTP-запроса: x402 и MPP, чаще всего стейблкоинами<a class="cite" href="#src-8">8</a>.</p>
+
+<figure class="fig wide" id="fig-layers">
+<div class="layers">
+  <div class="layer" data-tone="soft"><b>Кто стучится</b><span>Подпись запроса по RFC 9421 и ключ из каталога: Web Bot Auth (IETF), Visa TAP, Mastercard Agent Pay. Проверяется на краю CDN, до приложения.</span></div>
+  <div class="layer"><b>Что здесь можно</b><span>Манифест и каталог: <code>/.well-known/ucp</code>, <code>/.well-known/acp.json</code>, товарные фиды, <code>llms.txt</code> для текста.</span></div>
+  <div class="layer" data-tone="accent"><b>Разрешил ли человек</b><span>Подписанные пользователем мандаты: AP2, Verifiable Intent; в ACP — <code>allowance</code> на токене. Едут внутри чекаута UCP или ACP.</span></div>
+  <div class="layer" data-tone="ok"><b>Как дойдут деньги</b><span>Товары: SPT и сетевые токены через PSP магазина. Вызовы API: x402 и MPP, ответ 402 и повтор запроса с платежом.</span></div>
+</div>
+<figcaption>Один заказ проходит все четыре слоя. AP2 на третьем слое не двигает деньги вовсе, он производит доказательство согласия.</figcaption>
+</figure>
+
+<p>Путаница начинается, когда протоколы с разных слоёв сравнивают как соперников. Вопрос «AP2 или x402» бессмыслен: AP2 выпускает доказательства, а деньги идут по любому рельсу, хоть карточному, хоть блокчейну. Напрямую в сентябре 2026 года спорят только UCP с ACP за чекаут товаров и x402 с MPP за оплату HTTP-вызова. Всё остальное складывается в стек, и один заказ может задеть пять протоколов сразу: подпись Web Bot Auth на краю CDN, чекаут UCP, мандат AP2 в поле этого чекаута, сетевой токен в платёжном поле, а если магазин вдобавок продаёт API, то ещё и x402.</p>
+
+<div class="note key"><p>Сначала выясни, на какой из четырёх вопросов отвечает протокол. Спор «кто победит» осмыслен только внутри одного слоя, и таких соревнований сейчас два, а не восемь.</p></div>
+
+<h3>Стандарты ушли от авторов</h3>
+<p>За полгода почти все эти протоколы сменили хозяина. 28 апреля 2026 года Google передал AP2 в FIDO Alliance, и в тот же день Mastercard отдал туда Verifiable Intent. Работа идёт в двух группах FIDO: Agentic Authentication и Payments (Mastercard и Visa)<a class="cite" href="#src-9">9</a>. x402, который Coinbase запустил в мае 2025 года, перешёл в x402 Foundation при Linux Foundation. Фонд объявили 2 апреля, а заработал он 14 июля 2026 года с 40 членами<a class="cite" href="#src-10">10</a>. Web Bot Auth с 1 сентября 2026 года стал черновиком рабочей группы IETF, а не частным предложением Cloudflare<a class="cite" href="#src-1">1</a>. UCP управляет Governing Council из Google, Shopify и Stripe, при нём отраслевые советы по еде, жилью и платежам<a class="cite" href="#src-11">11</a>. ACP остался у OpenAI и Stripe, в апреле в его технический комитет вошла Meta<a class="cite" href="#src-4">4</a>.</p>
+
+<p>Stripe при этом сидит почти везде: соавтор ACP, член совета UCP, член x402 Foundation и соавтор MPP. Visa 8 апреля 2026 года запустила пилот Intelligent Commerce Connect, шлюз, который принимает TAP, MPP, ACP и UCP одновременно<a class="cite" href="#src-12">12</a>. Крупные игроки на вопрос «кто победит» отвечают тем, что поддерживают всех. Не строй бизнес-логику вокруг одного протокола, строй её вокруг своей модели заказа, а протоколы подключай адаптерами.</p>
+
+<ol class="timeline">
+  <li><time>16 сентября 2025</time><p>Google выпускает AP2 v0.1.0 с тремя мандатами: Intent, Cart, Payment.</p></li>
+  <li class="is-major"><time>29 сентября 2025</time><p>OpenAI и Stripe публикуют ACP, в ChatGPT появляется Instant Checkout.</p></li>
+  <li><time>24 октября 2025</time><p>Cloudflare проверяет агентов Visa TAP и Mastercard Agent Pay через Web Bot Auth.</p></li>
+  <li><time>11 декабря 2025</time><p>x402 V2: платёжные данные уходят в заголовки, сети называются по CAIP-2.</p></li>
+  <li class="is-major"><time>11 января 2026</time><p>Google, Shopify и партнёры выпускают UCP.</p></li>
+  <li><time>18 марта 2026</time><p>Запускается сеть Tempo, вместе с ней Stripe и Tempo представляют MPP.</p></li>
+  <li class="is-major"><time>24 марта 2026</time><p>OpenAI возвращает чекаут на сайты магазинов, ACP в ChatGPT становится каналом обнаружения товаров.</p></li>
+  <li><time>17 апреля 2026</time><p>ACP 2026-04-17: <code>/.well-known/acp.json</code>, Feed API, 3DS, обязательная идемпотентность.</p></li>
+  <li class="is-major"><time>28 апреля 2026</time><p>AP2 v0.2.0 с двумя мандатами и Verifiable Intent уходят в FIDO Alliance.</p></li>
+  <li><time>14 июля 2026</time><p>x402 Foundation начинает работу, 40 членов.</p></li>
+  <li><time>23 июля 2026</time><p>Препринт arXiv 2607.21824: 14 структурных уязвимостей в AP2 v0.2.0.</p></li>
+  <li><time>25 августа 2026</time><p>UCP v2026-08-25, релиз с ломающими изменениями.</p></li>
+  <li><time>1 сентября 2026</time><p>Web Bot Auth принят рабочей группой IETF.</p></li>
+  <li><time>2 сентября 2026</time><p>Отчёт AP2 #346: одно согласие пользователя, два платежа.</p></li>
+</ol>
+<p>Источники дат: репозитории AP2<a class="cite" href="#src-6">6</a>, ACP<a class="cite" href="#src-4">4</a> и UCP<a class="cite" href="#src-13">13</a>, блог Cloudflare<a class="cite" href="#src-2">2</a>, анонс x402 V2<a class="cite" href="#src-14">14</a>, блог Tempo<a class="cite" href="#src-15">15</a>, пост OpenAI<a class="cite" href="#src-16">16</a>, препринт Лоука<a class="cite" href="#src-17">17</a>.</p>
+</section>
+
+<section id="ap2">
+<h2>AP2: мандат вместо доверия к агенту</h2>
+<p>Если ты читал про AP2 осенью 2025 года, ты помнишь три мандата: Intent, Cart и Payment. В версии v0.2, вышедшей 28 апреля 2026 года, этих слов нет. Мандатов осталось два, Checkout Mandate и Payment Mandate, и у каждого два состояния, открытое и закрытое<a class="cite" href="#src-6">6</a>. Большинство статей в сети описывает старую модель, так что у чужой схемы сначала проверь год.</p>
+
+<p>Исходную позицию протокола задаёт одна фраза спецификации: «AP2 assumes that, at a minimum, the Shopping Agent is agentic… when either role is agentic, then the Agent itself is a potential attacker»<a class="cite" href="#src-6">6</a>. Агент, внутри которого работает недетерминированная модель, сам считается возможным атакующим. Поэтому продавец не верит ни одному утверждению агента о желаниях пользователя, а верит только подписи пользователя, которую агент подделать не может.</p>
+
+<aside class="margin"><p><b>MPP</b> в AP2 — роль Merchant Payment Processor. С протоколом MPP от Stripe и Tempo, о котором речь ниже, совпадение только в буквах.</p></aside>
+<p>Ролей пять. Shopping Agent собирает корзину и ведёт покупку, Credential Provider (кошелёк или банк) хранит платёжные данные пользователя, Merchant владеет каталогом и ценами. Merchant Payment Processor проводит платёж и проверяет, что платёжные данные выданы именно под эту корзину. <dfn>Trusted Surface</dfn> — интерфейс, в котором человек видит, что подписывает, и подписывает. Роль называется агентной, если её сообщения обрабатывает LLM, и неагентной, если детерминированный код. Shopping Agent по умолчанию агентный. Trusted Surface обязана быть неагентной, и это центральное требование протокола: если текст мандата пользователю показывает модель, она же может показать одно, а отдать на подпись другое. <mark>Подпись что-то значит, только когда показанное и подписанное строит один и тот же детерминированный код.</mark></p>
+
+<h3>Что лежит в мандате</h3>
+<p>Оба мандата — verifiable credentials в формате <dfn>SD-JWT</dfn>: JWT, в котором отдельные поля можно раскрывать выборочно, и который привязан к ключу держателя. У мандата есть поле <code>vct</code>, тип документа с версией в суффиксе: <code>mandate.checkout.1</code> и <code>mandate.payment.1</code> для закрытых, <code>mandate.checkout.open.1</code> и <code>mandate.payment.open.1</code> для открытых<a class="cite" href="#src-6">6</a>.</p>
+
+<p>Закрытый Checkout Mandate несёт <code>checkout_jwt</code>, JWT корзины, подписанный магазином, и <code>checkout_hash</code>, хеш этого JWT. Если AP2 работает поверх UCP, внутри <code>checkout_jwt</code> обязан лежать UCP-объект Checkout. Закрытый Payment Mandate несёт <code>transaction_id</code> (тот же хеш, это и есть привязка оплаты к корзине), получателя <code>payee</code>, сумму <code>payment_amount</code> в минорных единицах валюты (<code>27999</code> — это $279,99), <code>payment_instrument</code> и <code>risk_data</code>. Магазин проверяет первый мандат, платёжная сторона второй, и обе стороны сверяют одну и ту же корзину, хотя ни одна не видит всего.</p>
+
+<figure class="fig wide" id="fig-ap2-present">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Пользователь
+  participant SA as Shopping Agent
+  participant TS as Trusted Surface
+  participant M as Магазин
+  participant CP as Credential Provider
+  U->>SA: кроссовки до $100
+  SA->>M: собрать корзину
+  M-->>SA: checkout_jwt, подписан магазином
+  SA->>CP: доступные способы оплаты
+  CP-->>SA: инструменты без реквизитов
+  SA->>TS: содержимое двух мандатов
+  TS->>U: корзина, сумма, получатель
+  U->>TS: согласие, биометрия
+  TS-->>SA: закрытые мандаты, подпись user_sk
+  SA->>CP: Payment Mandate
+  CP-->>SA: платёжный токен под эту корзину
+  SA->>M: токен и Checkout Mandate
+  Note over M: сверка с живой корзиной, процессор сверяет transaction_id
+  M-->>SA: квитанции Checkout и Payment
+</script>
+<figcaption>Режим Human Present. Агент носит документы, но ничего не подписывает сам: подпись ставит Trusted Surface ключом пользователя. Платёжный токен выпускается под хеш конкретной корзины, поэтому подменить корзину после согласия нельзя.</figcaption>
+</figure>
+
+<h3>Когда человека рядом нет</h3>
+<p>Режим Human Not Present нужен для поручений вида «купи, когда цена упадёт ниже $100». Пользователь заранее подписывает на Trusted Surface открытые мандаты. В них вместо корзины лежат ограничения, а в поле <code>cnf</code> — публичный ключ агента, так что проверяющий знает, чья подпись должна появиться дальше. Когда условие выполнилось, агент сам собирает корзину, сам выпускает закрытые мандаты, подписывает их своим ключом и предъявляет вместе с открытыми. Проверяющий смотрит, укладывается ли закрытый мандат в рамку открытого<a class="cite" href="#src-6">6</a>. Так выглядит раскрытое содержимое открытого Checkout Mandate из спецификации:</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="Открытый Checkout Mandate (раскрытый payload SD-JWT)" data-hl="2,19">
+{
+  "vct": "mandate.checkout.open.1",
+  "constraints": [
+    {
+      "type": "checkout.line_items",
+      "items": [
+        {
+          "id": "line_1",
+          "acceptable_items": [ { "...": "y3aocAD2rhYpJQOUMN016faDFGkTBGEDVl1R1TRHdbw" } ],
+          "quantity": 1
+        }
+      ]
+    },
+    {
+      "type": "checkout.allowed_merchants",
+      "allowed": [ { "...": "a5UMAdxCk_MRayyVdRhpIAZ0ZhjVLEq1g2BWyruKUwg" } ]
+    }
+  ],
+  "cnf": { "jwk": { "crv": "P-256", "kty": "EC", "x": "...", "y": "..." } },
+  "iat": 1777342357,
+  "exp": 1777345957
+}
+</script>
+
+<p>Строки вида <code>{"...": "y3ao…"}</code> — хеши раскрытий SD-JWT, которые держатель пока не показал: список допустимых товаров и магазинов лежит в документе, но показывается только тому, кому держатель его раскроет. В раскрытом виде ограничение по товарам выглядит так: «одна пара из двух цветов на выбор».</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="Ограничение checkout.line_items (из документации AP2)">
+{
+  "type":  "checkout.line_items",
+  "items": [
+    {
+      "id": "id-shoe-choices",
+      "acceptable_items": [
+        {"id": "BAB1234", "title": "Red Style"},
+        {"id": "FAF1234", "title": "Blue Style"}
+      ],
+      "quantity": 1
+    }
+  ]
+}
+</script>
+
+<p>Спецификация формулирует проверку такого ограничения как задачу о максимальном потоке: позиции ограничения — источники, позиции корзины — стоки, пропускные способности — количества<a class="cite" href="#src-6">6</a>. Для оплаты ограничений больше: <code>payment.amount_range</code>, <code>payment.budget</code>, <code>payment.allowed_payees</code>, <code>payment.agent_recurrence</code> (частота от <code>ON_DEMAND</code> до <code>ANNUALLY</code> и <code>max_occurrences</code>) и ещё несколько.</p>
+
+<figure class="fig" id="fig-ap2-autonomous">
+<script type="text/x-mermaid">
+flowchart TD
+  u["Пользователь на Trusted Surface"] -->|"подпись ключом пользователя"| open["Открытые мандаты<br/>ограничения и cnf агента"]:::accent
+  open --> wait["Агент ждёт условия"]
+  wait -->|"цена упала"| closed["Закрытые мандаты<br/>подпись ключом агента"]
+  closed --> ver{"Закрытый укладывается<br/>в открытый?"}
+  ver -->|"да"| pay["Оплата как в Human Present"]:::ok
+  ver -->|"unresolved_constraint"| back["Вернуть человека<br/>в цикл"]:::warn
+  ver -->|"invalid_mandate или<br/>mandates_not_supported"| legacy["Обычный чекаут<br/>без мандатов"]:::mute
+</script>
+<figcaption>Режим Human Not Present. Магазин или Credential Provider в любой момент может ответить <code>unresolved_constraint</code> и превратить автономную покупку в обычную, с подтверждением человеком.</figcaption>
+</figure>
+
+<p>На каждую попытку у проверяющего четыре ответа об ошибке: <code>invalid_credential</code>, <code>unresolved_constraint</code>, <code>invalid_mandate</code>, <code>mandates_not_supported</code>. Два последних работают как сигнал «переходим на обычный чекаут без агента»<a class="cite" href="#src-6">6</a>. Против повторного использования согласия спецификация ставит правило на стороне агента: он «MUST NOT present any subsequent open Payment or Checkout Mandates without receiving a rejection receipt» и не должен подписывать пересекающиеся закрытые мандаты. На стороне проверяющих отказ от повторов сформулирован как MAY. Что из этого вышло, видно в следующем разделе.</p>
+
+<h3>Где AP2 стоит относительно A2A, MCP и платёжных рельсов</h3>
+<p>AP2 не описывает ни каталог, ни корзину, ни API между участниками. Всё это спецификация прямо выносит за свои пределы и называет себя расширением для A2A и UCP<a class="cite" href="#src-6">6</a>. В A2A мандаты едут в сообщениях между агентами (сам A2A разобран в <a href="../07-a2a/index.html">главе 7</a>). В эталонной реализации роли подняты как MCP-серверы: <code>credentials_provider_mcp</code>, <code>merchant_agent_mcp</code>, <code>merchant_payment_processor_mcp</code><a class="cite" href="#src-18">18</a>. Делегирование от пользователя можно оформить через OpenID4VP: Trusted Surface предъявляет credential с <code>transaction_data</code> типа <code>delegate</code>. Второй способ в общей модели авторизации AP2 называется Trusted Agent Provider: доверенной стороной там выступает сам провайдер агента. Деньги AP2 не двигает совсем. Карточный платёж, банковский перевод или стейблкоин — дело Merchant Payment Processor. Связку с x402 FAQ отправляет в отдельный репозиторий <code>a2a-x402</code>, где с мая 2026 года идут только обновления зависимостей.</p>
+
+<p>Состояние на конец сентября 2026 года такое. Тег v0.2.0 стоит на 28 апреля. Последний коммит в репозиторий <code>google-agentic-commerce/AP2</code> сделан 29 апреля, дальнейшая работа формально ушла в группы FIDO<a class="cite" href="#src-6">6</a>. Выпущенного пакета на PyPI, по FAQ проекта, нет. Спецификацию можно брать как проект формата, а код из репозитория — как иллюстрацию, не как библиотеку.</p>
+
+<h3>Verifiable Intent: та же идея от Mastercard</h3>
+<p>Mastercard пришёл к той же задаче со своей стороны. Verifiable Intent — открытая спецификация, в README значится «Draft (v0.1). Maintained by Mastercard», версия 0.1.0 от 19 февраля 2026 года, разработана вместе с Google и в апреле передана в FIDO вместе с AP2<a class="cite" href="#src-7">7</a>. Сама спецификация называет себя конкретной реализацией слоя verifiable credentials, который AP2 намеренно оставил на усмотрение реализаций. Её цепочка перевозится в полях AP2 внутри UCP или расширением ACP.</p>
+
+<figure class="fig" id="fig-vi-chain">
+<script type="text/x-mermaid">
+flowchart TD
+  iss["Эмитент карты"] -->|"L1, около года"| user["Пользователь<br/>cnf: ключ устройства"]
+  user -->|"L2, от 24 ч до 30 дней"| agent["Агент<br/>ограничения, cnf: ключ агента"]:::accent
+  agent -->|"L3a, 5 минут"| l3a["transaction_id<br/>инструмент"]
+  agent -->|"L3b, 5 минут"| l3b["checkout_jwt<br/>checkout_hash"]
+  l3a -.-|"сверка хешей"| l3b
+  l3a --> net["Платёжная сеть"]
+  l3b --> merch["Магазин"]
+</script>
+<figcaption>Автономный режим Verifiable Intent. Каждый слой подписан ключом из <code>cnf</code> предыдущего, срок жизни падает от года до минут. Магазин получает половину L3b с корзиной, сеть — половину L3a с инструментом; связывает их равенство <code>transaction_id</code> в L3a и <code>checkout_hash</code> в L3b.</figcaption>
+</figure>
+
+<p>Слой L1 выпускает эмитент: личность пользователя, последние четыре цифры карты, платёжную систему и ключ устройства пользователя в <code>cnf</code>, срок около года. L2 подписывает пользователь. В немедленном режиме в нём уже лежит итоговая корзина и сумма, <code>cnf</code> нет, живёт он минут 15. В автономном режиме L2 несёт ограничения и ключ агента, срок от 24 часов до 30 дней. L3 бывает только в автономном режиме и делится на две половины: L3a для сети с <code>transaction_id</code> и инструментом, L3b для магазина с корзиной и её хешем. Обе подписаны ключом агента и живут около пяти минут<a class="cite" href="#src-7">7</a>. Ограничений в v0.1 пять, и они называются почти как в AP2, только с префиксом: <code>mandate.checkout.line_items</code>, <code>mandate.payment.amount_range</code> и так далее. Транспорт, выдачу ключей и разбор споров VI сознательно не описывает.</p>
+
+<div class="note warn"><p>Mastercard Agent Pay и Verifiable Intent — разные вещи. Agent Pay — сетевая программа: зарегистрированные агенты, агентные токены, подписи Web Bot Auth, которые проверяются на краю CDN. Verifiable Intent — формат цепочки делегирования. В пресс-релизах и пересказах их регулярно склеивают.</p></div>
+</section>
+
+<section id="ap2-failures">
+<h2>Что нашли в AP2 за лето</h2>
+<p>Одна подпись пользователя, два заказа, две квитанции. Такое воспроизведение приложено к отчёту #346, который пришёл в трекер AP2 2 сентября 2026 года; проверяли коммит <code>e1ea56d</code>, то есть спецификацию v0.2. Пользователь один раз подписал закрытый Payment Mandate на корзину стоимостью 2500 минорных единиц. Агент предъявил его Credential Provider дважды и дважды получил платёжный токен. Магазин завершил два заказа, процессор выпустил две подписанные квитанции с одинаковым <code>reference</code>, хешем мандата, и разными <code>payment_id</code>. Ни одной подписи никто не подделывал: второе предъявление было байт в байт копией первого<a class="cite" href="#src-18">18</a>.</p>
+
+<figure class="fig wide" id="fig-replay">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant SA as Shopping Agent
+  participant CP as Credential Provider
+  participant M as Магазин
+  participant P as Процессор
+  SA->>CP: Payment Mandate, хеш Qef8…
+  CP-->>SA: токен 1, used false
+  SA->>CP: тот же мандат, байт в байт
+  CP-->>SA: токен 2, used false
+  SA->>M: complete с токеном 1
+  M->>P: initiate_payment
+  P-->>M: квитанция, reference Qef8…
+  SA->>M: complete с токеном 2
+  M->>P: initiate_payment
+  P-->>M: вторая квитанция, тот же reference
+  Note over CP,P: никто не записал, что мандат уже потрачен
+</script>
+<figcaption>Воспроизведение из отчёта AP2 #346. Проверка подписи, аудитории и nonce проходит оба раза. Магазин ищет дубликаты по токену, а токен при каждом повторе новый; процессор не хранит состояния вовсе.</figcaption>
+</figure>
+
+<p>Почему не помог nonce. Credential Provider в воспроизведении проверял и <code>aud</code>, и <code>nonce</code>, и оба раза успешно. Но nonce в AP2 выбирает сам Shopping Agent: запрос OpenID4VP строит он. Такой nonce доказывает, что предъявление адресовано этому проверяющему, и ничего не говорит о том, первое ли оно. Автор отчёта свёл это к одной фразе, которую стоит помнить любому, кто пишет платёжный код.</p>
+
+<div class="note field">
+<blockquote>Consumption is needed either way: checking a nonce is not remembering it.
+<footer>— FutureEnterprises, <a href="https://github.com/google-agentic-commerce/AP2/issues/346">AP2 issue #346, сентябрь 2026</a></footer></blockquote>
+<p><mark>Проверить свежесть и запомнить факт использования — две разные операции.</mark> Вторая требует состояния, записанного атомарно.</p>
+</div>
+
+<p>Спецификация здесь честно неполна. Обязательный контроль двойной траты стоит только на агенте, которому протокол по собственной модели угроз не доверяет. Проверяющим отказ от пересекающихся мандатов разрешён словом MAY, а в списке ошибок квитанции нет кода «уже использован». Автор построил модель прямого платежа в Tamarin: свойство «не больше одного списания на мандат» опровергается за 14 шагов, а с атомарным потреблением по <code>transaction_id</code> на стороне процессора доказывается. Отчёт сначала ушёл через программу вознаграждений Google, где его классифицировали как «intended behavior for program purposes» и предложили открыть публичную задачу<a class="cite" href="#src-18">18</a>.</p>
+
+<p>Исправление, которое предлагает автор, укладывается в одну таблицу и одно условие: записать хеш принятого мандата в долговременное хранилище атомарно и отказать с новой терминальной ошибкой <code>mandate_already_used</code>, если хеш там уже есть. Процессор делает то же с <code>transaction_id</code> до того, как инициирует платёж. На Postgres это выглядит так:</p>
+
+<div class="tabs">
+  <section data-tab="SQL">
+  <script type="text/plain" class="code" data-lang="sql" data-title="Набросок: таблица потреблённых мандатов">
+  CREATE TABLE consumed_mandates (
+      transaction_id text PRIMARY KEY,   -- хеш checkout_jwt из Payment Mandate
+      mandate_hash   text NOT NULL,      -- то, что уйдёт в reference квитанции
+      consumed_at    timestamptz NOT NULL DEFAULT now()
+  );
+  </script>
+  </section>
+  <section data-tab="Python">
+  <script type="text/plain" class="code" data-lang="python" data-title="Набросок: consume_once (asyncpg, не запускался)" data-hl="6-8,11-12">
+  class MandateAlreadyUsed(Exception):
+      code = "mandate_already_used"
+
+  async def consume_once(conn, transaction_id: str, mandate_hash: str) -> None:
+      row = await conn.fetchrow(
+          "INSERT INTO consumed_mandates (transaction_id, mandate_hash) "
+          "VALUES ($1, $2) ON CONFLICT (transaction_id) DO NOTHING "
+          "RETURNING transaction_id",
+          transaction_id, mandate_hash,
+      )
+      if row is None:
+          raise MandateAlreadyUsed(transaction_id)
+
+  async def issue_payment_token(pool, mandate) -> str:
+      async with pool.acquire() as conn, conn.transaction():
+          verify_chain_and_constraints(mandate)          # подпись, aud, ограничения
+          await consume_once(conn, mandate.transaction_id, mandate.sha256)
+          return await mint_token(conn, mandate)         # в той же транзакции
+  </script>
+  </section>
+</div>
+
+<p>Уникальный индекс здесь делает то, чего не делает проверка «есть ли запись» в коде приложения: два параллельных запроса не могут оба вставить строку. Тот же класс ошибки нашёл у себя разработчик платного API на x402, о нём речь ниже: объект с множеством использованных nonce пересоздавался на каждый запрос, и проверка повтора не срабатывала ни разу.</p>
+
+<h3>Нераскрытое ограничение считается соблюдённым</h3>
+<p>Отчёт #339 от 23 августа, с которого начинается глава, устроен тоньше. Эталонный SDK создаёт проверяющий объект на каждое ограничение, найденное в открытом мандате, так что ограничение, которого в предъявленном документе нет, не порождает ни проверки, ни нарушения. Эмитент при этом вправе пометить элементы массива <code>constraints</code> как выборочно раскрываемые, и это разумно: не показывать магазину общий бюджет пользователя — ровно та приватность, ради которой взяли SD-JWT. Держатель мандата штатным параметром <code>claims_to_disclose</code> не раскрывает ограничения, и проверка проходит<a class="cite" href="#src-18">18</a>. Рецензент программы Google подтвердил механизм словами «a selectively withheld constraint could lead to a permissions bypass», но закрыл отчёт как ожидаемое поведение.</p>
+
+<table>
+<thead><tr><th>Предъявление</th><th>verify()</th><th>Видимые ограничения</th><th class="num">Нарушений</th><th>Итог</th></tr></thead>
+<tbody>
+<tr><td>Всё раскрыто</td><td>проходит</td><td><code>payment.budget</code>, <code>payment.allowed_payees</code></td><td class="num">1</td><td><span class="yes">заблокирован</span></td></tr>
+<tr><td>Бюджет скрыт</td><td>проходит</td><td>нет</td><td class="num">0</td><td><span class="no">разрешён</span></td></tr>
+</tbody>
+</table>
+
+<p>В той же задаче вторая находка. <code>payment.amount_range.max</code> задокументирован в минорных единицах, а у <code>payment.budget.max</code> единица не указана, и эвалюатор умножает его на 100. Эмитент, который по аналогии с соседним полем запишет лимит в пайсах, получит потолок в сто раз выше: 5000 рупий превратятся в 500 000. 27 сентября открыли #362: множитель 100 применяется к любой валюте, хотя знаков после запятой не у всех валют два, а усечение float в некоторых случаях снижает лимит на одну минорную единицу.</p>
+
+<p>Ещё три задачи того же лета. В #268 (май 2026) Илья Григорик (igrigorik) показал, что правило v0.2 для алгоритма подписи <code>checkout_jwt</code> требует ECDSA, а Web Bot Auth живёт на Ed25519, поэтому магазин, который хочет и то и другое, вынужден держать два ключа; профиль-пример UCP так и публикует два ключа. В #358 оказалось, что <code>CheckoutMandateChain.verify()</code> эталонного кода не вычисляет хеш предъявленного <code>checkout_jwt</code>: <code>checkout_hash</code> закрытого мандата сравнивается только с необязательным аргументом, и если вызывающий его не передал, другая корзина, которая укладывается в открытые ограничения, проходит проверку чисто. #361 — отчёт не о самом AP2, а о чужом коде вокруг него: автор независимого верификатора воспроизвёл у себя класс «weak merchant identity binding» (AP2-17 в классификации препринта Jiang et al.). Его проверка пропускала сравнение получателя, если поле <code>payee.id</code> пустое, и мандат с пустым получателем принимался для любого получателя<a class="cite" href="#src-18">18</a>. У #339, #358 и #361 общая привычка: отсутствующее поле трактуется как «проверять нечего».</p>
+
+<h3>Препринт Лоука: ошибки не в модели, а в протоколе</h3>
+<p>23 июля 2026 года Йедидел Лоук выложил препринт о трёх платформах агентной коммерции: CoralOS, Fetch.ai uAgents и AP2 v0.2.0<a class="cite" href="#src-17">17</a>. Он насчитал 33 структурные уязвимости: 11 в CoralOS, 8 в uAgents и 14 в AP2. «Структурная» здесь значит, что атака срабатывает детерминированно и не зависит от того, какая модель стоит в агенте; там, где успех мерили на живой системе, он был 100%. Три уязвимости CoralOS складываются в полный угон платежа. Программа вознаграждений Google отчёты по AP2 не приняла, автор завёл GitHub Security Advisories, а точные места в коде в препринте нарочно не приведены. Защиту автор тоже предлагает, под именем PCAT, и по его замерам она сводит успех структурных атак к нулю в четырёх классах из пяти<a class="cite" href="#src-17">17</a>.</p>
+
+<figure class="fig" id="fig-rootcauses">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "33 структурные уязвимости по классам причин", "subtitle": "CoralOS, Fetch.ai uAgents и AP2 v0.2.0 вместе", "unit": "шт.",
+ "emphasis": ["Права не ограничены", "Проверка не атомарна"],
+ "rows": [["Права не ограничены", 13, "RC-5: аутентификация есть, границы нет"], ["Проверка не атомарна", 9, "RC-4: TOCTOU в платёжном состоянии"], ["Секрет в логах или URL", 4, "RC-3"], ["Каталог без подписи", 3, "RC-1"], ["Чужой адрес получателя", 3, "RC-2"]],
+ "note": "Y. Louck, arXiv 2607.21824, 23 июля 2026. Тридцать третья находка — составная цепочка атак, в классы не входит."}
+</script>
+<figcaption>Две трети находок приходятся на два класса: проверка и списание разнесены во времени, либо аутентификация есть, а границы прав не проверяются. Повтор мандата из #346 — первый класс, нераскрытое ограничение из #339 — второй.</figcaption>
+</figure>
+
+<div class="note practice"><p>Если принимаешь мандаты AP2 или цепочки VI, заложи в проверяющий код пять правил. Сверяй мандат с живым состоянием корзины, а не с тем, что прислал агент. Потребляй мандат атомарно по <code>transaction_id</code>. Держи список обязательных ограничений и считай отсутствующее ограничение провалом, а не успехом. Храни все суммы целыми в минорных единицах. Выдавай nonce сам и сам его запоминай.</p></div>
+</section>
+
+<section id="ucp">
+<h2>UCP: магазин как набор capability</h2>
+<p>UCP-сессия начинается с анонимного GET-запроса за профилем магазина. Регистрации нет, ключей API нет: платформа читает <code>/.well-known/ucp</code> и узнаёт, что магазин умеет, по каким адресам и какими ключами подписывает ответы<a class="cite" href="#src-3">3</a>.</p>
+
+<script type="text/plain" class="code wide" data-lang="json" data-title="Набросок по примерам спецификации: GET /.well-known/ucp" data-hl="4-9,16-17,26-29">
+{
+  "ucp": {
+    "version": "2026-08-25",
+    "services": {
+      "dev.ucp.shopping": [
+        { "version": "2026-08-25", "transport": "rest",
+          "schema": "https://ucp.dev/2026-08-25/services/shopping/rest.openapi.json",
+          "endpoint": "https://business.example.com/ucp/v1" }
+      ]
+    },
+    "capabilities": {
+      "dev.ucp.shopping.checkout": [
+        { "version": "2026-08-25",
+          "schema": "https://ucp.dev/2026-08-25/schemas/shopping/checkout.json" }
+      ],
+      "dev.ucp.shopping.fulfillment": [
+        { "version": "2026-08-25", "extends": "dev.ucp.shopping.checkout" }
+      ],
+      "dev.ucp.common.identity_linking": [
+        { "version": "2026-08-25",
+          "config": { "scopes": { "dev.ucp.shopping.order:read": {}, "dev.ucp.shopping.order:manage": {} } } }
+      ]
+    },
+    "payment_handlers": { "com.example.processor_tokenizer": [ { "id": "processor_tokenizer", "...": "..." } ] }
+  },
+  "keys": [
+    { "kid": "poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U", "kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "x": "..." },
+    { "kid": "business_2025", "kty": "EC", "crv": "P-256", "alg": "ES256", "x": "...", "y": "..." }
+  ]
+}
+</script>
+
+<p>В <code>services</code> перечислены транспорты. Значений <code>transport</code> четыре: <code>rest</code> (OpenAPI), <code>mcp</code> и <code>embedded</code> (оба на JSON-RPC, описаны через OpenRPC) и <code>a2a</code>, где <code>endpoint</code> указывает на Agent Card агента магазина<a class="cite" href="#src-3">3</a>. В <code>capabilities</code> лежат <dfn>capability</dfn>, версионированные функции с именами в обратной DNS-нотации. Пространство <code>dev.ucp.*</code> ведёт технический совет UCP, <code>com.acme.*</code> — сам acme.com, и URL схемы обязан лежать на домене владельца пространства: платформа должна отвергнуть capability, у которой это не так. Расширение объявляет родителя через <code>extends</code>. <code>payment_handlers</code> описывают, как получить платёжный инструмент, а <code>keys</code> — обычный JWK Set. После релиза v2026-08-25 это единственное поле для ключей, <code>signing_keys[]</code> удалили<a class="cite" href="#src-13">13</a>.</p>
+
+<p>Два ключа в примере стоят не для красоты. Ed25519 нужен для подписи HTTP-запросов в духе Web Bot Auth, ES256 — для подписей AP2. Это прямое следствие задачи AP2 #268 из предыдущего раздела, и спецификация UCP так и объясняет пример.</p>
+
+<h3>Переговоры о возможностях</h3>
+<p>Платформа, то есть агент или приложение, в каждом запросе присылает ссылку на собственный профиль в заголовке <code>UCP-Agent</code>. Магазин обязан скачать и проверить этот профиль, если его нет в кеше, а потом пересечь две публикации возможностей<a class="cite" href="#src-3">3</a>. Алгоритм пересечения в спецификации четырёхшаговый: оставить capability, которые есть у обеих сторон по имени; для каждой выбрать самую позднюю общую версию, а если общей нет, выкинуть; убрать расширения, у которых не осталось ни одного родителя; повторять третий шаг, пока что-то удаляется. Результат магазин возвращает в поле <code>ucp</code> каждого ответа.</p>
+
+<p>Прогоним алгоритм на профиле вроде показанного выше, только с двумя версиями чекаута. Платформа знает только <code>checkout</code> версии 2026-04-08 и <code>fulfillment</code> той же версии. Магазин публикует <code>checkout</code> в версиях 2026-08-25 и 2026-04-08, а <code>fulfillment</code> только в 2026-08-25. Имена совпали у обоих. У <code>checkout</code> общая версия 2026-04-08, её и выбирают. У <code>fulfillment</code> общей версии нет, его выкидывают. Расширений-сирот не осталось, и сессия идёт на чекауте 2026-04-08 без доставки. А если бы у <code>fulfillment</code> общая версия нашлась, но платформа не знала бы <code>checkout</code> вовсе, первый шаг убрал бы <code>checkout</code>, а третий — осиротевший <code>fulfillment</code>.</p>
+
+<figure class="fig" id="fig-ucp-negotiation">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant P as Платформа
+  participant B as Магазин
+  P->>B: GET /.well-known/ucp
+  B-->>P: capabilities, services, keys
+  P->>B: POST /checkout-sessions, UCP-Agent profile=…
+  B->>P: GET профиль платформы, если не в кеше
+  P-->>B: capabilities платформы
+  Note over B: пересечение имён, общая версия, отсев сирот
+  B-->>P: 201, активные capabilities, status incomplete
+  P->>B: PUT /checkout-sessions/{id}, email и доставка
+  B-->>P: status ready_for_complete
+  P->>B: POST /checkout-sessions/{id}/complete
+  B-->>P: status completed, order
+</script>
+<figcaption>Онбординг без регистрации: магазин узнаёт платформу по профилю, на который указывает <code>UCP-Agent</code>, а доверие к запросу даёт подпись ключом из этого профиля. Если пересечение пустое, магазин отвечает <code>capabilities_incompatible</code> и может дать <code>continue_url</code> на обычный сайт.</figcaption>
+</figure>
+
+<p>Пересечение нужно, потому что UCP версионирует не протокол целиком, а каждую capability по отдельности. Магазин может держать старую версию рядом с новой, пока на ней сидят платформы, поэтому в <code>capabilities</code> лежит массив, а не одна запись.</p>
+
+<h3>Чекаут по REST</h3>
+<p>REST-привязка чекаута — пять операций. Обрати внимание на дефис в пути и на <code>PUT</code> для обновления: в ACP и то и другое устроено иначе, и на этом легко ошибиться, если пишешь адаптер к обоим<a class="cite" href="#src-19">19</a>. Кроме чекаута в той же OpenAPI есть <code>/carts</code>, <code>/catalog/search</code>, <code>/catalog/lookup</code>, <code>/catalog/product</code> и <code>GET /orders/{id}</code>.</p>
+
+<table>
+<thead><tr><th>Операция</th><th>Метод</th><th>Путь</th></tr></thead>
+<tbody>
+<tr><td>Create Checkout</td><td><code>POST</code></td><td><code>/checkout-sessions</code></td></tr>
+<tr><td>Get Checkout</td><td><code>GET</code></td><td><code>/checkout-sessions/{id}</code></td></tr>
+<tr><td>Update Checkout</td><td><code>PUT</code></td><td><code>/checkout-sessions/{id}</code></td></tr>
+<tr><td>Complete Checkout</td><td><code>POST</code></td><td><code>/checkout-sessions/{id}/complete</code></td></tr>
+<tr><td>Cancel Checkout</td><td><code>POST</code></td><td><code>/checkout-sessions/{id}/cancel</code></td></tr>
+</tbody>
+</table>
+
+<div class="tabs">
+  <section data-tab="Запрос">
+  <script type="text/plain" class="code" data-lang="http" data-title="Create Checkout (пример из спецификации)">
+  POST /checkout-sessions HTTP/1.1
+  UCP-Agent: profile="https://platform.example/profile"
+  Content-Type: application/json
+
+  {
+    "line_items": [
+      { "item": { "id": "item_123" }, "quantity": 2 }
+    ]
+  }
+  </script>
+  </section>
+  <section data-tab="Ответ 201">
+  <script type="text/plain" class="code" data-lang="jsonc" data-title="Create Checkout, ответ (сокращён)" data-hl="8-14,19-23">
+  {
+    "ucp": {
+      "version": "2026-08-25",
+      "capabilities": { "dev.ucp.shopping.checkout": [ {"version": "2026-08-25"} ] },
+      "payment_handlers": { "com.shopify.shop_pay": [ { "id": "shop_pay_1234" /* … */ } ] }
+    },
+    "id": "chk_1234567890",
+    "status": "incomplete",
+    "messages": [
+      { "type": "error", "code": "missing",
+        "path": "$.buyer.email",
+        "content": "Buyer email is required",
+        "severity": "recoverable" }
+    ],
+    "currency": "USD",
+    "line_items": [
+      { "id": "li_1", "item": { "id": "item_123", "title": "Red T-Shirt", "price": 2500 }, "quantity": 2 }
+    ],
+    "totals": [
+      { "type": "subtotal", "amount": 5000 },
+      { "type": "tax", "amount": 400 },
+      { "type": "total", "amount": 5400 }
+    ],
+    "links": [ { "type": "terms_of_service", "url": "https://business.example.com/terms" } ]
+  }
+  </script>
+  </section>
+</div>
+
+<p>Статус выставляет магазин, а что делать дальше, платформа узнаёт из <code>messages</code>. Ошибка с <code>severity: recoverable</code> означает «исправь через Update»: здесь не хватает email покупателя. Ошибки <code>requires_buyer_input</code> и <code>requires_buyer_review</code> переводят сессию в <code>requires_escalation</code>, и тогда магазин обязан вернуть <code>continue_url</code>, абсолютный HTTPS-адрес, по которому человек продолжит покупку в браузере<a class="cite" href="#src-19">19</a>. Путь «агент не справился, передай человеку» спроектирован заранее, а не прикручен сбоку.</p>
+
+<figure class="fig" id="fig-ucp-states">
+<script type="text/x-mermaid">
+stateDiagram-v2
+  [*] --> incomplete
+  incomplete --> requires_escalation: нужен человек
+  requires_escalation --> incomplete
+  incomplete --> ready_for_complete: данные собраны
+  ready_for_complete --> complete_in_progress: Complete
+  complete_in_progress --> completed
+  requires_escalation --> completed: continue_url
+  completed --> [*]
+  state "canceled, из любого состояния" as canceled
+  canceled --> [*]
+</script>
+<figcaption>Шесть статусов чекаута UCP. Ветка через <code>requires_escalation</code> уводит покупку из API в браузер: агент отдаёт человеку <code>continue_url</code>, и заказ завершается уже на сайте магазина. <code>canceled</code> возможен из любого нетерминального состояния.</figcaption>
+</figure>
+
+<p>Деньги везде целые, в минорных единицах: <code>2500</code> — это $25,00. Релиз v2026-08-25 добавил товары на вес: количество может быть мерой с единицей и масштабом, и спецификация подробно запрещает самодеятельность<a class="cite" href="#src-19">19</a>. Бананы по 79 центов за фунт, покупатель берёт 1,50 фунта, платформа шлёт <code>quantity: 150</code> при <code>scale: 2</code>. Магазин считает <code>79 × 150 × 10⁻²</code> = 118,5 и округляет один раз, до 119 центов. Платформе прямо запрещено пересчитывать итог по дробному количеству со своим округлением, а магазину — молча переинтерпретировать количество: пересчёт возвращается как изменённая строка с предупреждением в <code>messages</code>. Поэтому суммы агент берёт из <code>totals</code> ответа, модель их не складывает.</p>
+
+<h3>Как платит платформа</h3>
+<p>Путь денег начинается с <code>payment_handlers</code> в ответе на Create Checkout. UCP отделяет получение платёжного инструмента от его обработки и описывает это «треугольником доверия»<a class="cite" href="#src-20">20</a>. У магазина и его PSP уже есть договор. Платформа получает токен или зашифрованный инструмент у Credential Provider и сама денег не держит. Магазину она передаёт только этот токен или мандат. Шагов тоже три: магазин объявляет обработчики, платформа по логике обработчика получает инструмент и кладёт его в <code>payment.instruments[]</code> запроса <code>complete</code>, магазин списывает деньги через своего PSP. Данные идут только в одну сторону: «businesses MUST NOT echo credentials back in responses».</p>
+
+<p>Магазин при этом остаётся merchant of record, продавцом по записи, который отвечает за сделку, и по спецификации чекаута не обязан проходить PCI DSS. Способы оплаты, которые покупатель сохранил у магазина, магазин возвращает только на запрос от имени привязанного покупателя, и то как непрозрачную ссылку: <code>id</code> и поля <code>display</code>, без реквизитов<a class="cite" href="#src-19">19</a>. Единого аналога <code>delegate_payment</code> из ACP в UCP нет: как получить токен, решает обработчик, и адаптер разбирает каждый объявленный.</p>
+
+<p>Два других механизма UCP пересекаются с соседними главами, поэтому здесь коротко. Identity linking привязывает аккаунт покупателя у магазина к платформе через OAuth 2.0 с PKCE S256 и серверными метаданными RFC 8414. Для ускоренного входа платформа меняет свой токен у провайдера идентичности по RFC 8693 на JWT-грант со сроком не больше 60 секунд и предъявляет его магазину по RFC 7523; предъявлять магазину сырой токен провайдера запрещено<a class="cite" href="#src-3">3</a>. Подробно такие схемы разобраны в <a href="../15-integrations-auth/index.html">главе 15</a>.</p>
+
+<p>Заказ после оплаты живёт в <code>dev.ucp.shopping.order</code>. Состояние можно спросить через <code>GET /orders/{id}</code>, но платформе рекомендовано полагаться на вебхуки. Модель заказа разделяет ожидания по доставке (expectations) и журнал событий (events), в который только дописывают, а возвраты, возвраты товара и споры идут отдельными корректировками (adjustments), тоже лучше в режиме «только дописывать». Вебхуки носят заголовки Standard Webhooks, <code>Webhook-Id</code> и <code>Webhook-Timestamp</code>, но подписываются по RFC 9421, а адрес для них берётся из <code>config.webhook_url</code> в профиле платформы<a class="cite" href="#src-3">3</a>. Журнал, который нельзя переписать задним числом, пригодится, когда дело дойдёт до спора о платеже.</p>
+
+<h3>AP2 внутри UCP: подпись внутри подписи</h3>
+<p>Если обе стороны объявили расширение <code>dev.ucp.common.payment.ap2_mandate</code>, магазин подписывает каждый ответ чекаута. Подпись лежит в <code>ap2.merchant_authorization</code>: JWS с отсоединённым содержимым, то есть строка вида <code>&lt;header&gt;..&lt;signature&gt;</code> без середины, поверх канонизированного по JCS чекаута без поля <code>ap2</code>. В защищённом заголовке <code>alg</code> и <code>kid</code>, и <code>kid</code> указывает на ключ из <code>keys[]</code> профиля магазина<a class="cite" href="#src-21">21</a>.</p>
+
+<script type="text/plain" class="code" data-lang="jsonc" data-title="Ответ чекаута с подписью магазина (из спецификации расширения, сокращён)" data-hl="9-11">
+{
+  "ucp": { /* … */ },
+  "id": "chk_abc123",
+  "status": "ready_for_complete",
+  "currency": "USD",
+  "line_items": [ /* … */ ],
+  "totals": [ /* … */ ],
+  "links": [ /* … */ ],
+  "ap2": {
+    "merchant_authorization": "eyJhbGciOiJFUzI1NiIsImtpZCI6Im1lcmNoYW50XzIwMjUifQ..<signature>"
+  }
+}
+</script>
+
+<p>Дальше платформа кладёт в запрос <code>complete</code> поле <code>ap2.checkout_mandate</code>, и спецификация требует, чтобы мандат содержал ответ чекаута целиком, вместе с <code>merchant_authorization</code>: «the platform's signature covers the business's signature». Payment Mandate едет отдельно, в <code>payment.instruments[*].credential.token</code>, и уходит от магазина к его PSP и дальше в сеть.</p>
+
+<figure class="fig wide" id="fig-ucp-ap2">
+<svg class="diagram" viewBox="0 0 900 330" role="img" aria-label="Вложенные подписи AP2 в запросе complete UCP">
+  <rect class="box--ghost" x="10" y="10" width="880" height="240" rx="6"/>
+  <text class="t-mono t-mute" x="26" y="32">POST /checkout-sessions/{id}/complete</text>
+  <rect class="box--violet" x="30" y="46" width="500" height="190" rx="6"/>
+  <text class="t-title" x="50" y="72">ap2.checkout_mandate</text>
+  <text class="t-sub" x="50" y="92">подпись платформы: ключ пользователя или агента</text>
+  <rect class="box" x="50" y="104" width="460" height="118" rx="6"/>
+  <text class="t-title" x="70" y="128">Ответ чекаута магазина целиком</text>
+  <text class="t-mono" x="70" y="148">id, status, line_items, totals</text>
+  <rect class="box--accent" x="70" y="160" width="420" height="54" rx="6"/>
+  <text class="t-title" x="90" y="182">ap2.merchant_authorization</text>
+  <text class="t-sub" x="90" y="202">JWS магазина по JCS(checkout без ap2)</text>
+  <rect class="box--ok" x="560" y="46" width="310" height="100" rx="6"/>
+  <text class="t-title" x="715" y="74" text-anchor="middle">payment.instruments[]</text>
+  <text class="t-sub" x="715" y="96" text-anchor="middle">credential.token = Payment Mandate</text>
+  <text class="t-sub" x="715" y="118" text-anchor="middle">привязан к transaction_id</text>
+  <rect class="box" x="30" y="280" width="500" height="40" rx="6"/>
+  <text class="t-title" x="280" y="305" text-anchor="middle">Магазин проверяет обе подписи</text>
+  <rect class="box--mute" x="560" y="280" width="310" height="40" rx="6"/>
+  <text class="t-title" x="715" y="305" text-anchor="middle">PSP магазина, затем сеть</text>
+  <path class="arrow" d="M280,236 L280,278"/>
+  <path class="arrow" d="M715,146 L715,278"/>
+</svg>
+<figcaption>Запрос <code>complete</code> с расширением AP2. Подпись магазина лежит внутри мандата, который подписала платформа, поэтому ни одна сторона не может потом утверждать, что видела другую корзину. Payment Mandate идёт параллельно и проверяется уже платёжной стороной.</figcaption>
+</figure>
+
+<p>Для подписи HTTP-запросов UCP берёт <code>Content-Digest</code> по сырым байтам, а мандаты канонизирует через JCS. Разница в сроке жизни: мандат — долговременное доказательство, которое пройдёт от платформы к магазину, к PSP и в сеть, и по дороге JSON могут пересериализовать. Подписанные байты должны восстанавливаться из содержимого, иначе подпись перестанет сходиться уже у третьего участника<a class="cite" href="#src-21">21</a>. Если ты подписываешь JSON в своём сервисе, логика та же: подпись транспорта — по байтам, подпись документа — по канонической форме.</p>
+
+<p>После согласования расширения сессия становится Security Locked: запрос <code>complete</code> без <code>ap2.checkout_mandate</code> обязан завершиться ошибкой, и откатиться внутри той же сессии к чекауту без мандатов нельзя ни одной стороне. Иначе атакующему хватило бы выбросить поле с мандатом.</p>
+
+<div class="note warn" data-label="Устаревшие примеры"><p>В описаниях до августа 2026 года расширение называется <code>dev.ucp.shopping.ap2_mandate</code>, а подпись магазина — <code>checkoutSignature</code>. В v2026-08-25 платёжные расширения переехали в <code>dev.ucp.common.payment.*</code>, это ломающее изменение<a class="cite" href="#src-13">13</a>, а документация Verifiable Intent на конец сентября всё ещё использует старое имя.</p></div>
+
+<p>Тот же релиз v2026-08-25 перевёл согласия покупателя в словарь с ключами в обратной DNS-нотации, провёл 3DS2 через новый примитив <code>actions[]</code> и добавил совместимость с Web Bot Auth. Протокол растёт в стороны: 16 мест в техническом совете с апреля, отраслевые советы по еде (июль), жилью (август) и платежам (2 сентября), черновик бронирования отелей <code>dev.ucp.lodging.booking</code> влит 24 сентября<a class="cite" href="#src-11">11</a>. MCP-привязка UCP передаёт профиль платформы в <code>arguments.meta["ucp-agent"]</code> внутри <code>tools/call</code> и писалась под ревизии MCP до 2026-07-28, в которой исчезли <code>initialize</code> и <code>Mcp-Session-Id</code><a class="cite" href="#src-22">22</a>. Если поднимаешь UCP поверх MCP, проверь, какую ревизию поддерживает твой SDK (подробнее в <a href="../05-mcp/index.html">главе 5</a>).</p>
+</section>
+
+<section id="acp">
+<h2>ACP после Instant Checkout</h2>
+<p>24 марта 2026 года OpenAI опубликовала пост о поиске товаров в ChatGPT, и главная фраза в нём была не про поиск: «We've found that the initial version of Instant Checkout did not offer the level of flexibility that we aspire to provide, so we're allowing merchants to use their own checkout experiences while we focus our efforts on product discovery»<a class="cite" href="#src-16">16</a>. Оплата прямо в чате, ради которой ACP запускали в сентябре 2025 года, за полгода ушла на второй план. Target, Sephora, Nordstrom, Lowe's, Best Buy, The Home Depot и Wayfair подключились к ACP, но для обнаружения товаров, а не для оплаты в чате. Покупатели магазинов на Shopify находят товар в ChatGPT через Shopify Catalog и платят на сайте магазина во встроенном браузере, а Walmart пошёл третьим путём и сделал собственное приложение внутри ChatGPT<a class="cite" href="#src-16">16</a>.</p>
+
+<p>Пересказы тех недель путают два утверждения, и оба неверны. «OpenAI закрыла агентный чекаут» — нет: спецификация живёт, релиз 2026-04-17 вышел уже после поста, предложения по изменениям вливали до 18 июля, а 24 апреля в технический комитет вошла Meta<a class="cite" href="#src-4">4</a>. «Семь крупных ритейлеров работают на ACP-чекауте» — тоже нет, они пришли ради discovery. Документация OpenAI для разработчиков на 30 сентября по-прежнему описывает три потока Instant Checkout: фид, чекаут и делегированный платёж<a class="cite" href="#src-23">23</a>.</p>
+
+<h3>Что магазин отдаёт в ChatGPT сейчас</h3>
+<p>Первое — каталог. С релиза 2026-04-17 в ACP есть Feed API, и он устроен наоборот тому, к чему привык бэкендер: не агент обходит эндпоинты магазина, а магазин сам отправляет данные в фид агента через <code>POST /feeds</code> и частично обновляет товары через <code>PATCH /feeds/{id}/products</code> по <code>Product.id</code>. Второе — документ обнаружения <code>/.well-known/acp.json</code><a class="cite" href="#src-4">4</a>:</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="/.well-known/acp.json (пример из RFC Discovery)">
+{
+  "protocol": {
+    "name": "acp",
+    "version": "2025-09-29",
+    "supported_versions": ["2025-09-29"]
+  },
+  "api_base_url": "https://merchant.example.com/api",
+  "transports": ["rest"],
+  "capabilities": {
+    "services": ["checkout"]
+  }
+}
+</script>
+
+<p>В этом документе нарочно нет двух вещей. Нет <code>merchant_id</code>, чтобы на платформах с тысячами продавцов вроде <code>acp.stripe.com</code> нельзя было перебрать всех по одному адресу. Нет способов оплаты: они зависят от продавца и от корзины, и узнаются уже в сессии. Документ отдаётся без аутентификации, RFC рекомендует <code>Cache-Control: public, max-age=3600</code>, а агент перед операциями с корзиной проверяет, есть ли в <code>services</code> значение <code>carts</code>.</p>
+
+<p>Так фид устроен в протоколе. Живой ChatGPT по документации OpenAI на 30 сентября 2026 года принимает и файловый фид: полный снимок каталога не реже раза в день по SFTP, лучше всего parquet со сжатием zstd (сжатые jsonl, csv и tsv тоже годятся), шарды до 500 тыс. товаров и примерно 500 МБ, одно и то же имя файла при каждом обновлении. Обязательных полей девять: <code>item_id</code>, <code>title</code>, <code>description</code>, <code>url</code>, <code>brand</code>, <code>seller_name</code>, <code>image_url</code>, <code>availability</code>, <code>price</code>. Видимостью управляют флаги <code>is_eligible_search</code> и <code>is_eligible_checkout</code>, второй работает только вместе с первым и сам по себе ничего не включает: «Setting an eligibility flag does not complete checkout onboarding»<a class="cite" href="#src-23">23</a>.</p>
+
+<h3>Чекаут и делегированный платёж</h3>
+<p>Сам чекаут — REST-контракт, который реализует магазин, оставаясь системой учёта заказов, платежей и налогов. Пути с подчёркиванием, <code>/checkout_sessions</code>, и обновление через <code>POST /checkout_sessions/{id}</code>, а не PUT. Каждый ответ — авторитетное состояние корзины, которое агент показывает пользователю. Заголовки: <code>Authorization: Bearer</code>, <code>API-Version</code>, <code>Idempotency-Key</code> на каждом POST (до 255 символов, рекомендован UUIDv4) и рекомендованная подпись тела <code>Signature</code> с <code>Timestamp</code><a class="cite" href="#src-4">4</a>. Статус в схеме 2026-04-17 принимает 11 значений: <code>incomplete</code>, <code>not_ready_for_payment</code>, <code>requires_escalation</code>, <code>authentication_required</code>, <code>ready_for_payment</code>, <code>pending_approval</code>, <code>complete_in_progress</code>, <code>completed</code>, <code>canceled</code>, <code>in_progress</code>, <code>expired</code>. Картинка с четырьмя состояниями, которую рисуют в обзорах, описывает 2025 год.</p>
+
+<p>Переговоры о возможностях в ACP тоже есть, с релиза 2026-01-30, только устроены проще, чем в UCP. Агент объявляет в запросе, что умеет: <code>interventions.supported</code> (например, <code>3ds</code>), <code>display_context</code>, <code>max_redirects</code>, а магазин возвращает пересечение. Тем же релизом пришли обработчики оплаты с флагом <code>requires_delegate_payment</code>. О заказе после оплаты магазин сообщает вебхуками <code>order_created</code> и <code>order_updated</code> со статусами от <code>manual_review</code> до <code>fulfilled</code>, подписанными HMAC<a class="cite" href="#src-4">4</a>.</p>
+
+<figure class="fig wide" id="fig-acp-flow">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant A as Агент (ChatGPT)
+  participant M as Магазин
+  participant S as PSP (Stripe)
+  A->>M: POST /checkout_sessions, Idempotency-Key
+  M-->>A: 201, ready_for_payment, handlers
+  A->>M: POST /checkout_sessions/{id}, доставка
+  M-->>A: 200, пересчитанные totals
+  A->>S: POST /agentic_commerce/delegate_payment, allowance
+  S-->>A: 201, токен vt_…
+  A->>M: POST …/{id}/complete, токен spt
+  M->>S: списание по токену
+  S-->>M: ok, в пределах allowance
+  M-->>A: 200, completed, order
+  M-)A: вебхук order_created
+</script>
+<figcaption>Поток ACP для товара. Агент не передаёт магазину реквизиты карты: он получает у PSP токен, ограниченный суммой, сроком, магазином и конкретной сессией, и отдаёт в <code>complete</code> только его.</figcaption>
+</figure>
+
+<p>Делегированный платёж — единственное место, где данные карты вообще появляются. Платформа агента один раз отправляет их в PSP вызовом <code>POST /agentic_commerce/delegate_payment</code> вместе с объектом <code>allowance</code>: <code>reason: "one_time"</code>, <code>max_amount</code>, <code>currency</code>, <code>checkout_session_id</code>, <code>merchant_id</code>, <code>expires_at</code>. В ответ приходит токен хранилища с префиксом <code>vt_</code><a class="cite" href="#src-4">4</a>. Первая совместимая реализация — Shared Payment Token у Stripe. <code>allowance</code> — прямой аналог ограничений из AP2, только живёт он не в подписанном пользователем документе, а в токене у PSP. Спецификация обработчиков оплаты знает ещё <code>agentic_token</code> с <code>network: "visa"</code> или <code>"mastercard"</code>, то есть сетевой токен карточной системы вместо токена Stripe. OpenAI пишет, что фид и чекаут намеренно вынесены из зоны PCI DSS, а прямая интеграция эндпоинтов делегированного платежа «will likely be in PCI scope»<a class="cite" href="#src-23">23</a>.</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="Complete — запрос (из RFC Agentic Checkout, сокращён)" data-hl="7,10-18">
+{
+  "buyer": { "first_name": "John", "last_name": "Smith", "email": "johnsmith@mail.com" },
+  "payment_data": {
+    "handler_id": "card_tokenized",
+    "instrument": {
+      "type": "card",
+      "credential": { "type": "spt", "token": "spt_123" }
+    }
+  },
+  "authentication_result": {
+    "outcome": "authenticated",
+    "outcome_details": {
+      "three_ds_cryptogram": "AbCdEfGhIjKlMnOpQrStUvWxY0=",
+      "electronic_commerce_indicator": "05",
+      "transaction_id": "dsTransId_abc123",
+      "version": "2.2.0"
+    }
+  }
+}
+</script>
+
+<p><code>authentication_result</code> появился с Delegate Authentication в апреле 2026 года: если сессия в статусе <code>authentication_required</code>, клиент обязан приложить результат 3DS, иначе магазин отвечает ошибкой 4XX.</p>
+
+<h3>Идемпотентность, в которой документация отстаёт от RFC</h3>
+<p>Раздел про идемпотентность переписали по SEP #120, и он разбирает все три варианта повтора<a class="cite" href="#src-4">4</a>. Ключ хранится 24 часа, ответы 5xx против ключа кешировать нельзя.</p>
+
+<table>
+<thead><tr><th>Ситуация</th><th class="num">Код</th><th>Ответ</th><th>Повторять?</th></tr></thead>
+<tbody>
+<tr><td>Тот же ключ, то же тело</td><td class="num">как в первый раз</td><td>исходный ответ и <code>Idempotent-Replayed: true</code></td><td><span class="yes">да</span></td></tr>
+<tr><td>Тот же ключ, другое тело</td><td class="num">422</td><td><code>idempotency_conflict</code></td><td><span class="no">нет, навсегда</span></td></tr>
+<tr><td>Тот же ключ, первый запрос ещё выполняется</td><td class="num">409</td><td><code>idempotency_in_flight</code> и <code>Retry-After</code></td><td><span class="yes">да, после паузы</span></td></tr>
+</tbody>
+</table>
+
+<div class="note warn"><p>Производственный чеклист OpenAI на конец сентября 2026 года называет <code>idempotency_conflict</code> с кодом 409<a class="cite" href="#src-23">23</a>. Нормативен RFC: 422 для другого тела, 409 для запроса в полёте. Магазин, который по чеклисту вернёт 409 на конфликт тел, заставит клиента, написанного по RFC, считать запрос «ещё выполняющимся» и повторять его, пока не истечёт ключ.</p></div>
+
+<p>Самый горячий спор вокруг ACP был не про технику. При запуске OpenAI написала, что магазины платят небольшую комиссию с завершённых покупок, но это «doesn't influence ChatGPT's product results». Тред на Hacker News на 362 комментария прочитал это как обещание, которое невозможно проверить<a class="cite" href="#src-24">24</a>.</p>
+
+<div class="note field">
+<blockquote>The incentives are very strong to prefer instant checkout items.
+<footer>— datadrivenangel, <a href="https://news.ycombinator.com/item?id=45416080">Hacker News, сентябрь 2025</a></footer></blockquote>
+<p>Там же burkaman предположил, что магазины заложат комиссию в цену, а tom1337 ответил, что в ЕС так нельзя, как нельзя переложить на покупателя комиссию процессора. Протокол этот вопрос не решает.</p>
+</div>
+
+<h3>UCP или ACP</h3>
+<p>Оба протокола описывают один и тот же чекаут, и различия у них в деталях, на которых спотыкается адаптер.</p>
+
+<table class="wide">
+<thead><tr><th></th><th>UCP</th><th>ACP</th></tr></thead>
+<tbody>
+<tr><th>Кто ведёт</th><td>Governing Council: Google, Shopify, Stripe</td><td>OpenAI и Stripe, в техкомитете Meta</td></tr>
+<tr><th>Версия на 30.09.2026</th><td>v2026-08-25</td><td>2026-04-17</td></tr>
+<tr><th>Обнаружение</th><td><code>/.well-known/ucp</code> с ключами; профиль платформы в <code>UCP-Agent</code></td><td><code>/.well-known/acp.json</code> без ключей и без <code>merchant_id</code></td></tr>
+<tr><th>Чекаут</th><td><code>/checkout-sessions</code>, обновление <code>PUT</code>, 6 статусов</td><td><code>/checkout_sessions</code>, обновление <code>POST</code>, 11 статусов</td></tr>
+<tr><th>Переговоры</th><td>пересечение профилей по имени и версии capability</td><td>пересечение <code>interventions</code> из запроса агента</td></tr>
+<tr><th>Каталог</th><td>запросы агента: <code>/catalog/search</code>, <code>lookup</code>, <code>product</code></td><td>магазин сам пушит фид: <code>POST /feeds</code></td></tr>
+<tr><th>Транспорты</th><td>REST, MCP, A2A, embedded</td><td>REST, MCP</td></tr>
+<tr><th>Согласие пользователя</th><td>расширение AP2, подпись внутри подписи</td><td><code>allowance</code> на токене PSP; VI как расширение</td></tr>
+<tr><th>Где работает</th><td>AI Mode в Google Поиске, Gemini<a class="cite" href="#src-25">25</a></td><td>ChatGPT, в основном фиды и discovery</td></tr>
+</tbody>
+</table>
+
+<p>Выбор определяется тем, где твои покупатели. Покупают через ChatGPT — начни с ACP-фида и <code>acp.json</code>, через Google — с профиля UCP и Merchant Center. Если магазин на Shopify, большую часть работы платформа сделает за тебя на обоих направлениях. Если чекаут свой, держи одну модель заказа и два тонких адаптера, а не две реализации. Встроенную оплату в чате в сентябре 2026 года не ставь первым приоритетом: OpenAI сама вернула оплату на сайты магазинов, а UCP в трудных случаях всё равно уводит человека по <code>continue_url</code>. Это изменится, если у одной из платформ заметная доля покупок начнёт завершаться внутри чата, и тогда смотреть стоит на статистику собственных <code>requires_escalation</code>.</p>
+</section>
+
+<section id="x402">
+<h2>Оплата внутри HTTP-запроса: x402 и MPP</h2>
+<p>Попроси у сервера из официального FastAPI-примера x402 прогноз погоды, не заплатив, и получишь ответ с пустым телом<a class="cite" href="#src-26">26</a>:</p>
+
+<script type="text/plain" class="code" data-lang="output" data-title="curl к примеру examples/python/servers/fastapi">
+$ curl -i http://localhost:4021/weather
+
+HTTP/1.1 402 Payment Required
+content-type: application/json
+payment-required: <base64-encoded JSON>
+
+{}
+</script>
+
+<p>Всё содержательное лежит в заголовке. Во второй версии протокола, вышедшей 11 декабря 2025 года, тело ответа объявлено делом реализации сервера, а требования к оплате, сам платёж и квитанция ездят в трёх заголовках с base64-JSON: <code>PAYMENT-REQUIRED</code> от сервера, <code>PAYMENT-SIGNATURE</code> от клиента и <code>PAYMENT-RESPONSE</code> от сервера<a class="cite" href="#src-27">27</a>. Раскодированный <code>PAYMENT-REQUIRED</code> выглядит так:</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="PaymentRequired, x402 V2 (из спецификации)" data-hl="11-17">
+{
+  "x402Version": 2,
+  "error": "PAYMENT-SIGNATURE header is required",
+  "resource": {
+    "url": "https://api.example.com/premium-data",
+    "description": "Access to premium market data",
+    "mimeType": "application/json"
+  },
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "eip155:84532",
+      "amount": "10000",
+      "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+      "maxTimeoutSeconds": 60,
+      "extra": { "name": "USDC", "version": "2" }
+    }
+  ],
+  "extensions": {}
+}
+</script>
+
+<p>Сеть записана в формате CAIP-2: <code>eip155:84532</code> — тестовая сеть Base Sepolia, <code>eip155:8453</code> — основная Base. Сумма в атомарных единицах токена: у USDC шесть знаков, так что <code>10000</code> — это один цент. <code>asset</code> — адрес контракта USDC, <code>extra</code> — параметры домена EIP-712 для подписи. <code>accepts</code> — список: сервер из FastAPI-примера предлагает на выбор Base и Solana, клиент берёт то, что умеет.</p>
+
+<p>Для схемы <code>exact</code> в EVM-сетях клиент не отправляет транзакцию сам. Он подписывает разрешение на перевод по EIP-3009 (<code>from</code>, <code>to</code>, <code>value</code>, <code>validAfter</code>, <code>validBefore</code>, <code>nonce</code>), кладёт его вместе с выбранным вариантом <code>accepted</code> в <code>PAYMENT-SIGNATURE</code> и повторяет запрос. Сервер отдаёт подпись <dfn>facilitator</dfn>, стороннему сервису с тремя эндпоинтами: <code>POST /verify</code>, <code>POST /settle</code> и <code>GET /supported</code>. Facilitator отправляет перевод в сеть и платит за газ; распоряжаться деньгами клиента сверх подписанного он не может.</p>
+
+<figure class="fig wide" id="fig-x402-flow">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant C as Клиент-агент
+  participant S as Сервер API
+  participant F as Facilitator
+  participant B as Блокчейн
+  C->>S: GET /weather
+  S-->>C: 402, PAYMENT-REQUIRED
+  Note over C: выбор из accepts, подпись EIP-3009
+  C->>S: GET /weather, PAYMENT-SIGNATURE
+  S->>F: POST /verify
+  F-->>S: подпись и баланс в порядке
+  Note over S: выполняет запрос
+  S->>F: POST /settle
+  F->>B: transferWithAuthorization
+  B-->>F: транзакция подтверждена
+  F-->>S: success, transaction
+  S-->>C: 200, тело и PAYMENT-RESPONSE
+</script>
+<figcaption>Поток <code>authorization</code>, который x402 предлагает по умолчанию: проверить, выполнить, списать. Работа сервера происходит до расчёта, поэтому неудачный расчёт после выполнения — штатный случай, и его надо обрабатывать.</figcaption>
+</figure>
+
+<p>Первая версия протокола, май 2025 года, выглядела иначе: требования в JSON-теле, заголовки <code>X-PAYMENT</code> и <code>X-PAYMENT-RESPONSE</code>, сети по именам вроде <code>base-sepolia</code>, поле <code>maxAmountRequired</code><a class="cite" href="#src-26">26</a>. Обе версии живут одновременно. Разработчик, о котором речь ниже, в сентябре 2026 года запустил сервис, отвечающий в формате V1<a class="cite" href="#src-28">28</a>. Смотри на <code>x402Version</code> и не рассчитывай, что все клиенты уже перешли.</p>
+
+<h3>Схемы, порядок расчёта и двойное списание</h3>
+<p>Схема — логический способ перевести деньги, независимо от сети. В спецификации их четыре: <code>exact</code> (ровно столько), <code>upto</code> (не больше стольких, например оплата сгенерированных токенов по факту), <code>batch-settlement</code> и <code>auth-capture</code> (версия 1.1 от 25 августа 2026 года). В <code>asset</code> можно указать код фиатной валюты по ISO 4217, а 23 сентября 2026 года влили привязку <code>exact</code> для Lightning<a class="cite" href="#src-27">27</a>. Фраза «x402 — это USDC на Base» описывает самый частый случай, а не протокол.</p>
+
+<table>
+<thead><tr><th>Поток</th><th>Порядок</th><th>Когда</th></tr></thead>
+<tbody>
+<tr><td><code>authorization</code></td><td>verify → ресурс → settle → ответ</td><td>по умолчанию; клиенту следует предпочитать его</td></tr>
+<tr><td><code>upfront</code></td><td>settle → ресурс → ответ</td><td>сети, где нельзя «вытянуть» платёж по подписи</td></tr>
+<tr><td><code>escrow</code></td><td>settle → ресурс → settle → ответ</td><td>деньги блокируются заранее, окончательная сумма потом</td></tr>
+</tbody>
+</table>
+
+<p>Инвариант у всех трёх один: «The resource never executes with nothing checked». Двойное списание сам протокол не решает. На вопрос с Hacker News «Does x402 prevent the double-spending problem?» автор x402 ответил, что гарантию даёт сеть расчёта и facilitator<a class="cite" href="#src-29">29</a>. На Solana это проявилось конкретно: RPC отвечает «успех» на каждую повторную отправку той же подписанной транзакции, пока она не подтверждена, потому что дубли отсекаются на консенсусе, а не в RPC. Клиент мог повторить один платёж и открыть несколько ресурсов. Официальные SVM-библиотеки facilitator теперь держат <code>SettlementCache</code> по содержимому транзакции на 120 секунд, с запасом на время жизни blockhash в Solana, 60–90 секунд<a class="cite" href="#src-26">26</a>. Кеш живёт в памяти процесса, так что за несколькими репликами facilitator он защищает только внутри каждой из них. Если транзакция ушла, а подтверждение не получено, facilitator возвращает нетерминальный <code>settlement_pending</code> с хешем, сервер повторяет ровно один раз, а при нескольких репликах общий <code>PendingSettlementStore</code>, например в Redis, не даёт отправить транзакцию дважды.</p>
+
+<p>У <code>exact</code> есть и свойство, о котором примеры молчат: такой платёж не вернуть. Спецификация схемы <code>auth-capture</code> прямо с этого и начинается: «Where <code>exact</code> moves a fixed amount once and offers no way to give it back, <code>auth-capture</code> is for payments … which may later need to be undone». Там клиент авторизует максимум, а дальше у платежа появляется жизненный цикл: <code>capture</code> части суммы, <code>void</code> остатка удержания, <code>refund</code> после списания и <code>reclaim</code>, которым клиент сам забирает удержание, если сервер не списал его до <code>extra.captureDeadline</code>. По умолчанию схема идёт потоком <code>escrow</code>. Операции <code>capture</code>, <code>void</code> и <code>refund</code> клиент не подписывает, поэтому привязка к сети обязана проверять, что их разрешил сервер<a class="cite" href="#src-26">26</a>. Если платежи x402 или MPP принимает Stripe, всё проще: деньги падают на баланс Stripe и выводятся в фиате, а возвраты идут через обычный Refunds API<a class="cite" href="#src-8">8</a>.</p>
+
+<p>Для повторов у x402 есть собственный механизм идемпотентности — расширение <code>payment-identifier</code>. Клиент кладёт в платёж <code>id</code> длиной от 16 до 128 символов, и по нему сервер ресурса, facilitator или оба сразу отбрасывают повторную отправку и отдают закешированный ответ. По сути это <code>Idempotency-Key</code> из ACP, только внутри платёжной нагрузки. В том же каталоге расширений лежит <code>http-message-signatures</code>: подпись RFC 9421 от платящего агента, то есть слой «кто стучится» с первого рисунка главы, который едет прямо внутри x402<a class="cite" href="#src-26">26</a>.</p>
+
+<h3>Платный MCP-тул</h3>
+<p>Тому, кто живёт в Claude Code, ближе всего транспорт x402 для MCP. Тул, за который не заплатили, возвращает обычный результат с <code>isError: true</code>, а <code>PaymentRequired</code> кладёт дважды: в <code>structuredContent</code> и строкой JSON в <code>content[0].text</code>, для клиентов, которые структурированный контент не читают<a class="cite" href="#src-26">26</a>. Клиент с поддержкой x402 повторяет <code>tools/call</code> с платежом в <code>_meta["x402/payment"]</code>, а квитанцию получает в <code>_meta["x402/payment-response"]</code>. Если расчёт не прошёл уже после выполнения тула, сервер не должен отдавать результат, только ошибку оплаты.</p>
+
+<figure class="fig wide" id="fig-x402-mcp">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant L as Модель
+  participant H as MCP-клиент в хосте
+  participant S as MCP-сервер
+  participant F as Facilitator
+  L->>H: вызвать get_weather
+  H->>S: tools/call get_weather
+  S-->>H: isError true, PaymentRequired
+  Note over L,H: без x402 модель видит JSON как текст ошибки
+  H->>S: tools/call, _meta x402/payment
+  S->>F: verify
+  Note over S: выполняет тул
+  S->>F: settle
+  S-->>H: content и _meta x402/payment-response
+  H-->>L: результат тула
+</script>
+<figcaption>x402 поверх MCP. Если хост умеет платить, повтор с платежом происходит без участия модели. Если не умеет, требование оплаты попадает в контекст как обычная ошибка инструмента, и модель решает сама, что с ним делать.</figcaption>
+</figure>
+
+<p>На стороне сервера это обёртка вокруг обычного инструмента FastMCP. Ниже сокращённый пример из репозитория x402:</p>
+
+<script type="text/plain" class="code" data-lang="python" data-title="examples/python/servers/mcp/simple.py (сокращён)" data-hl="16-20,28-31,33">
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import CallToolResult
+from x402.http import FacilitatorConfig, HTTPFacilitatorClientSync
+from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from x402.mcp import (MCPToolResult, SyncPaymentWrapperConfig,
+                      create_payment_wrapper_sync, wrap_fastmcp_tool_sync)
+from x402.schemas import ResourceConfig
+from x402.server import x402ResourceServerSync
+
+mcp_server = FastMCP("x402-mcp-server", host="0.0.0.0", port=PORT)
+resource_server = x402ResourceServerSync(
+    HTTPFacilitatorClientSync(FacilitatorConfig(url=FACILITATOR_URL)))
+resource_server.register("eip155:84532", ExactEvmServerScheme())
+resource_server.initialize()
+
+accepts = resource_server.build_payment_requirements(ResourceConfig(
+    scheme="exact", network="eip155:84532", pay_to=EVM_ADDRESS,
+    price="$0.001", extra={"name": "USDC", "version": "2"}))
+paid_weather = create_payment_wrapper_sync(
+    resource_server, SyncPaymentWrapperConfig(accepts=accepts))
+
+paid_weather_tool = wrap_fastmcp_tool_sync(
+    paid_weather,
+    lambda args, _: MCPToolResult(
+        content=[{"type": "text", "text": json.dumps(get_weather_data(args["city"]))}]),
+    tool_name="get_weather")
+
+@mcp_server.tool()
+def get_weather(city: str, ctx: Context) -> CallToolResult:
+    """Get current weather for a city. Requires payment of $0.001."""
+    return paid_weather_tool({"city": city}, ctx)
+
+mcp_server.run(transport="sse")
+</script>
+
+<p>Обрати внимание на последнюю строку: пример поднимает сервер на транспорте SSE, который в MCP заменили Streamable HTTP ещё в 2025 году, а сама привязка x402 к MCP писалась до ревизии 2026-07-28 без сессий и без <code>initialize</code><a class="cite" href="#src-22">22</a>. Для стенда это неважно, для продакшена проверь совместимость SDK с ревизией, которую поддерживают твои клиенты (транспорты и ревизии — в <a href="../05-mcp/index.html">главе 5</a>).</p>
+
+<h3>MPP: оплата как схема HTTP-аутентификации</h3>
+<p>Machine Payments Protocol, который Stripe и Tempo представили 18 марта 2026 года вместе с запуском сети Tempo<a class="cite" href="#src-15">15</a>, решает ту же задачу, но не изобретает своих заголовков. Он регистрирует в стандартном механизме HTTP-аутентификации новую схему <code>Payment</code><a class="cite" href="#src-30">30</a>:</p>
+
+<script type="text/plain" class="code" data-lang="http" data-title="Вызов MPP (пример из draft-httpauth-payment)">
+HTTP/1.1 402 Payment Required
+Cache-Control: no-store
+WWW-Authenticate: Payment id="x7Tg2pLqR9mKvNwY3hBcZa",
+    realm="api.example.com",
+    method="example",
+    intent="charge",
+    expires="2025-01-15T12:05:00Z",
+    request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QiLCJyZWNpcGllbnQiOiJhY2N0XzEyMyJ9"
+</script>
+
+<p>Клиент повторяет запрос с <code>Authorization: Payment &lt;credential&gt;</code> в base64url, сервер отвечает <code>200</code> с заголовком <code>Payment-Receipt</code>. Для запросов с телом вызов несёт <code>digest</code> по RFC 9530, и при несовпадении хеша тела сервер обязан отвергнуть credential. Каждый ответ, который требует оплаты, — это 402 со свежим вызовом. Главное отличие от x402 в поле <code>method</code>: способ оплаты — зарегистрированный идентификатор, и за ним может стоять как стейблкоин, так и карта. Черновик прошёл путь от индивидуального <code>draft-ryan-httpauth-payment-01</code> до повторной подачи как <code>draft-httpauth-payment-01</code> 9 сентября 2026 года.</p>
+
+<p>Второй автор MPP, Tempo, — блокчейн первого уровня для платежей в стейблкоинах, который инкубировали Stripe и Paradigm; разработчик заявляет финализацию блока примерно за 0,6 секунды без реорганизаций<a class="cite" href="#src-15">15</a>. Stripe принимает оба протокола, и его документация на 30 сентября 2026 года — самая практичная карта этой пары<a class="cite" href="#src-8">8</a>. MPP у Stripe принимает карты через Shared Payment Token и стейблкоины в сетях Tempo (USDC.e) и Solana (USDC). x402 у Stripe — только USDC в сети Base. Для товаров через агентов та же документация отправляет к UCP и ACP, для оплаты за вызов — к MPP и x402.</p>
+
+<div class="stats">
+  <div class="stat"><b>0,50 $</b><span>минимальный платёж картой через SPT в Stripe</span></div>
+  <div class="stat"><b>0,01 USDC</b><span>минимальный расчёт стейблкоином; внутри сессии MPP можно считать доли цента</span></div>
+  <div class="stat"><b>0,6–7,5%</b><span>доля похожего на агентов трафика в x402 по оценке TRM Labs</span></div>
+</div>
+
+<p>Два первых числа объясняют, почему для оплаты API-вызовов понадобились стейблкоины: карточный минимум в 50 центов в пятьдесят раз больше цены вызова из FastAPI-примера и в пятьсот раз больше, чем берёт MCP-тул выше.</p>
+
+<h3>Кто платит на самом деле</h3>
+<p>Команда x402 в декабре 2025 года заявила о более чем 100 млн платежей за первые полгода<a class="cite" href="#src-14">14</a>. Это цифра вендора, и к ней есть независимый противовес. По пересказу PYMNTS, на который ссылается разработчик с Хабра под ником Laratok, TRM Labs разобрала около $52,7 млн платежей x402, почти 199 млн расчётов в Base, Solana и Polygon с мая 2025 года. После фильтрации всего, что не похоже на коммерцию, на агентов пришлось 0,6–7,5% объёма. Остальное — скрипты, плановые задачи и переводы самому себе, которые в блокчейне неотличимы от агентских платежей. Исследователи оговариваются, что методика может занижать долю: агент, который раз за разом покупает один и тот же сервис, выглядит как скрипт<a class="cite" href="#src-28">28</a>. Сам отчёт TRM Labs для этой главы прочитать не удалось, число из вторых рук.</p>
+
+<p>Сам Laratok в сентябре 2026 года собрал на x402 платный API для проверки кода: FastAPI-шлюз, одноразовый контейнер без сети, подпись результата Ed25519, код писал Claude Code. По дороге нашлись четыре бага, и каждый, по словам автора, выглядел как правильно работающий код. Facilitator создавался заново на каждый запрос вместе с пустым множеством использованных nonce, так что ветка <code>nonce_already_used</code> была мёртвым кодом. Из-за захардкоженного порта второй автодеплой отдал 502 при чистых логах. Схему базы никто не применял на managed-Postgres, health check её не трогал, и первый платный запрос упал с <code>UndefinedTableError</code>. А в переменных продакшена стояло <code>FACILITATOR_MODE=mock</code>, и сертификат можно было получить, не заплатив ничего. После запуска в журнале оказалось шесть записей, все — проверочные запросы самого автора.</p>
+
+<div class="note field">
+<blockquote>Декларация — не подтверждённый факт. Все четыре бага — один класс ошибки: что‑то сообщало о себе не то, чем являлось.
+<footer>— Laratok, <a href="https://habr.com/ru/articles/1086276/">Хабр, 24 сентября 2026</a></footer></blockquote>
+<p>Первый баг — тот же класс, что AP2 #346: проверка повтора без состояния, которое переживает запрос. Вывод автора про рынок тоже стоит запомнить: инфраструктура x402 готова и дешёва, массового потока платящих агентов по доступным данным пока нет.</p>
+</div>
+
+<p>1 июля 2026 года Cloudflare запустил Monetization Gateway, возможность брать плату через x402 за любой ресурс в своей сети, и тред на Hacker News набрал 355 очков и 251 комментарий<a class="cite" href="#src-31">31</a>. Защитники говорили о трафике ботов, противники — о том, что платить будут не те. У шлюза есть предыстория, которая ближе к коду: ещё в сентябре 2025 года Cloudflare добавил в Agents SDK обёртку <code>paidTool</code> для MCP-серверов и клиент <code>withX402Client</code>, а краулерам предлагал закрытую бету pay per crawl<a class="cite" href="#src-32">32</a>.</p>
+
+<div class="note field">
+<blockquote>It would be economically impossible for me to run a small personal website without Cloudflare thanks to the sheer quantity of badly behaved automated traffic on the Internet in 2026.
+<footer>— tristor, <a href="https://news.ycombinator.com/item?id=48746914">Hacker News, июль 2026</a></footer></blockquote>
+<p>В том же треде hedora возражал, что если брать деньги только с агентов, люди просто пустят агентов через обычный браузер, а крупные компании закешируют один раз оплаченную копию. Кто в итоге платит за контент, протокол не определяет.</p>
+</div>
+
+<p>Между x402 и MPP выбирай по тому, что у тебя уже есть. Работаешь со Stripe и хочешь принимать карты — MPP. Нужна оплата стейблкоином без Stripe или аудитория уже живёт в крипте — x402 с facilitator. Граница между ними к тому же размывается: с 8 июня 2026 года SDK <code>mppx</code> умеет и потоки x402 <code>exact</code>, так что один клиент говорит на обоих протоколах<a class="cite" href="#src-33">33</a>. Есть и третий, самый старый участник, L402 (бывший LSAT) от Lightning Labs на сети Lightning; в треде о запуске x402 на Hacker News thinkmassive напомнил, что он «has been in production use for half a decade»<a class="cite" href="#src-29">29</a>. Поддержать x402 и MPP на сервере стоит вечер, а не квартал, и только в таком масштабе это сейчас и оправдано: денег от агентов по данным TRM Labs и опыту Laratok пока мало. Если через год доля агентского трафика в x402 вырастет в разы, пересмотри этот вывод первым.</p>
+</section>
+
+<section id="identity">
+<h2>Кто стучится: подписи запросов</h2>
+<p>Так выглядит запрос бота или агента в текущем черновике рабочей группы IETF <code class="wrap">draft-ietf-webbotauth-httpsig-protocol-00</code> от 1 сентября 2026 года. Авторы — Т. Менье из Cloudflare и С. Мейджор из Google<a class="cite" href="#src-1">1</a>.</p>
+
+<script type="text/plain" class="code" data-lang="http" data-title="Web Bot Auth, пример из черновика рабочей группы" data-hl="3-8">
+GET /path/to/resource HTTP/1.1
+Host: origin.example.com
+Signature: sig=abc==
+Signature-Input: sig=("@authority" "signature-agent";key="sig");\
+                 created=1700000000;\
+                 expires=1700011111;\
+                 keyid="ba3e64==";\
+                 tag="web-bot-auth"
+Signature-Agent: sig="https://signer.example.com"
+</script>
+
+<p>Механика — RFC 9421, HTTP Message Signatures. <code>Signature-Input</code> перечисляет, какие части запроса подписаны, и параметры подписи, <code>Signature</code> несёт саму подпись. Проверяющий заново собирает из запроса строку подписи (signature base): по строке на каждый подписанный компонент и последней строкой сами параметры. Потом он проверяет подпись публичным ключом. Черновик Web Bot Auth добавляет к RFC 9421 свои правила. Параметры <code>created</code>, <code>expires</code>, <code>keyid</code> и <code>tag</code> обязательны. <code>keyid</code> — отпечаток JWK по SHA-256, <code>tag</code> равен <code>web-bot-auth</code>, срок жизни подписи рекомендован не больше 24 часов. Подписать нужно хотя бы <code>@authority</code> или <code>@target-uri</code>. Заголовок <code>Signature-Agent</code> говорит, где взять ключ: это словарь структурированных полей, и по умолчанию его значение указывает на каталог ключей <code class="wrap">/.well-known/http-message-signatures-directory</code>, JWKS с типом <code class="wrap">application/http-message-signatures-directory+json</code>. Ключ проверяющий достаёт после первого запроса и кеширует.</p>
+
+<div class="note warn" data-label="Устаревшие примеры"><p>В постах 2025 года и в части заметок встречается форма <code>Signature-Agent: signer.example.com</code> с компонентом <code>"signature-agent"</code> без ключа. В черновике рабочей группы это legacy. Там же сменились имена документов: индивидуальные <code>draft-meunier-web-bot-auth-architecture</code> и <code class="wrap">draft-meunier-http-message-signatures-directory</code> поглощены одним документом рабочей группы.</p></div>
+
+<h3>Visa и Mastercard: те же подписи, другие теги</h3>
+<p>Карточные сети не стали придумывать свой формат. 24 октября 2025 года Cloudflare написал, что «Both Trusted Agent Protocol and Agent Pay leverage Web Bot Auth as the agent authentication layer»<a class="cite" href="#src-2">2</a>. Агента регистрирует сеть, ключи лежат в каталогах, которые держат Visa и Mastercard, а смысл запроса передаёт тег: <code>agent-browser-auth</code>, когда агент смотрит каталог, и <code>agent-payer-auth</code>, когда платит. Подписаны <code>@authority</code> и <code>@path</code>, в параметрах есть <code>nonce</code>. Проверку делает край CDN, до того как запрос дойдёт до магазина.</p>
+
+<figure class="fig wide" id="fig-tap-edge">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant A as Агент
+  participant E as Край CDN
+  participant D as Каталог ключей сети
+  participant O as Сайт магазина
+  A->>E: GET /product, Signature-Input и Signature
+  Note over E,D: заголовки есть, created ≤ now ≤ expires
+  E->>D: ключ по keyid, если нет в кеше
+  D-->>E: публичный ключ
+  Note over E,D: nonce новый, tag agent-browser-auth или agent-payer-auth
+  Note over E,D: собрать signature base, проверить Ed25519
+  E->>O: запрос с отметкой о проверенном агенте
+  O-->>E: страница или чекаут
+  E-->>A: ответ
+</script>
+<figcaption>Семь проверок на краю из поста Cloudflare: наличие заголовков, ключ из каталога сети, окно времени, уникальность nonce, допустимый тег, пересборка строки подписи, проверка Ed25519. Магазину остаётся доверять пометке своего CDN.</figcaption>
+</figure>
+
+<p>Visa выложила открытый образец, <code>visa/trusted-agent-protocol</code>: агент на Python, реестр агентов и CDN-прокси на Node.js<a class="cite" href="#src-34">34</a>. Прокси держит кеш nonce с <code>NONCE_TTL = 3600000</code>, это один час, и отвечает 403 на повтор. А вот подпись в образце стоит прочитать внимательно. Агент собирает строку <code>@signature-params</code> из сырой строки заголовка, с пробелами после точек с запятой, и называет параметр <code>keyId</code>, тогда как в RFC 9421 он <code>keyid</code>, а RFC 8941 разрешает в ключах параметров только строчные буквы. Прокси разбирает заголовок регулярными выражениями и требует метку <code>sig2</code>. Внутри песочницы подписи сходятся, потому что обе стороны ошибаются одинаково. Строгая библиотека RFC 9421 пересоберёт параметры в каноническом виде, без пробелов, и такую подпись, скорее всего, не примет. Образцы кода имеют привычку доезжать до продакшена, так что совместимость с чужой реализацией проверяй на настоящем трафике, а не на песочнице одного вендора.</p>
+
+<p>Подписью TAP не ограничивается. По README того же репозитория, с согласия покупателя магазин получает «via query parameters» его идентификаторы: Payment Account Reference для сохранённых карт, номера программ лояльности, email и телефон<a class="cite" href="#src-34">34</a>. Вывод для бэкенда скучный, но обязательный: URL таких запросов несут персональные данные, и маскировать их нужно до того, как они попадут в access-лог CDN или приложения.</p>
+
+<h3>Что может пойти не так на твоей стороне</h3>
+<p>Подпись только над <code>@authority</code>, по словам самого черновика, «verifies against any method, path, or body sent to that authority until it expires». Visa сужает область через <code>@path</code> и nonce. Тела не покрывает ни один компонент, поэтому агент, которому нужна целостность тела, обязан отправить и подписать <code>Content-Digest</code>.</p>
+
+<p>Собственных требований к nonce черновик не добавляет, он отсылает к разделу 7.2.2 RFC 9421. Если nonce нет, повтор подписанного запроса в пределах окна <code>created</code>–<code>expires</code> проходит проверку, так что для денег храни nonce сам.</p>
+
+<p>Адрес каталога ключей приходит в запросе от незнакомого клиента, и сервер сам идёт по нему. В черновике есть отдельный раздел о SSRF с рекомендацией ограничивать загрузку, и ещё два с говорящими названиями: «Shared Secrets Considered Harmful» и «Key Reuse Considered Harmful».</p>
+
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок: проверка подписи агента (http-message-signatures, не запускался)" data-hl="17-18,23-25">
+import datetime, redis, requests
+from http_message_signatures import HTTPMessageVerifier, HTTPSignatureKeyResolver, algorithms
+
+r = redis.Redis()
+
+class DirectoryResolver(HTTPSignatureKeyResolver):
+    def resolve_public_key(self, key_id: str):
+        # ключ из закешированного каталога доверенного оператора;
+        # адреса каталогов — только из своего allowlist, никогда из запроса как есть
+        return load_cached_key_pem(key_id)
+
+verifier = HTTPMessageVerifier(signature_algorithm=algorithms.ED25519,
+                               key_resolver=DirectoryResolver())
+
+def verify_agent(method: str, url: str, headers: dict) -> dict:
+    prepared = requests.Request(method, url, headers=headers).prepare()
+    result = verifier.verify(prepared, max_age=datetime.timedelta(minutes=10),
+                             expect_tag="web-bot-auth")[0]
+    params = result.parameters
+    nonce = params.get("nonce")
+    if nonce is None:
+        raise PermissionError("без nonce платёжные запросы не принимаем")
+    ttl = int(params["expires"]) - int(params["created"])
+    if not r.set(f"nonce:{nonce}", 1, nx=True, ex=max(ttl, 1)):
+        raise PermissionError("повтор подписи")
+    return result.covered_components   # доверяй только тому, что подписано
+</script>
+
+<p>Библиотека проверяет подпись, окно времени и тег. Уникальность nonce и выбор каталога остаются на тебе. Для тегов Visa и Mastercard передавай в <code>expect_tag</code> свой тег под каждый маршрут: <code>agent-browser-auth</code> на каталоге, <code>agent-payer-auth</code> на оплате.</p>
+
+<div class="note field">
+<blockquote>The problem with this is that key generation is free, so being a well-behaved unknown bot is the same as being an unidentified bot… It is only useful for whitelisting bots, not for banning bad ones, as bad ones can rotate keys.
+<footer>— sneak, <a href="https://news.ycombinator.com/item?id=45055452">Hacker News, август 2025</a></footer></blockquote>
+<p>Это из обсуждения Web Bot Auth на Hacker News<a class="cite" href="#src-35">35</a>. marginalia_nu возражал, что подписи хотя бы дают ботам накапливать репутацию, а mtrovo и binarymax — что верифицированный реестр Cloudflare делает его привратником. Подпись отвечает на вопрос «кто это», но не на вопрос «можно ли ему доверять». Незнакомый подписанный агент для тебя пока ничем не лучше неподписанного.</p>
+</div>
+
+<h3>Know Your Agent: термин без стандарта</h3>
+<p>«KYA» по аналогии с KYC встречается в пресс-релизах часто, но единого стандарта за ним нет. Vouched пишет, что «authored the KYA-OS standard, donated it to the Decentralized Identity Foundation»<a class="cite" href="#src-36">36</a>, но документа под таким именем в открытых материалах DIF найти не удалось. На уровне протоколов под зонтиком KYA на сентябрь 2026 года реально работают три вещи. Регистрация агента у сети плюс подписи RFC 9421 (Visa TAP, Mastercard Agent Pay). Цепочки делегирования от пользователя (мандаты AP2, Verifiable Intent). Каталоги ключей Web Bot Auth. Обе группы IETF, которые занимаются агентами, webbotauth и DAWN, прямо исключают оценку доверия из своей области<a class="cite" href="#src-37">37</a>. Как агенту получать и хранить учётные данные, как делегировать права через OAuth и токен-обмен, подробно разобрано в <a href="../15-integrations-auth/index.html">главе 15</a>.</p>
+
+<p>С Mastercard источники хуже всего: цифры о живых транзакциях Agent Pay в Азии и о пилоте с Santander в Европе встречаются только во вторичных обзорах, а страницы самой Mastercard для автоматического чтения закрыты. Visa публикует больше: 8 апреля 2026 года запущен пилот Intelligent Commerce Connect с семью партнёрами, среди них AWS, Highnote и Payabli, с расширением «throughout 2026»<a class="cite" href="#src-12">12</a>.</p>
+</section>
+
+<section id="discovery">
+<h2>Как агент находит магазин</h2>
+<p>На 30 сентября 2026 года магазин, который хочет, чтобы его нашли агенты, может выставить до шести служебных адресов. Ни один из них не обязателен, и ни один агент не читает их все.</p>
+
+<script type="text/plain" class="code" data-lang="bash" data-title="Набросок: что агент может спросить у магазина">
+curl https://shop.example/.well-known/ucp          # UCP: capabilities, транспорты, ключи
+curl https://shop.example/.well-known/acp.json     # ACP: версия, api_base_url, services
+curl https://shop.example/.well-known/agent-card.json   # A2A: карточка агента магазина
+curl https://shop.example/.well-known/http-message-signatures-directory   # ключи, если магазин сам подписывает запросы
+curl https://shop.example/llms.txt                 # карта текстового контента для моделей
+curl -I https://shop.example/help/returns.html     # Link: markdown-версия страницы и её llms.txt
+</script>
+
+<figure class="fig wide" id="fig-discovery">
+<div class="layers">
+  <div class="layer" data-tone="mute"><b>Имя → адрес</b><span>DNS и mDNS: предлагаемая группа IETF DAWN, черновик DNS-AID. Только первичное обнаружение, без поиска и оценки доверия. Стадия черновиков.</span></div>
+  <div class="layer" data-tone="soft"><b>Индексы и реестры</b><span>NANDA Index (MIT), AGNTCY Agent Directory (Linux Foundation), каталог платных API x402 Bazaar, Stripe Directory.</span></div>
+  <div class="layer" data-tone="accent"><b>Манифесты возможностей</b><span><code>/.well-known/ucp</code>, <code>/.well-known/acp.json</code>, <code>/.well-known/agent-card.json</code>. Работают сейчас.</span></div>
+  <div class="layer"><b>Ключи</b><span><code class="wrap">/.well-known/http-message-signatures-directory</code>, <code>keys[]</code> в профиле UCP.</span></div>
+  <div class="layer" data-tone="ok"><b>Контент и каталог</b><span><code>llms.txt</code> v2 с markdown-версиями страниц, NLWeb поверх разметки Schema.org, товарные фиды.</span></div>
+</div>
+<figcaption>Слои обнаружения агентами на сентябрь 2026 года. Всё, что ниже манифестов, пока в черновиках и исследованиях; всё, что выше, можно выложить сегодня.</figcaption>
+</figure>
+
+<p>DNS-слой самый молодой. Группа DAWN (Discovery of Agents With Names) на сентябрь 2026 года существует как проект устава: версия 00-07 от 11 сентября, в рассмотрении «DNS and mDNS as mechanisms». Устав прямо исключает каталоги возможностей, поиск и ранжирование, управление идентичностью и оценку доверия: «DAWN focuses on this initial discovery only»<a class="cite" href="#src-37">37</a>. Даже став стандартом, DAWN заменит первый DNS-запрос, а не переговоры через <code>/.well-known/ucp</code>.</p>
+
+<p>Индексы пока исследовательские или отраслевые. NANDA Index из MIT хранит по записи на организацию и ведёт от неё к каталогу агентов, записи DNS-AID, карточке A2A или персональной карточке; авторы называют это «first hop in a three-hop resolution chain»<a class="cite" href="#src-38">38</a>. Cisco открыл AGNTCY в марте 2025 года, а 29 июля передал его в Linux Foundation, где соучредителями проекта вместе с Cisco стали Dell, Google Cloud, Oracle и Red Hat<a class="cite" href="#src-50">50</a>. Проект выпускает работающий код: сервис каталога агентов <code>dir</code> v1.7.1 от 22 сентября 2026 года, схему описания агентов OASF v1.1.0 и транспорт сообщений между агентами SLIM v3.0.1 от 30 сентября<a class="cite" href="#src-39">39</a>. Для платных API есть узкие каталоги: x402 Bazaar с <code>GET /discovery/resources</code><a class="cite" href="#src-27">27</a> и Stripe Directory, куда при подаче заявки просят ссылку на твой <code>llms.txt</code><a class="cite" href="#src-8">8</a>.</p>
+
+<h3>llms.txt, вторая версия</h3>
+<p>В августе 2026 года Джереми Говард выпустил вторую версию <code>llms.txt</code> и объяснил, чему научили два года внедрения: «thousands of sites publish an llms.txt file, documentation platforms generate one automatically, and Chrome’s Lighthouse audits sites for one as part of its agentic browsing checks»<a class="cite" href="#src-5">5</a>. Главное изменение — ссылки на markdown-версию страницы и на покрывающий её <code>llms.txt</code> теперь объявляются стандартными отношениями, в HTML-элементе <code>&lt;link&gt;</code> или в HTTP-заголовке:</p>
+
+<script type="text/plain" class="code" data-lang="http" data-title="Link-заголовок из спецификации llms.txt v2">
+Link: </docs/page.html.md>; rel="alternate"; type="text/markdown", </docs/llms.txt>; rel="describedby"
+</script>
+
+<p>Остальные изменения тоже практические. Markdown-версия может называться и <code>page.html.md</code>, и <code>page.md</code>. <code>llms.txt</code> в подкаталоге покрывает страницы под своим путём, и применяется самый специфичный файл, поэтому участвовать может и сайт, которому принадлежит только путь, вроде проекта на GitHub Pages. Раздел <code>Optional</code> больше не несёт механического смысла, а инструмент развёртки файла в контекст из предложения убрали. Для бэкендера с публичным API это самое дешёвое улучшение из всей главы. Спецификация прямо пишет, что в документации ПО «coding agents follow them to find API references and tutorials», и markdown-версия страницы избавляет их от разбора HTML.</p>
+
+<p>Для магазина <code>llms.txt</code> — не замена манифесту. Это карта текстов: условия возврата, размерные сетки, описание API. Ни цен, ни остатков, ни операций в нём нет, и спецификация этого не обещает. NLWeb от Microsoft закрывает соседнюю задачу: это MCP-сервер, который превращает существующую разметку Schema.org (товары, рецепты, отзывы) в интерфейс вопросов и ответов. Авторы формулируют это так: «NLWeb is to MCP/A2A what HTML is to HTTP»<a class="cite" href="#src-40">40</a>.</p>
+
+<div class="note field">
+<blockquote>dark patterns… baked right into your standard
+<footer>— комментатор треда CommerceTXT, <a href="https://news.ycombinator.com/item?id=46289481">Hacker News, декабрь 2025</a></footer></blockquote>
+<p>CommerceTXT предлагал «llms.txt для магазинов» с директивой <code>@SEMANTIC_LOGIC</code>, через которую магазин мог сказать агенту «осталось 3 штуки», когда в поле остатков стоит 42<a class="cite" href="#src-41">41</a>. Манифест он положил в корень сайта, а не в <code>/.well-known/</code>, потому что Shopify и Wix не дают нетехническим продавцам писать в скрытые каталоги. Комментатор с ником robotstxtwasbad назвал это нарушением RFC 8820. Спор «корень или <code>.well-known</code>» повторяется у всего семейства <code>llms.txt</code>, и решается он компромиссом, а не техникой.</p>
+</div>
+
+<p>Карточка A2A нужна, только если у тебя действительно работает агент, с которым можно разговаривать (<a href="../07-a2a/index.html">глава 7</a>). DNS-слой и индексы пока наблюдай со стороны. И помни про ключи: <code>keys[]</code> из профиля UCP верификатор Web Bot Auth прочитает, только если <code>Signature-Agent</code> явно укажет на профиль с <code>type=jwks_uri</code>. По умолчанию он ждёт подписанный каталог по адресу <code class="wrap">/.well-known/http-message-signatures-directory</code><a class="cite" href="#src-3">3</a>.</p>
+</section>
+
+<section id="matrix">
+<h2>Сводная таблица и выбор</h2>
+<p>Строки упорядочены по слоям с первого рисунка главы, сверху вниз.</p>
+
+<table class="wide">
+<thead><tr><th>Протокол</th><th>Слой</th><th>Кто ведёт</th><th>Версия на 30.09.2026</th><th>Криптография</th><th>Обнаружение</th></tr></thead>
+<tbody>
+<tr><th>Web Bot Auth</th><td>кто стучится</td><td>IETF webbotauth</td><td>WG-черновик -00, 1.09.2026</td><td>RFC 9421, каталог JWKS</td><td><code>Signature-Agent</code> и well-known каталог</td></tr>
+<tr><th>Visa TAP, Mastercard Agent Pay</th><td>кто стучится</td><td>Visa, Mastercard</td><td>программы сетей</td><td>RFC 9421 с тегами сетей</td><td>каталоги ключей сетей</td></tr>
+<tr><th>UCP</th><td>что можно</td><td>Google, Shopify, Stripe и советы</td><td>v2026-08-25</td><td>RFC 9421, JWS с JCS</td><td><code>/.well-known/ucp</code></td></tr>
+<tr><th>ACP</th><td>что можно</td><td>OpenAI, Stripe; Meta в TSC</td><td>2026-04-17</td><td>подпись тела, токены хранилища</td><td><code>/.well-known/acp.json</code></td></tr>
+<tr><th>AP2</th><td>разрешил ли человек</td><td>FIDO Alliance</td><td>v0.2.0, 28.04.2026</td><td>SD-JWT VC, <code>cnf</code></td><td>нет, едет внутри UCP и A2A</td></tr>
+<tr><th>Verifiable Intent</th><td>разрешил ли человек</td><td>FIDO Alliance, от Mastercard</td><td>v0.1, 19.02.2026</td><td>слои SD-JWT и KB-SD-JWT</td><td>нет</td></tr>
+<tr><th>x402</th><td>как дойдут деньги</td><td>x402 Foundation (Linux Foundation)</td><td>V2, 11.12.2025</td><td>по схеме: EIP-712 и EIP-3009 и др.</td><td>Bazaar</td></tr>
+<tr><th>MPP</th><td>как дойдут деньги</td><td>Stripe и Tempo, IETF</td><td><code>draft-httpauth-payment-01</code>, 9.09.2026</td><td>по методу оплаты</td><td>Stripe Directory</td></tr>
+</tbody>
+</table>
+
+<p>Где что работает в продуктах на конец сентября 2026 года:</p>
+
+<table class="wide">
+<thead><tr><th>Что</th><th>Где работает</th><th>Оговорка</th></tr></thead>
+<tbody>
+<tr><th>UCP</th><td>AI Mode в Google Поиске и Gemini<a class="cite" href="#src-25">25</a></td><td>релиз v2026-08-25 ломает совместимость; бронирование отелей в черновике</td></tr>
+<tr><th>ACP</th><td>ChatGPT: фиды и discovery, семь крупных ритейлеров</td><td>оплата с марта 2026 года в основном на сайтах магазинов</td></tr>
+<tr><th>AP2</th><td>спецификация в FIDO</td><td>эталонный репозиторий без коммитов с 29.04.2026; подтверждённых первоисточниками внедрений найти не удалось</td></tr>
+<tr><th>x402</th><td>Stripe (USDC на Base), Cloudflare Monetization Gateway (лист ожидания)</td><td>доля агентского трафика 0,6–7,5% по вторичному пересказу TRM Labs</td></tr>
+<tr><th>MPP</th><td>Stripe: карты через SPT, стейблкоины на Tempo и Solana</td><td>стейблкоины недоступны бизнесу в Нью-Йорке</td></tr>
+<tr><th>Web Bot Auth, TAP, Agent Pay</th><td>проверка на краю Cloudflare</td><td>рыночные цифры Agent Pay не проверены по первоисточнику</td></tr>
+<tr><th>Yandex Commerce Protocol</th><td>Алиса: 3500 магазинов на старте в феврале 2026 года<a class="cite" href="#src-42">42</a></td><td>по данным Яндекса, 19 млн пользователей Алисы в неделю, 30% покупок через «универсальный чекаут»<a class="cite" href="#src-43">43</a></td></tr>
+</tbody>
+</table>
+
+<p>Последняя строка — для российского рынка: 27 февраля 2026 года Яндекс объявил собственный протокол для покупок внутри Алисы. Цифры в строке — данные самого Яндекса в пересказе Хабра, без независимой проверки. Автор той же августовской статьи на Хабре построил свой прогноз для российской электронной коммерции на середину 2028 года: полностью автономные покупки в нём занимают 1–3% транзакций, а через чекаут внутри ИИ-ассистента проходит 4–8%<a class="cite" href="#src-43">43</a>. Режим Human Not Present даже в этой модели остаётся нишей.</p>
+
+<figure class="fig wide" id="fig-choice">
+<script type="text/x-mermaid">
+flowchart TD
+  q1{"Что продаёшь агентам?"}
+  q1 -->|"товары"| q2{"Где покупатели?"}
+  q2 -->|"ChatGPT"| acp["ACP-фид и acp.json<br/>оплата на сайте или SPT"]:::accent
+  q2 -->|"Google Поиск, Gemini"| ucp["Профиль UCP, чекаут<br/>и continue_url"]:::accent
+  q1 -->|"вызовы API, данные, тулы"| q3{"Цена вызова?"}
+  q3 -->|"от 0,50 $"| mpp["MPP через Stripe<br/>карта по SPT"]:::ok
+  q3 -->|"центы и меньше"| q4{"Есть Stripe?"}
+  q4 -->|"да"| st["MPP на Tempo или Solana<br/>x402 на Base"]:::ok
+  q4 -->|"нет"| x4["x402 и facilitator"]:::ok
+  q1 -->|"покупки по поручению"| ap2["Приём мандатов AP2 или VI<br/>с атомарным потреблением"]:::warn
+</script>
+<figcaption>Что принимать от агентов, по документации Stripe и состоянию платформ на сентябрь 2026 года. Проверка подписей агентов на краю CDN нужна во всех ветках; ветка с мандатами самая рискованная, и начинать с неё стоит, только если платформа действительно их присылает.</figcaption>
+</figure>
+
+<p>Если свести это к очереди работ для бэкенда на Python, порядок такой. Сначала <code>llms.txt</code> v2 и markdown-версии документации: дёшево, и этим уже пользуются кодовые агенты. Потом манифест и фид под тот канал, где реально твои покупатели. Потом проверка подписей агентов, желательно силами CDN, а не своим кодом. Платные эндпоинты на x402 или MPP — если у тебя есть API, за который кто-то готов платить за вызов, и только после того, как ты проверил этот спрос. Мандаты — последними, когда платформа их пришлёт.</p>
+</section>
+
+<section id="risks">
+<h2>Инъекции, мошенничество, ответственность</h2>
+<p>В препринте Лоука есть эксперимент, который стоит показать целиком. CoralOS скачивает описания агентов из маркетплейса без проверки целостности, и атакующий, который контролирует адрес маркетплейса, подсовывает описание с инструкцией внутри. Доставка такого описания — структурная уязвимость, она срабатывает всегда. А выполнит ли агент подсунутую инструкцию, зависит уже от модели, и это автор измерил: восемь моделей, три температуры, три варианта инъекции, по 20 прогонов, всего 1440 прогонов за $0,72<a class="cite" href="#src-17">17</a>.</p>
+
+<figure class="fig" id="fig-injection">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Агент выполнил инструкцию из отравленного описания", "subtitle": "Уязвимость V5 в CoralOS, доля успешных атак по моделям", "unit": "%", "max": 100,
+ "emphasis": ["gpt-4o-mini", "gemini-2.5-flash", "mistral-large-2512", "gpt-4o"],
+ "rows": [["gpt-4o-mini", 100], ["gemini-2.5-flash", 100], ["mistral-large-2512", 99], ["gpt-4o", 68], ["llama-3.3-70b", 10], ["claude-3-haiku", 0], ["claude-sonnet-4.6", 0], ["gemini-2.5-pro", 0]],
+ "note": "Y. Louck, arXiv 2607.21824, таблица 9: 180 прогонов на модель, 95% доверительный интервал Уилсона, июль 2026."}
+</script>
+<figcaption>Одна и та же отравленная запись в каталоге, восемь моделей. Разброс от 0 до 100%, и он не следует за размером: GPT-4o уязвимее маленькой Llama 3.3 70B, а Claude 3 Haiku из того же лёгкого класса, что GPT-4o-mini и Gemini 2.5 Flash, не поддался ни разу.</figcaption>
+</figure>
+
+<p>Смена модели меняет семантическую половину риска, но не структурную. Отравленная запись доходит до агента всегда, и закрывать это нужно подписью каталога, а не выбором модели. Устоявшие модели, по наблюдению автора, отказывались по разным причинам: Sonnet распознавал инъекцию, Llama подозревала мошенничество, GPT-4o ссылался на политику. Поэтому автор советует не полагаться на самодиагностику модели, а показывать пользователю адрес получателя платежа и чистить поля описаний до того, как они попадут в контекст. Как устроены промпт-инъекции как класс и что против них работает, разобрано в <a href="../16-security/index.html">главе 16</a>.</p>
+
+<h3>От чего защищает мандат и от чего нет</h3>
+<p>Мандаты AP2 закрывают самый страшный сценарий: захваченный агент собирает корзину атакующего и оплачивает её. В режиме Human Present это не проходит. Подпись ставит Trusted Surface, пользователь видит на ней настоящую корзину, а платёжный токен привязан к её хешу. В режиме Human Not Present защита ровно такая, какая рамка у открытого мандата. Широкие ограничения и долгий срок, до 30 дней в Verifiable Intent, дают захваченному агенту свободу внутри рамки, и подписи будут настоящими. Плюс два слабых места из раздела о сбоях: ограничение можно не раскрыть, а мандат — предъявить дважды. Рамку проектируй узкой: конкретные магазины в <code>allowed_merchants</code> и получатели в <code>allowed_payees</code>, <code>amount_range</code> вместо общего бюджета, короткий срок.</p>
+
+<div class="note field">
+<blockquote>confident decision on stale context
+<footer>— novachen, <a href="https://news.ycombinator.com/item?id=47371289">Ask HN «Has anyone built an AI agent that spends real money?», март 2026</a></footer></blockquote>
+<p>В самом подробном ответе треда novachen рассказал, что агенты, которые тратят деньги на кредиты API, вычисления и размещение рекламы, в продакшене уже работают, и главный реальный сбой у них — уверенное решение на устаревших данных, а не сценарий «агент сошёл с ума и потратил $10 000»<a class="cite" href="#src-44">44</a>. От такого сбоя мандат не защищает вообще: всё подписано честно, просто решение неверное. Здесь помогают свежие данные в момент покупки и evals на реальных сценариях (<a href="../17-evals/index.html">глава 17</a>).</p>
+</div>
+
+<p>Мошенничество со стороны самих агентов пока выглядит как старое мошенничество с новым транспортом. Ключи бесплатны, поэтому подпись не отличает честного незнакомца от бота, и магазин по-прежнему опирается на свои антифрод-сигналы. ACP передаёт их явно: в запросе делегированного платежа есть массив <code>risk_signals</code>, например <code class="wrap">{"type": "card_testing", "score": 10, "action": "manual_review"}</code><a class="cite" href="#src-4">4</a>. Заказ от агента для магазина остаётся заказом без физической карты, со всеми обычными проверками, плюс проверка подписи на краю и сохранённые доказательства согласия на случай спора.</p>
+
+<h3>Кто отвечает</h3>
+<p>AP2 формулирует эту проблему в первой же главе, в списке вопросов, на которые текущие системы не отвечают: «Accountability: In the event of a fraudulent or erroneous transaction, who is accountable?»<a class="cite" href="#src-6">6</a>. Протокол даёт доказательства для спора, мандаты и квитанции, но сам на вопрос не отвечает. В ACP распределение записано прямо: OpenAI не выступает продавцом по записи (merchant of record), расчёты, возвраты и чарджбэки остаются на магазине и его PSP<a class="cite" href="#src-23">23</a>.</p>
+
+<p>Право отвечает тем, что не даёт спрятаться за агентом. Калифорнийский закон AB 316, подписанный 13 октября 2025 года (Statutes 2025, ch. 672), запрещает ответчику, который разработал, изменил или использовал ИИ, защищаться тем, что «the artificial intelligence autonomously caused the harm»<a class="cite" href="#src-45">45</a>. Строгой ответственности закон не вводит, остальные защиты сохраняются, но довод «это сделал агент» больше не работает. Автор статьи на Хабре от 29 сентября 2026 года пишет: «Агента нельзя уволить, оштрафовать или засудить»<a class="cite" href="#src-46">46</a>. У ответственности за покупку, которую совершил агент, нет другого адреса, кроме того, кто его запустил.</p>
+
+<div class="note warn" data-label="Частая ошибка"><p>В обзорах 2026 года повторяется утверждение, что статья 26 EU AI Act с 2 августа 2026 года накладывает обязанности на того, кто запускает агента-покупателя. Оно неверно дважды. Статья 26 касается тех, кто применяет системы высокого риска (deployers), а обычный агент для покупок не попадает в перечень приложения III. Сами правила для систем высокого риска по приложению III, по странице Еврокомиссии в редакции от 3 августа 2026 года, после политического соглашения по «AI Omnibus» начнут применяться с 2 декабря 2027 года<a class="cite" href="#src-47">47</a>.</p></div>
+
+<p>Если строишь агента-покупателя, платёжные данные держи вне модели: токен, мандат, лимит на стороне PSP. Выше порога суммы возвращай человека в цикл, для этого в AP2 есть <code>unresolved_constraint</code>, а в UCP — <code>continue_url</code>. Храни всё, что подписано, дольше, чем срок оспаривания платежа. Магазину нужно то же самое с другой стороны: проверять подпись, хранить доказательства и не считать подписанного агента доверенным только потому, что подпись сошлась.</p>
+</section>
+
+<section id="build">
+<h2>Что сделать за вечер</h2>
+<p>Самый короткий путь к пониманию этой главы — поднять платный эндпоинт в тестовой сети и посмотреть на 402 своими глазами. Деньги не нужны: пример x402 работает в Base Sepolia через публичный facilitator <code>https://x402.org/facilitator</code>, а тестовые USDC бесплатны. Пакет <code>x402</code> на PyPI на 30 сентября 2026 года имеет версию 2.25.0 от 29 сентября<a class="cite" href="#src-48">48</a>.</p>
+
+<ol class="steps">
+  <li><b>Подними платный FastAPI-эндпоинт.</b> Возьми <code>examples/python/servers/fastapi</code> из репозитория x402, поставь зависимости через <code>uv add "x402[fastapi,httpx,evm]"</code> и укажи в <code>EVM_ADDRESS</code> свой адрес в Base Sepolia. Сама интеграция — middleware и словарь маршрутов с ценой, код ниже.</li>
+  <li><b>Раскодируй требование оплаты.</b> Сделай запрос без оплаты и достань JSON из заголовка <code>payment-required</code>. Сверь поля с разделом о x402: <code>network</code>, <code>amount</code> в атомарных единицах, <code>payTo</code>.</li>
+  <li><b>Подключи платный MCP-тул к Claude Code.</b> Запусти <code>examples/python/servers/mcp</code> и добавь его командой <code class="wrap">claude mcp add --transport sse weather-paid http://localhost:4022/sse</code>; SSE в документации Claude Code помечен как устаревший («Use HTTP servers instead, where available»), но для локального опыта это не мешает<a class="cite" href="#src-49">49</a>. Попроси агента узнать погоду и посмотри, что попало в контекст: это тот самый <code>isError</code> с <code>PaymentRequired</code>. Кошелёк с деньгами агенту в этом опыте не давай.</li>
+  <li><b>Проверь подпись и повтор.</b> Подпиши запрос своим ключом Ed25519 через <code>http-message-signatures</code> с тегом <code>web-bot-auth</code> и прогони через набросок проверки из раздела о подписях. Второй запрос с тем же <code>nonce</code> должен получить отказ.</li>
+  <li><b>Напиши тесты на идемпотентность и на повтор мандата.</b> Промпт для Claude Code ниже. Для <code>consume_once</code> тест тот же по смыслу: два параллельных вызова через <code>asyncio.gather</code>, ровно один успешный.</li>
+</ol>
+
+<div class="tabs">
+  <section data-tab="main.py">
+  <script type="text/plain" class="code" data-lang="python" data-title="examples/python/servers/fastapi/main.py (сокращён, адрес facilitator подставлен)" data-hl="10-12,14-22">
+  from fastapi import FastAPI
+  from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
+  from x402.http.middleware.fastapi import PaymentMiddlewareASGI
+  from x402.http.types import RouteConfig
+  from x402.mechanisms.evm.exact import ExactEvmServerScheme
+  from x402.server import x402ResourceServer
+
+  app = FastAPI()
+
+  server = x402ResourceServer(HTTPFacilitatorClient(
+      FacilitatorConfig(url="https://x402.org/facilitator")))
+  server.register("eip155:84532", ExactEvmServerScheme())
+
+  routes = {
+      "GET /weather": RouteConfig(
+          accepts=[PaymentOption(scheme="exact", price="$0.01",
+                                 network="eip155:84532", pay_to=EVM_ADDRESS)],
+          mime_type="application/json",
+          description="Weather report",
+      ),
+  }
+  app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
+
+  @app.get("/weather")
+  async def get_weather():
+      return {"weather": "sunny", "temperature": 70}
+  </script>
+  </section>
+  <section data-tab="Раскодировать 402">
+  <script type="text/plain" class="code" data-lang="python" data-title="Набросок: что сервер требует (не запускался)">
+  import base64, json, httpx
+
+  r = httpx.get("http://localhost:4021/weather")
+  assert r.status_code == 402, r.status_code
+  required = json.loads(base64.b64decode(r.headers["payment-required"]))
+  print(json.dumps(required, indent=2))
+  for option in required["accepts"]:
+      print(option["network"], option["amount"], option["payTo"])
+  </script>
+  </section>
+  <section data-tab="Промпт для тестов">
+  <script type="text/plain" class="code" data-lang="prompt" data-title="Задача для Claude Code">
+  Напиши pytest-тесты для POST /checkout_sessions по разделу 6 RFC Agentic Checkout (ACP).
+  1. Тот же Idempotency-Key и то же тело: тот же ответ и заголовок Idempotent-Replayed: true.
+  2. Тот же ключ, другое тело: 422 и code idempotency_conflict.
+  3. Тот же ключ, пока первый запрос ещё выполняется: 409, code idempotency_in_flight
+     и заголовок Retry-After. Задержи обработчик через asyncio.Event.
+  4. Ответ 5xx не кешируется против ключа: после ошибки повтор с тем же ключом
+     выполняется заново.
+  Не меняй код обработчика. Покажи сырой вывод pytest, а не пересказ.
+  </script>
+  </section>
+</div>
+
+<p>Последняя строка промпта взята из опыта Laratok, который собирал свой x402-сервис именно в Claude Code. Два его правила подходят для любой работы с агентом над платёжным кодом: требовать сырой вывод команды вместо пересказа и проверять поведение, а не конфигурацию. Не «переменная <code>PUBLIC_MODE</code> выставлена», а «при этом значении платного маршрута нет в <code>/openapi.json</code>»<a class="cite" href="#src-28">28</a>. Отчёт агента «исправил» — не то же самое, что дифф.</p>
+
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>Агент в режиме Human Not Present предъявил закрытый мандат, и верификатор эталонного SDK AP2 вернул пустой список нарушений. Почему это ещё не значит, что бюджет пользователя соблюдён?</summary><p>Эвалюатор создаётся только для ограничений, которые есть в предъявленном документе. Держатель мог штатно не раскрыть элементы массива <code>constraints</code>, и тогда проверять нечего, а пустой список выглядит как успех (#339). Вдобавок <code>budget.max</code> умножается на 100, и лимит, записанный в минорных единицах, становится в сто раз больше. Проверяющему нужен свой список обязательных ограничений, и отсутствие любого из них — отказ.</p></details>
+<details><summary>Почему проверка nonce не мешает предъявить один и тот же Payment Mandate дважды, и что мешает?</summary><p>Nonce в AP2 выбирает сам Shopping Agent, поэтому он доказывает только то, что предъявление адресовано этому проверяющему, но не что оно первое. Мешает долговременная запись о потреблении: хеш мандата или <code>transaction_id</code> с уникальным ключом, вставленный атомарно до выпуска токена или до платежа, и ошибка <code>mandate_already_used</code> на повторе.</p></details>
+<details><summary>Зачем AP2 требует, чтобы Trusted Surface была неагентной, если подпись всё равно ставит пользователь?</summary><p>Подпись что-то доказывает, только если человек видел ровно то, что подписал. Если текст мандата пользователю показывает модель, она может показать одну корзину, а отдать на подпись другую. Детерминированный код строит и то и другое из одних данных.</p></details>
+<details><summary>Магазин опубликовал в <code>/.well-known/ucp</code> один ключ ES256 и рассчитывает, что верификаторы Web Bot Auth возьмут его оттуда для проверки исходящих запросов магазина. Что пойдёт не так?</summary><p>Верификатор Web Bot Auth читает <code>keys[]</code> из профиля UCP, только если <code>Signature-Agent</code> явно указывает на профиль с <code>type=jwks_uri</code>. По умолчанию он ищет подписанный каталог в <code class="wrap">/.well-known/http-message-signatures-directory</code>. К тому же для подписи HTTP-запросов в этой экосистеме берут Ed25519, а правило AP2 для <code>checkout_jwt</code> требует ECDSA, поэтому на практике ключей два (#268).</p></details>
+<details><summary>Почему подпись магазина в расширении AP2 для UCP считается по JCS-канонической форме JSON, а подпись HTTP-запроса — по <code>Content-Digest</code> сырых байтов?</summary><p>Подпись запроса живёт секунды и проверяется на тех же байтах, что пришли по сети. Мандат — долговременное доказательство, которое идёт от платформы к магазину, PSP и сети, и JSON по дороге могут пересериализовать. Каноническая форма позволяет восстановить подписанные байты у любого участника.</p></details>
+<details><summary>Клиент, написанный по RFC ACP, получает 409 на POST с тем же <code>Idempotency-Key</code>, но с другим телом, от магазина, сделанного по производственному чеклисту OpenAI. Что произойдёт?</summary><p>По RFC 409 значит <code>idempotency_in_flight</code>: первый запрос ещё выполняется, повтори после <code>Retry-After</code>. Клиент будет повторять конфликтный запрос, пока не истечёт ключ (24 часа). Правильный ответ на другое тело — 422 <code>idempotency_conflict</code>, который не повторяют.</p></details>
+<details><summary>В потоке x402 <code>authorization</code> сервер уже выполнил работу, а <code>settle</code> вернул ошибку. Что отдать клиенту, и почему такой порядок вообще допустим?</summary><p>Транспорт x402 для MCP требует отдать только ошибку оплаты, без результата инструмента. Порядок допустим, потому что до выполнения платёж уже проверен через <code>verify</code>: инвариант «The resource never executes with nothing checked» соблюдён, а риск неудачного расчёта сервер принимает на себя. Если этот риск неприемлем, есть поток <code>upfront</code>: сначала расчёт, потом ресурс.</p></details>
+<details><summary>Чем MPP отличается от x402 на уровне HTTP, и почему через MPP у Stripe можно принять карту, а через x402 нельзя?</summary><p>x402 вводит свои заголовки <code>PAYMENT-REQUIRED</code>, <code>PAYMENT-SIGNATURE</code>, <code>PAYMENT-RESPONSE</code>. MPP встраивается в стандартную HTTP-аутентификацию: <code>WWW-Authenticate: Payment</code>, <code>Authorization: Payment</code>, <code>Payment-Receipt</code>, а способ оплаты задаётся зарегистрированным идентификатором <code>method</code>. Поэтому за MPP у Stripe может стоять и карта через SPT, и стейблкоин, а x402 у Stripe — только USDC в сети Base.</p></details>
+<details><summary>Подпись Web Bot Auth покрывает только <code>@authority</code>. Что может сделать тот, кто перехватил такой запрос, и как это закрыть?</summary><p>До истечения подписи её примут для любого метода, пути и тела на этом хосте, а без nonce тот же запрос можно повторить. Закрывается сужением области (<code>@path</code> или <code>@target-uri</code>), подписью <code>Content-Digest</code> для тела, коротким <code>expires</code> и хранением использованных nonce на стороне сервера.</p></details>
+<details><summary>Почему переход на модель, устойчивую к инъекциям, не закрывает уязвимость V5 из препринта Лоука?</summary><p>V5 состоит из двух частей. Доставка отравленного описания из маркетплейса без проверки целостности структурная и срабатывает всегда, при любой модели. Модель влияет только на то, выполнит ли агент подсунутую инструкцию. Закрывает первую часть подпись каталога, а вторую подстраховывают показ получателя платежа пользователю и чистка полей описаний.</p></details>
+<details><summary>Когда открытый мандат AP2 не защищает от захваченного агента, хотя все подписи в цепочке настоящие?</summary><p>Когда рамка широкая: много допустимых магазинов и получателей, общий бюджет вместо диапазона суммы, срок в недели. Захваченный агент законно подписывает закрытые мандаты внутри такой рамки. Мандат ограничивает агента ровно настолько, насколько узко его составили.</p></details>
+<details><summary>У тебя публичный API без товаров. Что из служебных адресов обнаружения ты выложишь первым и почему не <code>/.well-known/ucp</code>?</summary><p><code>llms.txt</code> второй версии и markdown-версии страниц документации со ссылками <code>rel="alternate"</code> и <code>rel="describedby"</code>: ими уже пользуются кодовые агенты. UCP описывает коммерческие операции: каталог, корзину, чекаут, заказы, и без них профиль пуст. Если API платный за вызов, дальше идут x402 или MPP и заявка в каталоги вроде Stripe Directory.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу нарисовать по памяти поток Human Present в AP2 и показать, почему агент в нём ничего не подписывает сам</li>
+  <li>Могу объяснить разницу между открытым и закрытым мандатом и спроектировать узкую рамку ограничений для поручения</li>
+  <li>Писал атомарное потребление мандата или платежа через уникальный ключ в Postgres и тест на два параллельных повтора</li>
+  <li>Могу собрать <code>/.well-known/ucp</code> с чекаутом по REST и ключами и пройти вручную алгоритм пересечения capability</li>
+  <li>Знаю, чем чекауты UCP и ACP различаются по путям, методу обновления и статусам, и могу написать адаптеры к обоим поверх одной модели заказа</li>
+  <li>Реализую идемпотентность по разделу 6 RFC ACP: повтор с <code>Idempotent-Replayed</code>, 422 на другое тело, 409 для запроса в полёте</li>
+  <li>Раскодировал заголовок <code>PAYMENT-REQUIRED</code> x402 V2 и могу объяснить каждое поле, включая CAIP-2 и атомарные единицы суммы</li>
+  <li>Поднимал платный эндпоинт x402 в Base Sepolia и видел ответ 402 через <code>curl -i</code></li>
+  <li>Подключал платный MCP-тул к Claude Code и смотрел, что попадает в контекст модели без оплаты</li>
+  <li>Умею проверить подпись RFC 9421 с нужным тегом, храню использованные nonce и не хожу за каталогом ключей по адресу из запроса без allowlist</li>
+  <li>Беру пресс-релиз об агентных платежах и за пять минут раскладываю каждый упомянутый протокол по четырём слоям главы: где подпись запроса, где мандат, где рельс (например, Agent Pay отдельно от Verifiable Intent)</li>
+  <li>Выложил <code>llms.txt</code> v2 и markdown-версии страниц с заголовком <code>Link</code> для своего API или документации</li>
+  <li>Разбирал проект агента-покупателя на юридические допущения и письменно отметил, какие опираются на статью 26 EU AI Act (не относится к обычному агенту-покупателю) и какие ломает калифорнийский AB 316</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://www.ietf.org/archive/id/draft-ietf-webbotauth-httpsig-protocol-00.txt">draft-ietf-webbotauth-httpsig-protocol-00: HTTP Message Signatures for automated traffic</a>. T. Meunier (Cloudflare), S. Major (Google), IETF, 1 сентября 2026.</li>
+  <li id="src-2"><a href="https://blog.cloudflare.com/secure-agentic-commerce/">Securing agentic commerce: helping AI Agents transact with Visa and Mastercard</a>. Rohin Lohe, Will Allen, Cloudflare, 24 октября 2025.</li>
+  <li id="src-3"><a href="https://github.com/Universal-Commerce-Protocol/ucp/tree/main/docs/specification">Universal Commerce Protocol Specification: Overview, Identity Linking, Order</a>. UCP Authors, GitHub, ветка main на 30 сентября 2026.</li>
+  <li id="src-4"><a href="https://github.com/agentic-commerce-protocol/agentic-commerce-protocol">Agentic Commerce Protocol: changelog 2026-04-17, JSON Schema, RFC Agentic Checkout, Delegate Payment, Discovery</a>. OpenAI и Stripe, GitHub, на 30 сентября 2026.</li>
+  <li id="src-5"><a href="https://llmstxt.org/">The /llms.txt file, v2; Changes — v2 (August 2026)</a>. Jeremy Howard, llmstxt.org, август 2026.</li>
+  <li id="src-6"><a href="https://github.com/google-agentic-commerce/AP2">Agent Payments Protocol (AP2): спецификация v0.2, документация, теги v0.1.0 и v0.2.0, история коммитов</a>. google-agentic-commerce, GitHub; та же документация на ap2-protocol.org, на 30 сентября 2026.</li>
+  <li id="src-7"><a href="https://github.com/agent-intent/verifiable-intent">Verifiable Intent, Draft v0.1</a>. Mastercard, GitHub, версия 0.1.0 от 19 февраля 2026.</li>
+  <li id="src-8"><a href="https://docs.stripe.com/payments/machine">Machine payments</a>. Stripe Docs, на 30 сентября 2026.</li>
+  <li id="src-9"><a href="https://fidoalliance.org/fido-alliance-to-develop-standards-for-trusted-ai-agent-interactions/">FIDO Alliance to Develop Standards for Trusted AI Agent Interactions</a>. FIDO Alliance, 28 апреля 2026.</li>
+  <li id="src-10"><a href="https://x402.org/linux-foundation-announces-operational-launch-of-x402-foundation-to-standardize-internet-native-payments-for-ai-agents-and-applications/">Linux Foundation Announces Operational Launch of x402 Foundation</a>. x402.org, 14 июля 2026.</li>
+  <li id="src-11"><a href="https://github.com/Universal-Commerce-Protocol/ucp/blob/main/docs/documentation/announcements.md">UCP Announcements</a>. UCP, GitHub, записи с 11 января по 25 сентября 2026.</li>
+  <li id="src-12"><a href="https://investor.visa.com/news/news-details/2026/Visa-Opens-the-Door-to-AI-Driven-Shopping-for-Businesses-Worldwide/default.aspx">Visa Opens the Door to AI-Driven Shopping for Businesses Worldwide</a>. Visa, 8 апреля 2026.</li>
+  <li id="src-13"><a href="https://github.com/Universal-Commerce-Protocol/ucp/releases">UCP releases v2026-08-25 и v2026-04-08</a>. UCP, GitHub, 25 августа 2026.</li>
+  <li id="src-14"><a href="https://x402.org/x402-v2-launch/">Introducing x402 V2: Evolving the Standard for Internet-native Payments</a>. Erik Reppel, Carson Roscoe, Josh Nickerson, x402.org, 11 декабря 2025.</li>
+  <li id="src-15"><a href="https://tempo.xyz/blog/mainnet">Tempo Mainnet is live</a>. Tempo, 18 марта 2026; описание сети на <a href="https://tempo.xyz">tempo.xyz</a>, прочитано 30 сентября 2026.</li>
+  <li id="src-16"><a href="https://openai.com/index/powering-product-discovery-in-chatgpt/">Powering product discovery in ChatGPT</a>. OpenAI, 24 марта 2026.</li>
+  <li id="src-17"><a href="https://arxiv.org/abs/2607.21824">Protocol-Level Attacks on Agentic Commerce Platforms: A Cross-Platform Taxonomy, AIP-Bench, and Unified Defense</a>. Y. Louck, arXiv:2607.21824, 23 июля 2026.</li>
+  <li id="src-18"><a href="https://github.com/google-agentic-commerce/AP2/issues">Трекер задач AP2: #268, #339, #346, #358, #361, #362</a>. GitHub, май–сентябрь 2026.</li>
+  <li id="src-19"><a href="https://github.com/Universal-Commerce-Protocol/ucp/tree/main/docs/specification/shopping/checkout">Checkout Capability и Checkout Capability — REST Binding</a>. UCP, GitHub, ветка main на 30 сентября 2026.</li>
+  <li id="src-20"><a href="https://ucp.dev/documentation/core-concepts/">Core Concepts: Payment Architecture, The Trust Triangle, Payment Handlers</a>. Universal Commerce Protocol, ucp.dev, прочитано 30 сентября 2026.</li>
+  <li id="src-21"><a href="https://github.com/Universal-Commerce-Protocol/ucp/blob/main/docs/specification/payment/extensions/ap2-mandates.md">AP2 Mandates Extension</a>. UCP, GitHub, ветка main на 30 сентября 2026.</li>
+  <li id="src-22"><a href="https://github.com/modelcontextprotocol/modelcontextprotocol">Model Context Protocol, ревизия 2026-07-28: Key Changes</a>. modelcontextprotocol, GitHub, 28 июля 2026.</li>
+  <li id="src-23"><a href="https://developers.openai.com/commerce">Agentic Commerce: Get Started, Key concepts, Agentic commerce in production, Delegated Payment Spec, Product Feed spec, File upload overview</a>. OpenAI Developers, на 30 сентября 2026.</li>
+  <li id="src-24"><a href="https://news.ycombinator.com/item?id=45416080">Instant Checkout and the Agentic Commerce Protocol</a>. Обсуждение на Hacker News, 29 сентября 2025, 362 комментария.</li>
+  <li id="src-25"><a href="https://developers.google.com/merchant/ucp">Universal Commerce Protocol</a>. Google for Developers, Merchant, на 30 сентября 2026.</li>
+  <li id="src-26"><a href="https://github.com/x402-foundation/x402">x402-foundation/x402: specs/transports-v1, specs/transports-v2/mcp.md, specs/schemes/auth-capture, specs/extensions, Python SDK, examples/python</a>. x402 Foundation, GitHub, на 30 сентября 2026.</li>
+  <li id="src-27"><a href="https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md">X402 Protocol Specification (Protocol Version 2)</a>. x402 Foundation, GitHub, изменения по 29 сентября 2026.</li>
+  <li id="src-28"><a href="https://habr.com/ru/articles/1086276/">Собрал платный API для ИИ-агентов на x402. Рынка не нашёл — зато нашёл четыре бага</a>. Laratok, Хабр, 24 сентября 2026.</li>
+  <li id="src-29"><a href="https://news.ycombinator.com/item?id=45347335">x402 — An open protocol for internet-native payments</a>. Обсуждение на Hacker News, 23 сентября 2025.</li>
+  <li id="src-30"><a href="https://www.ietf.org/archive/id/draft-ryan-httpauth-payment-01.txt">The „Payment“ HTTP Authentication Scheme: draft-ryan-httpauth-payment-01, повторно подан как draft-httpauth-payment-01</a>. B. Ryan и соавторы (Tempo Labs, Stripe), IETF, 18 марта и 9 сентября 2026.</li>
+  <li id="src-31"><a href="https://news.ycombinator.com/item?id=48746914">Monetization Gateway: Charge for any resource behind Cloudflare via x402</a>. Обсуждение на Hacker News, 1 июля 2026.</li>
+  <li id="src-32"><a href="https://blog.cloudflare.com/x402/">Launching the x402 Foundation with Coinbase, and support for x402 transactions</a>. Cloudflare, 23 сентября 2025.</li>
+  <li id="src-33"><a href="https://mpp.dev/blog/evm-x402-support">EVM and x402 support</a>. MPP, mpp.dev, 8 июня 2026.</li>
+  <li id="src-34"><a href="https://github.com/visa/trusted-agent-protocol">visa/trusted-agent-protocol: tap-agent/agent_app.py, cdn-proxy/server.js</a>. Visa, GitHub, репозиторий создан 10 октября 2025.</li>
+  <li id="src-35"><a href="https://news.ycombinator.com/item?id=45055452">Web Bot Auth</a>. Обсуждение на Hacker News, 28 августа 2025.</li>
+  <li id="src-36"><a href="https://kya.vouched.id/">Know Your Agent (KYA)</a>. Vouched, без даты, прочитано 30 сентября 2026.</li>
+  <li id="src-37"><a href="https://www.ietf.org/charter/charter-ietf-dawn-00-07.txt">Discovery of Agents With Names (DAWN): Proposed Charter, charter-ietf-dawn-00-07</a>. IETF, 11 сентября 2026.</li>
+  <li id="src-38"><a href="https://github.com/projnanda/nanda-index-v2">nanda-index-v2</a>. Project NANDA, MIT Media Lab, GitHub, на 30 сентября 2026.</li>
+  <li id="src-39"><a href="https://github.com/agntcy">AGNTCY: dir v1.7.1, slim v3.0.1, oasf v1.1.0</a>. AGNTCY, Linux Foundation, GitHub, июль–сентябрь 2026.</li>
+  <li id="src-40"><a href="https://github.com/microsoft/NLWeb">NLWeb</a>. Microsoft, GitHub, на 30 сентября 2026.</li>
+  <li id="src-41"><a href="https://news.ycombinator.com/item?id=46289481">Show HN: CommerceTXT – An open standard for AI shopping context (like llms.txt)</a>. Обсуждение на Hacker News, 16 декабря 2025.</li>
+  <li id="src-42"><a href="https://habr.com/ru/companies/bothub/news/1004896/">«Яндекс» создал стандарт для покупок в нейросетях: Yandex Commerce Protocol</a>. Хабр, блог bothub, 28 февраля 2026.</li>
+  <li id="src-43"><a href="https://habr.com/ru/articles/1073168/">Когда покупки станут диалогом агентов: что уже работает, что изменилось за месяц и прогноз на 2 года</a>. Хабр, 21 августа 2026.</li>
+  <li id="src-44"><a href="https://news.ycombinator.com/item?id=47371289">Ask HN: Has anyone built an AI agent that spends real money?</a> Обсуждение на Hacker News, 13 марта 2026.</li>
+  <li id="src-45"><a href="https://leginfo.legislature.ca.gov/faces/billNavClient.xhtml?bill_id=202520260AB316">AB-316 Artificial intelligence: defenses</a>. California Legislature, Statutes 2025, ch. 672, 13 октября 2025.</li>
+  <li id="src-46"><a href="https://habr.com/ru/articles/1088290/">Агента нельзя засудить: почему последняя миля ИИ — это человек</a>. Хабр, 29 сентября 2026.</li>
+  <li id="src-47"><a href="https://digital-strategy.ec.europa.eu/en/policies/regulatory-framework-ai">AI Act</a>. European Commission, Shaping Europe’s digital future, обновлено 3 августа 2026.</li>
+  <li id="src-48"><a href="https://pypi.org/project/x402/">x402 2.25.0</a>. PyPI, 29 сентября 2026.</li>
+  <li id="src-49"><a href="https://code.claude.com/docs/en/mcp">Connect Claude Code to tools via MCP</a>. Anthropic, документация Claude Code, на 30 сентября 2026.</li>
+  <li id="src-50"><a href="https://www.linuxfoundation.org/press/linux-foundation-welcomes-the-agntcy-project-to-standardize-open-multi-agent-system-infrastructure-and-break-down-ai-agent-silos">Linux Foundation Welcomes the AGNTCY Project</a>. Linux Foundation, 29 июля 2025.</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>

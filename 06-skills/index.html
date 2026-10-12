@@ -1,0 +1,1209 @@
+<!doctype html>
+<html lang="ru" data-chapter="06">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Skills — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 6</b> из 17, часть «Протоколы»</p>
+  <h1>Agent Skills</h1>
+  <p class="lead">В январе 2026 года Vercel положил документацию Next.js 16 в скилл и прогнал агента по своим evals. В 56% случаев агент скилл так и не открыл, и результат совпал с прогоном вовсе без документации: 53%. Тот же текст, ужатый до индекса на 8 КБ и вписанный в <code>AGENTS.md</code>, дал 100%<a class="cite" href="#src-1">1</a>. Скилл — папка с markdown-файлом, которую агент открывает сам, когда сочтёт нужным.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="anatomy">
+<h2>Папка с одним обязательным файлом</h2>
+
+<script type="text/plain" class="code wide" data-lang="markdown" data-title="~/.claude/skills/summarize-changes/SKILL.md">
+---
+description: Summarizes uncommitted changes and flags anything risky. Use when the user asks what changed, wants a commit message, or asks to review their diff.
+---
+
+## Current changes
+
+!`git diff HEAD`
+
+## Instructions
+
+Summarize the changes above in two or three bullet points, then list any risks you notice such as missing error handling, hardcoded values, or tests that need updating. If the diff is empty, say there are no uncommitted changes.
+</script>
+
+<p>Это скилл целиком, пример из документации Claude Code<a class="cite" href="#src-2">2</a>. Файл кладётся по указанному пути, и больше ничего не нужно: ни регистрации, ни сервера, ни схемы аргументов. Спросишь в сессии «What did I change?» — модель увидит в списке доступных скиллов описание про незакоммиченные изменения и сама загрузит тело. Наберёшь <code>/summarize-changes</code> — загрузится то же самое, только решение примешь ты. Строку с <code>git diff HEAD</code> модель не увидит вообще: Claude Code выполнит команду раньше и подставит на её место вывод.</p>
+
+<p><dfn>Скилл</dfn> (Agent Skill, в русской речи чаще «скилл», реже «навык») — каталог, в котором обязателен один файл, <code>SKILL.md</code>: YAML-фронтматтер между маркерами <code>---</code> и markdown-тело с инструкциями. Спецификация на agentskills.io предлагает три необязательных подкаталога и разрешает класть рядом что угодно ещё<a class="cite" href="#src-3">3</a>:</p>
+
+<script type="text/plain" class="code" data-lang="text" data-title="Структура каталога по спецификации">
+skill-name/
+├── SKILL.md          # Required: metadata + instructions
+├── scripts/          # Optional: executable code
+├── references/       # Optional: documentation
+├── assets/           # Optional: templates, resources
+└── ...               # Any additional files or directories
+</script>
+
+<p>Своего рантайма у скилла нет. Он не открывает соединений и не объявляет функций. Всё, что он «делает», делает модель обычными инструментами агента: читает файлы, запускает команды в шелле. Поэтому скиллы работают только там, где у агента есть файловая система и выполнение кода. В Claude Code это твоя машина, в Claude API — контейнер code execution, и без этого инструмента API скиллы не подключает<a class="cite" href="#src-4">4</a>. У той же простоты есть цена: скрипт из скилла выполняется с правами агента, то есть с твоими (подробнее <a href="#security">в разделе о безопасности</a>).</p>
+
+<div class="note field">
+<blockquote>I think skills are mainly just a formalization of the markdown plus CLI patterns that people have been using already. The only material difference with skills is that Claude knows to scan them for YAML descriptions on startup.
+<footer>— Simon Willison (simonw), <a href="https://news.ycombinator.com/item?id=45622252">Hacker News, 17 октября 2025</a></footer></blockquote>
+<p>За год это описание не устарело. Новое в скиллах не формат файла, а договорённость: харнесс сам сканирует папки, складывает описания в контекст, а тело подгружает по требованию.</p>
+</div>
+
+<h3>Шесть полей и строгие валидаторы</h3>
+
+<p>Открытая спецификация определяет шесть полей фронтматтера, из них обязательны два<a class="cite" href="#src-3">3</a>:</p>
+
+<table>
+<thead><tr><th>Поле</th><th>Обязательно</th><th>Ограничения</th></tr></thead>
+<tbody>
+<tr><th><code>name</code></th><td><span class="yes">да</span></td><td>1–64 символа: строчные буквы, цифры, дефис; без дефиса в начале, в конце и двух подряд; совпадает с именем каталога</td></tr>
+<tr><th><code>description</code></th><td><span class="yes">да</span></td><td>1–1024 символа; что делает скилл и когда его применять</td></tr>
+<tr><th><code>license</code></th><td><span class="no">нет</span></td><td>название лицензии или файл с ней</td></tr>
+<tr><th><code>compatibility</code></th><td><span class="no">нет</span></td><td>до 500 символов: для какого продукта, какие пакеты, нужна ли сеть</td></tr>
+<tr><th><code>metadata</code></th><td><span class="no">нет</span></td><td>словарь «строка → строка» для своих нужд</td></tr>
+<tr><th><code>allowed-tools</code></th><td><span class="no">нет</span></td><td>заранее одобренные инструменты через пробел; помечено как экспериментальное</td></tr>
+</tbody>
+</table>
+
+<p>Проверяет это эталонный валидатор <code>skills-ref validate ./my-skill</code>. Но у Anthropic свой набор правил поверх спецификации: при загрузке в claude.ai и через Skills API <code>name</code> не может содержать XML-теги и слова «anthropic» и «claude», <code>description</code> — XML-теги<a class="cite" href="#src-4">4</a>. Скилл с именем <code>claude-helper</code> пройдёт <code>skills-ref</code> и не пройдёт загрузку.</p>
+
+<p>Claude Code, наоборот, мягче спецификации. У него все поля необязательны: имя по умолчанию берётся из каталога, а без <code>description</code> описанием станет первая непустая строка тела<a class="cite" href="#src-2">2</a>. Зато полей он понимает около двадцати. К шести стандартным добавлены <code>when_to_use</code>, <code>argument-hint</code>, <code>arguments</code>, <code>disable-model-invocation</code>, <code>user-invocable</code>, <code>disallowed-tools</code>, <code>model</code>, <code>effort</code>, <code>context</code>, <code>agent</code>, <code>background</code>, <code>hooks</code>, <code>paths</code> и <code>shell</code>. Поля про вызов, права и форк разобраны по ходу главы, остальные сведены в таблицу ниже. Пока эти поля живут в <code>~/.claude/skills/</code> или в репозитории, они работают. Стоит загрузить такой скилл в claude.ai или в Skills API, и загрузка падает:</p>
+
+<script type="text/plain" class="code wide" data-lang="output" data-title="Ошибка упаковки скилла с полем из Claude Code">
+Unexpected key(s) in SKILL.md frontmatter: argument-hint. Allowed properties are: allowed-tools, compatibility, description, license, metadata, name
+</script>
+
+<div class="note warn"><p>Claude Code молча игнорирует поле, которого не знает. Имена полей пишутся через дефис, и только <code>when_to_use</code> — через подчёркивание. Строка <code>disable_model_invocation: true</code> не выдаст ошибки и ничего не сделает: модель будет вызывать скилл сама, а ты будешь уверен, что запретил.</p></div>
+
+<table>
+<thead><tr><th>Поле Claude Code</th><th>Что делает</th><th>Сколько действует</th></tr></thead>
+<tbody>
+<tr><th><code>when_to_use</code></th><td>дополнительные сигналы вызова: фразы-триггеры, примеры запросов; дописывается к <code>description</code> в листинге и делит с ним лимит 1&nbsp;536 символов</td><td>пока скилл в листинге</td></tr>
+<tr><th><code>argument-hint</code>, <code>arguments</code></th><td>подсказка в автодополнении вроде <code>[issue-number]</code>; имена позиционных аргументов для подстановки <code>$issue</code></td><td>при вызове</td></tr>
+<tr><th><code>model</code>, <code>effort</code></th><td>модель и уровень effort, пока скилл активен; с <code>context: fork</code> <code>model</code> задаёт модель сабагента</td><td>до конца хода</td></tr>
+<tr><th><code>hooks</code></th><td>хуки, которые Claude Code регистрирует при вызове скилла<a class="cite" href="#src-2">2</a></td><td>до конца сессии</td></tr>
+<tr><th><code>shell</code></th><td><code>bash</code> (по умолчанию) или <code>powershell</code> для <code>!</code>-команд</td><td>при рендере</td></tr>
+</tbody>
+</table>
+
+<h3>Команды стали скиллами</h3>
+
+<p>Если у тебя в репозитории есть <code>.claude/commands/</code>, ты уже пишешь скиллы. В Claude Code v2.1.3 от 9 января 2026 года в changelog появилась строка «Merged slash commands and skills, simplifying the mental model with no change in behavior»<a class="cite" href="#src-5">5</a>. Файл <code>.claude/commands/deploy.md</code> и каталог <code>.claude/skills/deploy/SKILL.md</code> оба создают <code>/deploy</code> и работают одинаково. Командный файл понимает тот же фронтматтер, кроме <code>name</code> и <code>paths</code>, но у него нет каталога для вспомогательных файлов, поэтому для новой команды документация советует сразу делать скилл. При совпадении имён побеждает скилл<a class="cite" href="#src-2">2</a>.</p>
+
+<script type="text/plain" class="code" data-lang="markdown" data-title="fix-issue/SKILL.md (фрагмент примера из документации Claude Code)">
+---
+name: fix-issue
+description: Fix a GitHub issue
+disable-model-invocation: true
+---
+
+Fix GitHub issue $ARGUMENTS following our coding standards.
+</script>
+
+<p>Аргументы работают как раньше в командах. <code>/fix-issue 123</code> подставит <code>123</code> на место <code>$ARGUMENTS</code>; <code>$0</code>, <code>$1</code> берут отдельные аргументы с шелловыми кавычками; если плейсхолдера в теле нет, Claude Code допишет в конец <code>ARGUMENTS: 123</code>. Знак доллара перед цифрой в прозе экранируют: <code>\$1.00</code>. С v2.1.199 скиллы можно ставить цепочкой, <code>/write-tests /fix-issue 123</code> загрузит оба и передаст <code>123</code> каждому<a class="cite" href="#src-2">2</a>.</p>
+
+<p>Куда класть свой скилл, решает, кто его увидит. <code>~/.claude/skills/</code> — во всех твоих проектах на этой машине, но не в облачных сессиях и не в Cowork. <code>.claude/skills/</code> в репозитории — у всех, кто работает с репозиторием, после коммита. Каталог <code>.claude/skills/</code> внутри подпапки монорепозитория подхватится, только когда агент прочитает или изменит файл в этой подпапке. Ещё есть плагины и управляемые настройки организации, о них <a href="#distribution">в разделе о распространении</a>.</p>
+
+</section>
+
+<section id="disclosure">
+<h2>Три уровня загрузки и их цена</h2>
+
+<p>17 августа 2026 года в changelog Claude Code v2.1.234 появилась строка: «Reduced the context cost of loading the built-in <code>claude-api</code> skill from ~200k+ tokens to ~25k by loading reference docs on demand»<a class="cite" href="#src-5">5</a>. Скилл остался тем же, знания в нём тоже. Поменялось одно: справочные документы перестали ехать в контекст вместе с телом и стали читаться, когда понадобятся. Вызов подешевел в восемь раз.</p>
+
+<p>Этот приём называется <dfn>progressive disclosure</dfn> — поэтапное раскрытие, и на нём держится вся идея скиллов. В инженерном блоге Anthropic, где скиллы описали в день анонса, 16 октября 2025 года, их сравнивают с руководством, «that starts with a table of contents, then specific chapters, and finally a detailed appendix»<a class="cite" href="#src-6">6</a>. Оглавление лежит в контексте всегда. Главу открывают, когда она нужна. В приложение заглядывают, только если глава на него сослалась.</p>
+
+<figure class="fig" id="fig-disclosure">
+<div class="layers">
+  <div class="layer" data-tone="accent"><b>1. <code>name</code> + <code>description</code></b><span>При старте сессии, для каждого установленного скилла, в каждом запросе. Около 100 токенов на скилл.</span></div>
+  <div class="layer" data-tone="soft"><b>2. Тело <code>SKILL.md</code></b><span>Когда модель или ты активировали скилл. Целиком, один раз; дальше лежит в истории. Рекомендация — до 5&nbsp;000 токенов и 500 строк.</span></div>
+  <div class="layer"><b>3. <code>references/</code>, <code>assets/</code></b><span>Когда модель сама прочитает файл, на который сослалось тело. Цена — размер прочитанного.</span></div>
+  <div class="layer" data-tone="ok"><b>3. <code>scripts/</code></b><span>Скрипт выполняется в шелле. Код в контекст не попадает, только его вывод.</span></div>
+</div>
+<figcaption>Что из каталога скилла и когда попадает в окно контекста. Всегда платишь только за первую строку, но платишь за неё на каждом ходе и за каждый установленный скилл, даже тот, что ни разу не понадобится.</figcaption>
+</figure>
+
+<p>Цифры <a href="#fig-disclosure">на рисунке</a> — ориентиры из спецификации и документации Claude<a class="cite" href="#src-3">3</a><a class="cite" href="#src-7">7</a>. Руководство agentskills.io для авторов клиентов оценивает первый уровень в 50–100 токенов на скилл<a class="cite" href="#src-8">8</a>, OpenClaw — примерно в 24 токена служебной разметки плюс имя, описание и путь<a class="cite" href="#src-9">9</a>. Порядок один: тридцать установленных скиллов — это несколько тысяч токенов в каждом запросе. С кешированием промпта они дешёвые в деньгах, но место в окне и внимание модели занимают всё равно.</p>
+
+<p>Со вторым уровнем важно другое. Спецификация говорит, что агент «will load this entire file once it's decided to activate a skill»<a class="cite" href="#src-3">3</a>. Частичного чтения тела не бывает, поэтому всё, что нужно не в каждом вызове, из <code>SKILL.md</code> надо выносить. В Claude Code тело после загрузки остаётся в истории до конца сессии, и документация называет каждую его строку «a recurring token cost»<a class="cite" href="#src-2">2</a>.</p>
+
+<p>Самый недооценённый уровень — третий, точнее его половина со скриптами. Документация Claude описывает это так: «When Claude runs <code>validate_form.py</code>, the script's code never loads into the context window. Only its output … consumes tokens»<a class="cite" href="#src-7">7</a>. Валидатор на четыреста строк обходится в контексте ровно в столько, сколько весит его JSON на выходе. Инженерный блог добавляет довод про надёжность: сортировать список генерацией токенов «far more expensive than simply running a sorting algorithm»<a class="cite" href="#src-6">6</a>. Всё детерминированное — разбор файлов, проверки, преобразования форматов — стоит держать в скриптах, а в теле оставить, когда и как их вызывать.</p>
+
+<figure class="fig wide" id="fig-activation">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Ты
+  participant H as Claude Code
+  participant M as Модель
+  participant F as Каталог скилла
+  H->>M: системный промпт и листинг, имя и описание каждого скилла
+  U->>H: What did I change?
+  H->>M: сообщение пользователя
+  M->>H: tool_use Skill, skill = summarize-changes
+  H->>F: читает SKILL.md
+  Note over H,F: выполняет git diff HEAD и подставляет вывод в тело
+  H-->>M: отрендеренное тело одним сообщением
+  M->>H: Read references/risks.md
+  H-->>M: файл целиком
+  M->>H: Bash scripts/check.py
+  H-->>M: только stdout скрипта
+  M->>H: итоговый текст
+  H-->>U: ответ
+</script>
+<figcaption>Активация скилла в Claude Code. Первое сообщение модели харнесс собирает сам, и описание скилла попадает в него до твоего вопроса. Тело подгружается по вызову инструмента <code>Skill</code>, а файлы третьего уровня — обычными <code>Read</code> и <code>Bash</code>. Файлы <code>risks.md</code> и <code>check.py</code> в примере условные.</figcaption>
+</figure>
+
+<p>В Claude API отдельного инструмента для активации нет: там, где <a href="#fig-activation">на схеме</a> стоит вызов <code>Skill</code>, модель читает <code>SKILL.md</code> тем же bash-инструментом code execution. Пример из блога Anthropic так и выглядит: в контексте системный промпт, метаданные скиллов и сообщение пользователя; Claude вызывает bash, чтобы прочитать <code>pdf/SKILL.md</code>; потом решает прочитать ещё и <code>forms.md</code>; потом делает работу<a class="cite" href="#src-6">6</a>. Разница между «прочитать файл» и «вызвать специальный инструмент» важна для харнесса (права, подсчёт использования, <a href="#lifecycle">защита от компакции</a>), но не для автора скилла.</p>
+
+<h3>За экономию токенов платишь ходами</h3>
+
+<p>Каждый уровень — это ещё один вызов инструмента и ещё один круг через модель, то есть задержка и шанс, что модель на этом шаге решит обойтись без чтения. Если скилл нужен в каждой второй задаче и тело у него короткое, три шага вместо нуля — плохой обмен. Внешний замер это подтверждает: в отчёте Workday о продовых агентах поэтапное раскрытие «improves skill-retrieval quality but marginally degrades overall latency»<a class="cite" href="#src-10">10</a>. Это же показала история Vercel из вводки, она разобрана <a href="#versus">в разделе о выборе механизма</a>.</p>
+
+<p>Второй подвох — вложенность. Если тело ссылается на файл, а тот на другой, Claude, по словам руководства Anthropic для авторов, «might use commands like <code>head -100</code> to preview content rather than reading entire files»<a class="cite" href="#src-11">11</a>. Модель честно «прочитала» справочник и не увидела ничего ниже сотой строки. Отсюда правило из спецификации: ссылки из <code>SKILL.md</code> идут на один уровень вглубь, не больше<a class="cite" href="#src-3">3</a>. Длинному справочному файлу ставь оглавление в начало: даже при чтении первых ста строк модель узнает, что ещё в нём есть.</p>
+
+<div class="note practice"><p>В Claude API список скиллов рендерится в системный промпт в фиксированном порядке. Один и тот же набор <code>container.skills</code> даёт попадание в кеш, другой набор — промах<a class="cite" href="#src-4">4</a>. Если в разных запросах одного диалога ты подставляешь разные скиллы «по ситуации», ты каждый раз платишь за префикс заново.</p></div>
+
+</section>
+
+<section id="triggering">
+<h2>Почему скилл не срабатывает</h2>
+
+<p>Через два дня после анонса пользователь Hacker News под ником rane пожаловался, что его скилл для bash не вызывается даже на прямую просьбу написать bash-скрипт. Приписка «CRITICAL:» в начале описания тоже не помогла.</p>
+
+<div class="note field">
+<blockquote>So far not impressed with CC's ability to invoke skills automatically. I made a skill with the unambiguous description: "Use when creating or editing bash scripts" Yet, Claude does not invoke the skill when asked to write a bash script.
+<footer>— rane, <a href="https://news.ycombinator.com/item?id=45626050">Hacker News, 18 октября 2025</a></footer></blockquote>
+<p>Уиллисон ответил в том же треде догадкой: писать bash — ядро работы Claude Code, про инструмент Bash написана большая часть системного промпта, и модель, видимо, считает, что справится без подсказок. Догадка не проверена, но правило из неё выходит рабочее: чем ближе задача к тому, что модель умеет и так, тем реже она потянется к скиллу.</p>
+</div>
+
+<p>Через год Anthropic пишет то же самое о своей модели прямым текстом. В инструкции скилла <code>skill-creator</code>, которым Anthropic предлагает писать другие скиллы, есть абзац: «currently Claude has a tendency to „undertrigger“ skills — to not use them when they'd be useful. To combat this, please make the skill descriptions a little bit „pushy“»<a class="cite" href="#src-12">12</a>.</p>
+
+<h3>Решает модель, а не классификатор</h3>
+
+<p>Между запросом и скиллом нет ни эмбеддингов, ни поиска по ключевым словам. Харнесс кладёт в контекст каталог: имя, описание, иногда путь. Дальше модель решает, вызвать ли инструмент, ровно так же, как решает, звать ли <code>grep</code>. Руководство agentskills.io для авторов клиентов приводит каталог в таком виде<a class="cite" href="#src-8">8</a>:</p>
+
+<script type="text/plain" class="code" data-lang="xml" data-title="Каталог скиллов в системном промпте (пример из руководства agentskills.io)">
+<available_skills>
+  <skill>
+    <name>pdf-processing</name>
+    <description>Extract PDF text, fill forms, merge files. Use when handling PDFs.</description>
+    <location>/home/user/.agents/skills/pdf-processing/SKILL.md</location>
+  </skill>
+</available_skills>
+</script>
+
+<p>Дальше клиенты расходятся. В простом варианте модель читает файл по <code>location</code> обычным чтением. В другом харнесс даёт отдельный инструмент активации, и руководство советует сделать параметр с именем перечислением допустимых скиллов, чтобы модель не могла «активировать» то, чего нет<a class="cite" href="#src-8">8</a>. Отдельный инструмент есть у Claude Code (<code>Skill</code>), у Gemini CLI (<code>activate_skill</code>, и перед активацией там ещё спрашивают согласия пользователя) и у OpenCode (<code>skill({ name })</code>)<a class="cite" href="#src-2">2</a><a class="cite" href="#src-13">13</a><a class="cite" href="#src-14">14</a>. Точный формат листинга в Claude Code не документирован и меняется от версии к версии; документированы инструмент <code>Skill</code>, правила доступа к нему (<code>Skill(commit)</code>, <code>Skill(deploy *)</code>) и бюджет листинга.</p>
+
+<h3>Бюджет листинга</h3>
+
+<p>Описания всех скиллов Claude Code держит в одном листинге, и у листинга есть потолок: 1% контекстного окна модели. Каждая запись (<code>description</code> плюс <code>when_to_use</code>) дополнительно обрезается до 1&nbsp;536 символов. Когда скиллов становится много и листинг не влезает, Claude Code выбрасывает описания, начиная со скиллов, которые ты вызываешь реже всего. Имена остаются, описания пропадают<a class="cite" href="#src-2">2</a>.</p>
+
+<p>Из этого правила следует неприятная петля. Редкий скилл теряет описание, без описания модель его почти не находит, и он становится ещё реже. Хуже всего приходится узким скиллам, которые нужны раз в неделю, то есть как раз тем, ради которых знания и держат на диске, а не в контексте. У Codex похожий механизм: 2% контекста или 8&nbsp;000 символов, и при переполнении сначала укорачиваются описания<a class="cite" href="#src-15">15</a>.</p>
+
+<p>Что с этим делать в Claude Code:</p>
+
+<ul>
+<li>строка Skills в <code>/context</code> показывает размер листинга уже после обрезки, то есть ровно то, что получает модель (до v2.1.196 там был полный размер всех описаний, в разы больше реального);</li>
+<li><code>/doctor</code> оценивает стоимость листинга и называет самых крупных участников, а при переполнении Claude Code пишет предупреждение в лог <code>--debug</code>;</li>
+<li><code>skillListingBudgetFraction</code> поднимает потолок (<code>0.02</code> — 2%), <code>skillListingMaxDescChars</code> меняет лимит на запись;</li>
+<li>в <code>skillOverrides</code> второстепенные скиллы переводятся в <code>"name-only"</code>, чтобы их описания не отъедали место у важных<a class="cite" href="#src-2">2</a>.</li>
+</ul>
+
+<h3>Кто может вызвать и что видит модель</h3>
+
+<p>Видимость скилла задают два поля фронтматтера и настройка <code>skillOverrides</code> в <code>settings.json</code>. Вторая нужна, когда файл скилла трогать не хочешь, например он лежит в общем репозитории. Меню <code>/skills</code> пишет её за тебя в <code>.claude/settings.local.json</code><a class="cite" href="#src-2">2</a>:</p>
+
+<table>
+<thead><tr><th>Настройка</th><th>Ты через <code>/name</code></th><th>Модель сама</th><th>Что модель видит в листинге</th></tr></thead>
+<tbody>
+<tr><th>по умолчанию</th><td><span class="yes">да</span></td><td><span class="yes">да</span></td><td>имя и описание</td></tr>
+<tr><th><code>disable-model-invocation: true</code></th><td><span class="yes">да</span></td><td><span class="no">нет</span></td><td>ничего</td></tr>
+<tr><th><code>user-invocable: false</code></th><td><span class="no">нет</span></td><td><span class="yes">да</span></td><td>имя и описание</td></tr>
+<tr><th><code>skillOverrides: "name-only"</code></th><td><span class="yes">да</span></td><td><span class="part">да, вслепую</span></td><td>только имя</td></tr>
+<tr><th><code>skillOverrides: "user-invocable-only"</code></th><td><span class="yes">да</span></td><td><span class="no">нет</span></td><td>ничего</td></tr>
+<tr><th><code>skillOverrides: "off"</code></th><td><span class="no">нет</span></td><td><span class="no">нет</span></td><td>ничего</td></tr>
+</tbody>
+</table>
+
+<p><code>disable-model-invocation: true</code> — главный рубильник для всего, у чего есть побочные эффекты: <code>/deploy</code>, <code>/commit</code>, отправка сообщений. Причина в документации: «You don't want Claude deciding to deploy because your code looks ready». Попробует модель всё-таки — Claude Code заблокирует вызов и велит не повторять шаги другим способом<a class="cite" href="#src-2">2</a>. Есть ещё <code>paths</code>: список glob-шаблонов, при котором модель подгружает скилл сама, только когда работает с подходящими файлами. Скилл про миграции Alembic с <code>paths: migrations/**</code> не будет маячить в задачах про фронтенд.</p>
+
+<h3>Молчаливые провалы</h3>
+
+<p>Самые неприятные случаи — когда скилл вроде бы на месте, но не может сработать никогда. Claude Code читает фронтматтер, только если открывающий <code>---</code> стоит первой строкой файла; иначе весь файл, маркеры включительно, становится телом. Если YAML между маркерами не разбирается, скилл загружается с пустыми полями. В обоих случаях <code>/name</code> работает, а автоматический вызов — нет, потому что модели нечего сопоставлять с запросом. Ошибку разбора видно только с <code>--debug</code>, а битые файлы разом находит <code class="wrap">claude plugin validate .claude/skills</code> (с v2.1.233)<a class="cite" href="#src-2">2</a>.</p>
+
+<p>Типичный способ сломать YAML — двоеточие в описании. Строка <code class="wrap">description: Use this skill when: the user asks…</code> для парсера YAML — ошибка. Руководство agentskills.io советует авторам клиентов на такой случай запасной разбор с автоматическим закавычиванием<a class="cite" href="#src-8">8</a>, но полагаться на то, что конкретный клиент это делает, не стоит. Бери описание в кавычки. Весь порядок проверки собран <a href="#fig-trigger-debug">на схеме диагностики</a>.</p>
+
+<figure class="fig" id="fig-trigger-debug">
+<script type="text/x-mermaid">
+flowchart TD
+  s["Скилл не вызвался сам"] --> a{"Есть<br/>в /skills?"}
+  a -- нет --> a1["Не загрузился: путь, имя,<br/>вложенный каталог не тронут"]:::warn
+  a -- да --> b{"Модель<br/>знает о нём?"}
+  b -- нет --> b1["Описания нет в листинге:<br/>флаг, override, бюджет,<br/>битый YAML"]:::warn
+  b -- да --> c{"/name<br/>работает?"}
+  c -- нет --> c1["deny-правило Skill<br/>или user-invocable: false"]:::warn
+  c -- да --> d{"Модель умеет<br/>это и так?"}
+  d -- да --> d1["Описание напористее,<br/>when_to_use,<br/>строка в CLAUDE.md"]:::accent
+  d -- нет --> e["Проверить paths<br/>и формулировки"]
+  d1 --> f["Замерить долю вызовов:<br/>plugin eval, skill-creator"]:::ok
+  e --> f
+</script>
+<figcaption>Диагностика скилла, который не вызывается сам. Первые три развилки ловят механические причины, их видно в <code>/skills</code>, в <code>/context</code> и по вопросу «What skills are available?». Четвёртая — случай rane: всё загружено, но модель решает обойтись без скилла, и лечится это только формулировками и замером.</figcaption>
+</figure>
+
+<h3>Обратный сбой: скилл срабатывает не там</h3>
+
+<p>Описание работает в обе стороны. Слишком широкое срабатывает на посторонних запросах и отбирает вызовы у соседнего скилла. Руководство Anthropic для компаний выделяет это в класс проблем Coexistence и требует проверять новый скилл и в одиночку, и вместе с уже установленными<a class="cite" href="#src-16">16</a>. Лечится сужением: описание конкретнее, <code>paths</code> для скилла, привязанного к части репозитория, <code>disable-model-invocation: true</code> для того, что нужно только по команде<a class="cite" href="#src-2">2</a>. Отрицательные запросы для проверки вызова (о них <a href="#authoring">в разделе об авторстве</a>) гоняй по всем установленным скиллам сразу: near-miss, который твой скилл правильно пропустил, мог перехватить соседний.</p>
+
+<h3>Сколько скиллов не срабатывает на самом деле</h3>
+
+<p>Прямых замеров мало. Самый чистый — у Vercel: в их наборе задач по Next.js 16 скилл с документацией не вызывался в 56% прогонов<a class="cite" href="#src-1">1</a>. Отчёт Skill Crossroads от 10 сентября 2026 года прогнал 216 публичных скиллов для Claude Code из 18 репозиториев через линтер и насчитал 69% описаний, которые «won't reliably trigger», из них 40% (87 скиллов) не прошли проверку совсем<a class="cite" href="#src-17">17</a>. Это оценка по рубрике, а не измеренная доля вызовов, но направление с Vercel и с признанием в <code>skill-creator</code> совпадает.</p>
+
+<p>Сколько скиллов ставить, Anthropic не говорит. Руководство для компаний советует ограничивать число одновременно загруженных скиллов, чтобы модель их надёжно находила, и прекратить добавлять, «when performance degrades», замерив это своими evals<a class="cite" href="#src-16">16</a>. Скептики говорили об этом с первого дня.</p>
+
+<div class="note field">
+<blockquote>Anything the model chooses to use is going to waste context and get utilized poorly. Also, the more skills you have, the worse they're going to be. It's subagents v2. Just use slash commands, they work a lot better.
+<footer>— CuriouslyC, <a href="https://news.ycombinator.com/item?id=45608423">Hacker News, 16 октября 2025</a></footer></blockquote>
+<p>Позиция крайняя, но в ней есть рабочая часть. Скилл, который ты всё равно вызываешь руками, честнее пометить <code>disable-model-invocation: true</code>: он перестанет занимать листинг и не будет вызываться невпопад.</p>
+</div>
+
+<p>С сентября 2026 года для уборки есть <code>/skill-doctor</code> (changelog v2.1.261, 4 сентября): он показывает, во что обходится каждый скилл в листинге и как часто его вызывают, и отмечает те, что не вызывались ни разу<a class="cite" href="#src-5">5</a>. Встроенные и корпоративные скиллы в отчёт не попадают.</p>
+
+<div class="note practice"><p>Открой <code>/skill-doctor</code>, отключи через <code>skillOverrides</code> всё, что ни разу не вызывалось, и сравни строку Skills в <code>/context</code> до и после. Для скиллов, которые должны срабатывать сами, заведи пять-шесть запросов, на которых они обязаны вызваться, и прогоняй их после каждой правки описания.</p></div>
+
+</section>
+
+<section id="lifecycle">
+<h2>Что происходит после вызова</h2>
+
+<p>В документации Claude Code есть абзац для тех, кому кажется, что скилл «отвалился» посреди задачи: «If a skill seems to stop influencing behavior after the first response, the content is usually still present and the model is choosing other tools or approaches»<a class="cite" href="#src-2">2</a>. Модель просто перестала следовать тексту, потому что рядом накопились другие сигналы.</p>
+
+<p>Механика такая. Отрендеренное тело <code>SKILL.md</code> входит в разговор одним сообщением и остаётся там на последующих ходах. Файл Claude Code больше не перечитывает. Отсюда совет документации писать в теле «standing instructions rather than one-time steps»: «перед каждым коммитом в этой задаче гоняй тесты», а не «сначала прогони тесты». Второй вариант модель выполнит один раз и будет считать исполненным.</p>
+
+<p>Если ты поправил файл скилла посреди сессии, листинг обновится сам: Claude Code следит за каталогами скиллов. Тело в истории — нет. Оно останется старым, пока скилл не вызовут снова. При повторном вызове Claude Code сравнивает рендер с тем, что уже в контексте. Если текст тот же, модель получает короткую пометку, что скилл уже загружен. Если другой (поменялись аргументы, вывод <code>!</code>-команды или сам файл), в историю ложится ещё одна полная копия<a class="cite" href="#src-2">2</a>. Скилл, который подставляет свежий <code>git diff</code>, при каждом вызове добавляет себя целиком.</p>
+
+<p>Права живут меньше текста. Разрешения из <code>allowed-tools</code> действуют только в тот ход, в котором скилл вызвали, и снимаются, как только ты отправишь следующее сообщение. <code>disallowed-tools</code> и <code>model</code> из фронтматтера тоже действуют до конца хода. Инструкции остаются, а разрешение на <code>git commit</code> без вопроса — нет; чтобы вернуть его, скилл вызывают снова. Дольше всех живут <code>hooks</code>: хук из скилла работает до конца сессии<a class="cite" href="#src-2">2</a>.</p>
+
+<h3>Компакция оставляет пять скиллов</h3>
+
+<p>Когда окно заполняется, Claude Code сжимает историю в сводку (как устроена компакция в целом, разобрано в <a href="../02-context-engineering/index.html">главе 2</a>). Скиллы при этом не пропадают, но переживают её по жёстким правилам: после сводки заново прикрепляется последний вызов каждого скилла, от него берутся первые 5&nbsp;000 токенов, а на все прикреплённые скиллы вместе отведено 25&nbsp;000. Бюджет заполняется начиная с последнего вызванного скилла, поэтому более ранние «can be dropped entirely»<a class="cite" href="#src-2">2</a>.</p>
+
+<figure class="fig wide" id="fig-compaction">
+<svg class="diagram" viewBox="0 0 760 260" role="img" aria-label="Какие скиллы переживают компакцию в Claude Code">
+  <text class="t-sub" x="36" y="32">Вызваны по порядку, тела лежат в истории целиком</text>
+  <rect class="box" x="36" y="44" width="88" height="48" rx="6"/>
+  <text class="t-title" x="80" y="66" text-anchor="middle">A</text>
+  <text class="t-sub" x="80" y="84" text-anchor="middle">1-й</text>
+  <rect class="box" x="136" y="44" width="88" height="48" rx="6"/>
+  <text class="t-title" x="180" y="66" text-anchor="middle">B</text>
+  <text class="t-sub" x="180" y="84" text-anchor="middle">2-й</text>
+  <rect class="box" x="236" y="44" width="88" height="48" rx="6"/>
+  <text class="t-title" x="280" y="66" text-anchor="middle">C</text>
+  <text class="t-sub" x="280" y="84" text-anchor="middle">3-й</text>
+  <rect class="box" x="336" y="44" width="88" height="48" rx="6"/>
+  <text class="t-title" x="380" y="66" text-anchor="middle">D</text>
+  <text class="t-sub" x="380" y="84" text-anchor="middle">4-й</text>
+  <rect class="box" x="436" y="44" width="88" height="48" rx="6"/>
+  <text class="t-title" x="480" y="66" text-anchor="middle">E</text>
+  <text class="t-sub" x="480" y="84" text-anchor="middle">5-й</text>
+  <rect class="box" x="536" y="44" width="88" height="48" rx="6"/>
+  <text class="t-title" x="580" y="66" text-anchor="middle">F</text>
+  <text class="t-sub" x="580" y="84" text-anchor="middle">6-й</text>
+  <rect class="box--accent" x="636" y="44" width="88" height="48" rx="6"/>
+  <text class="t-title" x="680" y="66" text-anchor="middle">G</text>
+  <text class="t-sub" x="680" y="84" text-anchor="middle">7-й</text>
+  <path class="arrow" d="M280,92 L280,146"/>
+  <path class="arrow" d="M380,92 L380,146"/>
+  <path class="arrow" d="M480,92 L480,146"/>
+  <path class="arrow" d="M580,92 L580,146"/>
+  <path class="arrow" d="M680,92 L680,146"/>
+  <text class="t-sub" x="36" y="130">После сводки</text>
+  <rect class="box--ghost" x="36" y="150" width="88" height="48" rx="6"/>
+  <text class="t-red" x="80" y="179" text-anchor="middle">выпал</text>
+  <rect class="box--ghost" x="136" y="150" width="88" height="48" rx="6"/>
+  <text class="t-red" x="180" y="179" text-anchor="middle">выпал</text>
+  <rect class="box--ok" x="236" y="150" width="88" height="48" rx="6"/>
+  <text class="t-mono" x="280" y="179" text-anchor="middle">5 000</text>
+  <rect class="box--ok" x="336" y="150" width="88" height="48" rx="6"/>
+  <text class="t-mono" x="380" y="179" text-anchor="middle">5 000</text>
+  <rect class="box--ok" x="436" y="150" width="88" height="48" rx="6"/>
+  <text class="t-mono" x="480" y="179" text-anchor="middle">5 000</text>
+  <rect class="box--ok" x="536" y="150" width="88" height="48" rx="6"/>
+  <text class="t-mono" x="580" y="179" text-anchor="middle">5 000</text>
+  <rect class="box--ok" x="636" y="150" width="88" height="48" rx="6"/>
+  <text class="t-mono" x="680" y="179" text-anchor="middle">5 000</text>
+  <path class="line" d="M236,218 L724,218"/>
+  <path class="line" d="M236,212 L236,224"/>
+  <path class="line" d="M724,212 L724,224"/>
+  <text class="t-sub" x="480" y="244" text-anchor="middle">общий бюджет 25 000 токенов, заполняется от G к A</text>
+</svg>
+<figcaption>Семь скиллов, каждый длиннее 5&nbsp;000 токенов. После компакции от каждого остаются первые 5&nbsp;000, и бюджет в 25&nbsp;000 кончается на пятом с конца. Два самых ранних исчезают вместе с инструкциями.</figcaption>
+</figure>
+
+<p>Из правил и <a href="#fig-compaction">рисунка</a> следуют два вывода для автора. Всё важное ставь в начало <code>SKILL.md</code>: у длинного скилла после компакции останется только голова. И если задача длинная, а скиллов за сессию вызывалось много, после компакции нужный скилл стоит вызвать повторно. Когда поведение должно соблюдаться всегда, независимо от того, помнит ли модель текст, документация советует не скилл, а хук: его выполняет харнесс, а не модель<a class="cite" href="#src-2">2</a>.</p>
+
+<h3>Команды, которые выполняются до модели</h3>
+
+<p>Строка вида <code>!`команда`</code> в начале строки или после пробела и блок, открытый как <code>```!</code>, выполняются при рендере скилла, до того как текст увидит модель. Вывод встаёт на место плейсхолдера и повторно не сканируется. Выполнение идёт тем же инструментом Bash, что и у модели, с теми же правилами<a class="cite" href="#src-2">2</a>:</p>
+
+<ul>
+<li>рабочий каталог — текущий каталог сессии, и он сдвигается, если модель сделала <code>cd</code>, поэтому пути к своим файлам строят от <code>${CLAUDE_SKILL_DIR}</code> или <code>${CLAUDE_PROJECT_DIR}</code>;</li>
+<li>stderr смешивается со stdout и тоже попадает в текст;</li>
+<li>таймаут две минуты;</li>
+<li>ненулевой код выхода отменяет весь вызов с ошибкой <code class="wrap">Shell command failed for pattern "..."</code>, и модель не видит скилл вообще; исключение — код 1 у команд поиска и сравнения вроде <code>grep</code> и <code>diff</code>;</li>
+<li>каждая команда проходит проверку по правилам доступа; запрет или правило «спросить» (вне auto mode) тоже отменяют вызов, с ошибкой <code class="wrap">Shell command permission check failed for pattern "..."</code>. Спросить разрешения при рендере Claude Code не может, поэтому команды заранее одобряют через <code>allowed-tools</code>.</li>
+</ul>
+
+<script type="text/plain" class="code wide" data-lang="markdown" data-title="Набросок: .claude/skills/pr-check/SKILL.md для сервиса на FastAPI и Alembic">
+---
+name: pr-check
+description: "Checks the current branch before a PR: test failures, model changes without an Alembic migration, risky diffs. Use when the user asks if the branch is ready, wants a PR description, or asks to review the diff."
+allowed-tools: Bash(git diff *) Bash(uv run alembic check *) Bash(uv run pytest *)
+---
+
+## Changed files
+!`git diff --stat origin/main...HEAD`
+
+## Migration state
+!`uv run alembic check || true`
+
+## Instructions
+- Run `uv run pytest -x -q` and report failures with file and line.
+- If the migration state above reports new upgrade operations, stop and ask before generating a migration.
+- Flag raw SQL, dropped columns and changed signatures of public API handlers.
+</script>
+
+<p>В наброске важна строка с <code>alembic check</code>. Эта команда нарочно завершается с ошибкой, если нашла изменения моделей без миграции: так её встраивают в CI<a class="cite" href="#src-18">18</a>. Без <code>|| true</code> скилл отменялся бы ровно тогда, когда он нужнее всего, и ты видел бы ошибку рендера вместо предупреждения про миграцию. Строка <code>allowed-tools</code> здесь не для удобства: без неё проверка прав при рендере оборвала бы вызов на первой же команде, если <code>git diff</code> не разрешён у тебя глобально.</p>
+
+<div class="note warn"><p>Документация советует дописывать <code>|| true</code> к любой команде, которая может законно вернуть ненулевой код, например к проверке, которая выходит с 1, когда нашла проблемы. Для организаций есть рубильник <code class="wrap">"disableSkillShellExecution": true</code> в управляемых настройках: вместо каждой команды в текст подставится <code class="wrap">[shell command execution disabled by policy]</code>. Встроенные и корпоративные скиллы он не трогает.</p></div>
+
+<h3>Скилл в отдельном сабагенте</h3>
+
+<p>Поле <code>context: fork</code> меняет всё выше. Скилл больше не встаёт в твой разговор: Claude Code запускает новый сабагент типа из поля <code>agent</code> (по умолчанию <code>general-purpose</code>, можно <code>Explore</code>, <code>Plan</code> или свой из <code>.claude/agents/</code>), и тело скилла становится его промптом. Документация специально предупреждает о названии: это не форк текущего разговора, историю сабагент не видит<a class="cite" href="#src-2">2</a>. Отличия от обычного вызова сведены <a href="#fig-fork">на рисунке</a>. Как устроены сабагенты сами по себе, разобрано в <a href="../12-deep-agents/index.html">главе 12</a>.</p>
+
+<figure class="fig" id="fig-fork">
+<div class="versus">
+  <div><h4>Обычный вызов</h4><ul><li>Тело ложится в твой разговор и видит всю историю</li><li>Остаётся до конца сессии, после компакции — в пределах 5&nbsp;000 токенов</li><li>Работают все инструменты сессии</li><li>Правки попадают в чекпоинты, <code>/rewind</code> их откатывает</li></ul></div>
+  <div data-tone="ok"><h4><code>context: fork</code></h4><ul><li>Тело становится промптом нового сабагента, истории он не видит</li><li>В основной разговор возвращается только итог</li><li>С v2.1.218 идёт в фоне, с урезанным набором инструментов фоновых агентов</li><li>Правки вне чекпоинтов, откатывать их придётся через git</li></ul></div>
+</div>
+<figcaption>Один и тот же скилл при обычном вызове и в форке. Форк экономит основной контекст, но теряет историю и часть инструментов; для скилла-справочника без задачи он бесполезен.</figcaption>
+</figure>
+
+<p>С v2.1.218 от 22 июля 2026 года форк по умолчанию работает в фоне, и результат приходит, когда готов. <code>background: false</code> возвращает ожидание в том же ходе. В неинтерактивном режиме (<code>-p</code>, Agent SDK) и в запланированных задачах Claude Code ждёт в любом случае<a class="cite" href="#src-5">5</a><a class="cite" href="#src-2">2</a>. Встроенные <code>Explore</code> и <code>Plan</code> не читают <code>CLAUDE.md</code> и git status, так что скилл с <code>agent: Explore</code> видит только свой текст и системный промпт агента. А скилл, в котором одни правила без задачи («используй такие-то соглашения API»), в форке бессмыслен: документация предупреждает, что сабагент получит правила, не получит задания и вернётся ни с чем.</p>
+
+<p>Есть и обратное направление. В определении своего сабагента можно перечислить скиллы в поле <code>skills</code>, и тогда их тела целиком загрузятся при его старте, как справочный материал, без всякого листинга и выбора<a class="cite" href="#src-2">2</a>. Задача с понятным результатом, которую не жалко отдать без контекста, — форк; знания, которые нужны специализированному агенту всегда, — предзагрузка.</p>
+
+</section>
+
+<section id="api">
+<h2>Скиллы вне терминала: API, SDK, Managed Agents</h2>
+
+<div class="tabs">
+  <section data-tab="Запрос">
+  <script type="text/plain" class="code" data-lang="python" data-title="Messages API со скиллом (пример из документации Anthropic)">
+  client = anthropic.Anthropic()
+
+  response = client.messages.create(
+      model="claude-opus-5-5",
+      max_tokens=4096,
+      container={
+          "skills": [{"type": "anthropic", "skill_id": "pptx", "version": "latest"}]
+      },
+      messages=[
+          {"role": "user", "content": "Create a presentation about renewable energy"}
+      ],
+      tools=[{"type": "code_execution_20250825", "name": "code_execution"}],
+  )
+  </script>
+  </section>
+  <section data-tab="pause_turn">
+  <script type="text/plain" class="code" data-lang="python" data-title="Длинная операция: продолжение в том же контейнере (из документации)">
+  # Handle pause_turn for long operations
+  for _ in range(max_retries):
+      if response.stop_reason != "pause_turn":
+          break
+
+      messages.append({"role": "assistant", "content": response.content})
+      response = client.messages.create(
+          model="claude-opus-5-5",
+          max_tokens=4096,
+          container={
+              "id": response.container.id,
+              "skills": [
+                  {
+                      "type": "custom",
+                      "skill_id": "skill_01AbCdEfGhIjKlMnOpQrStUv",
+                      "version": "latest",
+                  }
+              ],
+          },
+          messages=messages,
+          tools=[{"type": "code_execution_20250825", "name": "code_execution"}],
+      )
+  </script>
+  </section>
+  <section data-tab="Файлы">
+  <script type="text/plain" class="code" data-lang="python" data-title="Где искать file_id созданного документа (из документации)">
+  def extract_file_ids(response):
+      file_ids = []
+      for item in response.content:
+          if item.type == "bash_code_execution_tool_result":
+              content_item = item.content
+              if content_item.type == "bash_code_execution_result":
+                  # each content item is a bash_code_execution_output block carrying a file_id
+                  for file in content_item.content:
+                      file_ids.append(file.file_id)
+      return file_ids
+
+
+  for file_id in extract_file_ids(response):
+      file_metadata = client.files.retrieve_metadata(file_id=file_id)
+      file_content = client.files.download(file_id=file_id)
+  </script>
+  </section>
+</div>
+
+<p>От обычного запроса этот отличается двумя местами. В <code>container.skills</code> перечислены скиллы, до 20 штук на запрос. В <code>tools</code> стоит инструмент code execution, без которого скиллу негде жить: его файлы копируются в песочницу по пути <code>/skills/{имя}/</code>, и модель читает их тем же bash, которым потом выполняет скрипты<a class="cite" href="#src-4">4</a>. Каталог называется по <code>name</code> из <code>SKILL.md</code>, а не по идентификатору <code>skill_01…</code>, так что пути внутри скилла от способа загрузки не зависят. Весь путь от загрузки до готового файла — <a href="#fig-api-flow">на схеме ниже</a>.</p>
+
+<p>Скиллы бывают двух типов. <code>anthropic</code> — готовые <code>pptx</code>, <code>xlsx</code>, <code>docx</code> и <code>pdf</code> с версией-датой вроде <code>20251013</code> или <code>latest</code>. <code>custom</code> — твои, с идентификаторами <code>skill_01…</code> и версиями <code>skver_01…</code>. Схема запроса у них одна.</p>
+
+<p>Актуальных версий code execution на сентябрь 2026 года три: <code>code_execution_20250825</code> (bash и файловые операции), <code>code_execution_20260120</code> (плюс сохранение состояния REPL и programmatic tool calling) и <code>code_execution_20260521</code> — тот же рантайм, но описание инструмента сообщает Claude о лимите в 90 секунд на одну Python-ячейку. Все три принимаются без beta-заголовка. Примеры в документации по скиллам используют первую, а свежим <code>web_search_20260209</code> и <code>web_fetch_20260209</code> нужна как минимум вторая<a class="cite" href="#src-19">19</a>.</p>
+
+<figure class="fig wide" id="fig-api-flow">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant App as Твой сервис
+  participant SK as Skills API
+  participant MSG as Messages API
+  participant C as Контейнер
+  participant FL as Files API
+  App->>SK: POST /v1/skills, multipart с каталогом
+  SK-->>App: id skill_01..., latest_version_id skver_01...
+  App->>MSG: container.skills и инструмент code_execution
+  MSG->>C: копирует скилл в /skills/имя/
+  Note over MSG,C: модель читает SKILL.md через bash и запускает скрипты
+  MSG-->>App: stop_reason pause_turn и container.id
+  App->>MSG: тот же container.id, история с ответом
+  MSG-->>App: end_turn, file_id в результате bash
+  App->>FL: files.download с этим file_id
+  FL-->>App: готовый xlsx или pptx
+</script>
+<figcaption>Путь скилла через Claude API. Загружается он один раз и живёт в workspace; в каждом запросе его подключают по идентификатору. Длинная работа прерывается на <code>pause_turn</code>, и продолжать её надо в том же контейнере, иначе созданные файлы останутся в старом.</figcaption>
+</figure>
+
+<h3>Песочница без сети</h3>
+
+<p>Контейнер code execution — Python 3.11 на Linux x86_64, 5 ГиБ памяти, 5 ГиБ диска, один CPU и никакого интернета. Ставить пакеты во время работы нельзя, доступны только предустановленные<a class="cite" href="#src-19">19</a><a class="cite" href="#src-4">4</a>. Контейнер живёт 30 дней с момента создания, после пяти минут простоя его замораживают, и запрос с тем же <code>container.id</code> его поднимает. Первые 1&nbsp;550 часов в месяц на организацию бесплатны, дальше $0,05 за час на контейнер.</p>
+
+<p>Для автора скилла это главное расхождение с Claude Code. Локально скилл ходит в сеть и ставит пакеты, в API тот же <code>SKILL.md</code> не сможет ни того ни другого. Том Макрайт описал это через четыре дня после анонса: в облаке у скиллов «a minimal environment with Python, a few packages, and no ability to install extra dependencies», и скиллу трудно быть переиспользуемым, если он должен работать в двух настолько разных средах<a class="cite" href="#src-20">20</a>. Если скилл нужен и там и там, укажи требования в <code>compatibility</code> и проверь его в контейнере отдельно.</p>
+
+<p>В третьей среде, приложении claude.ai, сеть у скилла, по документации, «full, partial, or no network access» в зависимости от настроек пользователя и администратора<a class="cite" href="#src-7">7</a>:</p>
+
+<table>
+<thead><tr><th>Где работает скилл</th><th>Сеть</th><th>Пакеты</th></tr></thead>
+<tbody>
+<tr><th>Claude Code</th><td><span class="yes">как у любой программы на машине</span></td><td>можно ставить, но локально, не глобально</td></tr>
+<tr><th>claude.ai</th><td><span class="part">полная, частичная или никакой</span></td><td>в документации не описано</td></tr>
+<tr><th>Claude API, Claude Platform on AWS, Microsoft Foundry</th><td><span class="no">нет</span></td><td>только предустановленные</td></tr>
+</tbody>
+</table>
+
+<p>Последняя строка — заодно полный список облаков, где документация обещает скиллы через API; на Foundry для этого нужен вариант развёртывания Hosted on Anthropic<a class="cite" href="#src-7">7</a>. Amazon Bedrock и Google Vertex AI в этом списке не названы. Если ты ходишь к Claude через Bedrock, проверь доступность Skills API до того, как строить на нём решение.</p>
+
+<h3>Загрузка и версии</h3>
+
+<script type="text/plain" class="code" data-lang="python" data-title="Загрузка своего скилла (из документации)">
+from anthropic.lib import files_from_dir
+
+client = anthropic.Anthropic()
+
+skill = client.skills.create(
+    files=files_from_dir("financial_skill"),
+)
+
+print(f"Created skill: {skill.id}")
+print(f"Latest version: {skill.latest_version_id}")
+</script>
+
+<p>Загрузка — multipart-запрос <code>POST /v1/skills</code> с файлами каталога, не больше 30 МБ в распакованном виде. Каждая новая версия — полный снимок, а не дельта: файл, который ты не приложил, в новую версию не попадёт<a class="cite" href="#src-4">4</a>. Если собираешь загрузку в CI из списка изменённых файлов, получишь скилл без половины скриптов. CLI <code>ant apply financial_skill</code> загружает каталог целиком, и в CI надёжнее звать его<a class="cite" href="#src-4">4</a>.</p>
+
+<p>Skills API вышел из беты. Заголовок <code>anthropic-beta: skills-2025-10-02</code> больше не нужен, но запросы с ним продолжают работать и возвращают старые формы ответов. Если переписываешь интеграцию, вот что поменялось<a class="cite" href="#src-4">4</a>:</p>
+
+<table>
+<thead><tr><th>Что</th><th>В бете</th><th>Сейчас</th></tr></thead>
+<tbody>
+<tr><th>Название</th><td><code>display_title</code>, до 64 символов, уникальное</td><td><code>display_name</code>, до 255, не уникальное, по умолчанию из <code>name</code></td></tr>
+<tr><th>Последняя версия</th><td><code>latest_version</code>, строка с микросекундами эпохи</td><td><code>latest_version_id</code> вида <code>skver_…</code></td></tr>
+<tr><th><code>source</code></th><td>строка <code>"custom"</code></td><td>объект <code>{"type": "custom"}</code></td></tr>
+<tr><th>Удаление скилла</th><td>400, пока есть версии</td><td>удаляет скилл вместе со всеми версиями</td></tr>
+<tr><th>SDK</th><td><code>client.beta.skills</code></td><td><code>client.skills</code>; с Python SDK 1.2.0 и TypeScript SDK 0.122.0 и beta-пространство не шлёт заголовок</td></tr>
+</tbody>
+</table>
+
+<div class="note warn"><p>Строка про удаление опасна. Старый код мог полагаться на то, что API откажется удалять скилл с версиями. Теперь <code>client.skills.delete(skill_id)</code> молча удаляет всё. Если отказ служил предохранителем, проверку придётся написать самому.</p></div>
+
+<p>Скиллы доступны всему workspace: любой API-ключ с доступом к нему может читать, вызывать и удалять любой скилл, загруженный в этот workspace, и для мультитенантной платформы документация советует отдельный workspace на каждого клиента (по умолчанию их до 100 на организацию)<a class="cite" href="#src-4">4</a>. И скиллы не входят в соглашения о zero data retention: определения и данные выполнения хранятся по стандартной политике Anthropic.</p>
+
+<h3>Managed Agents и Agent SDK</h3>
+
+<p>В Claude Managed Agents (бета, заголовок <code>managed-agents-2026-04-01</code>) скиллы задают прямо в определении агента, до 500 на сессию<a class="cite" href="#src-21">21</a>:</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="Агент со скиллами (из документации Managed Agents)">
+{
+  "name": "Financial Analyst",
+  "model": "claude-opus-5-5",
+  "system": "You are a financial analysis agent.",
+  "skills": [
+    {"type": "anthropic", "skill_id": "xlsx"},
+    {"type": "custom", "skill_id": "skill_01AbCdEfGhIjKlMnOpQrStUv", "version": "latest"}
+  ]
+}
+</script>
+
+<p>Каждый лишний скилл, по документации, удлиняет старт песочницы. Второй путь — подключить к сессии GitHub-репозиторий: в облачных песочницах платформа сама найдёт в его корне <code>.claude/skills</code>. Здесь же предупреждение: всякий, кто может коммитить в репозиторий, меняет инструкции агента, и платформа загружает их «at session start without a review step»<a class="cite" href="#src-21">21</a>.</p>
+
+<p>Claude Agent SDK берёт скиллы только с диска, программного API для их регистрации нет<a class="cite" href="#src-22">22</a>. Параметр <code>skills</code> принимает <code>"all"</code>, список имён или пустой список, а загрузка зависит от <code>setting_sources</code>:</p>
+
+<script type="text/plain" class="code" data-lang="python" data-title="Скиллы в Claude Agent SDK (из документации)">
+options = ClaudeAgentOptions(
+    cwd=os.getcwd(),  # .claude/skills/ here or in a parent directory
+    setting_sources=["user", "project"],  # Load skills from filesystem
+    skills="all",  # Let Claude invoke every discovered skill
+    allowed_tools=["Read", "Write", "Bash"],
+)
+</script>
+
+<p>С <code>setting_sources=[]</code> не загрузится ни один скилл, и это частая причина вопроса «почему в SDK скиллов нет, а в терминале есть». Обратная ловушка: скилл, не попавший в список, модель не видит, и инструмент <code>Skill</code> его не запустит, но его файлы «remain on disk and stay reachable through Read and Bash»<a class="cite" href="#src-22">22</a>. Список скиллов в SDK — фильтр для удобства, а не граница безопасности.</p>
+
+</section>
+
+<section id="standard">
+<h2>Открытый стандарт и его швы</h2>
+
+<p>Положи скилл <code>deploy</code> в <code>~/.claude/skills/</code> и одноимённый в <code>.claude/skills/</code> репозитория. Claude Code на <code>/deploy</code> запустит твой личный: у него корпоративный уровень выше личного, а личный выше проектного<a class="cite" href="#src-2">2</a>. Руководство agentskills.io для авторов клиентов считает правильным обратный порядок и называет «project-level skills override user-level skills» «the universal convention»<a class="cite" href="#src-8">8</a>. Gemini CLI и OpenClaw так и делают<a class="cite" href="#src-13">13</a><a class="cite" href="#src-9">9</a>. Codex одноимённые скиллы вообще не сливает и показывает в выборе оба<a class="cite" href="#src-15">15</a>. Три порядка рядом — <a href="#fig-precedence">на рисунке</a>.</p>
+
+<figure class="fig wide" id="fig-precedence">
+<div class="versus">
+  <div data-tone="warn"><h4>Claude Code</h4><ul><li>1. корпоративный (managed settings)</li><li>2. личный, <code>~/.claude/skills</code></li><li>3. проектный, <code>.claude/skills</code></li><li>вложенный и плагинный грузятся рядом под своими именами: <code>/apps/web:deploy</code>, <code>/plugin:deploy</code></li><li>синхронизированный из claude.ai уступает всем и зовётся <code>/anthropic-skills:deploy</code></li></ul></div>
+  <div data-tone="ok"><h4>Gemini CLI, OpenClaw, гайд agentskills.io</h4><ul><li>1. проектный (workspace)</li><li>2. пользовательский</li><li>3. расширения и управляемые</li><li>4. встроенные</li><li>в Gemini внутри одного уровня <code>.agents</code> побеждает <code>.gemini</code></li></ul></div>
+  <div data-tone="mute"><h4>Codex</h4><ul><li>одноимённые скиллы не сливаются</li><li>оба видны в выборе, модель и пользователь различают их по описанию</li></ul></div>
+</div>
+<figcaption>Кто побеждает, если скилл с одним именем лежит и у тебя, и в репозитории. В Claude Code твоя личная копия молча перекрывает командную, и коллега с тем же репозиторием работает по другой инструкции. В клиентах, которые следуют руководству agentskills.io, всё наоборот.</figcaption>
+</figure>
+
+<p>Сам стандарт устроен проще, чем можно подумать по слову «стандарт». 18 декабря 2025 года Anthropic объявила: «We've published Agent Skills as an open standard for cross-platform portability»<a class="cite" href="#src-23">23</a>. Спецификация на agentskills.io — одна страница без номера версии: шесть полей, свободное тело, три рекомендованных каталога, поэтапное раскрытие, ссылки в один уровень и валидатор <code>skills-ref</code><a class="cite" href="#src-3">3</a>.</p>
+
+<ol class="timeline">
+  <li class="is-major"><time>16 октября 2025</time><p>Anthropic выпускает Agent Skills в Claude, Claude Code, Agent SDK и API.</p></li>
+  <li class="is-major"><time>18 декабря 2025</time><p>Формат публикуется как открытый стандарт на agentskills.io.</p></li>
+  <li><time>9 января 2026</time><p>Claude Code v2.1.3 сливает команды и скиллы.</p></li>
+  <li><time>6 августа 2026</time><p>OpenAI, Amazon, Microsoft, Cursor и Vercel объявляют стандарт Agent Plugins, который упаковывает скиллы вместе с MCP-серверами.</p></li>
+  <li><time>9 августа 2026</time><p>OpenClaw и Hermes Agent появляются в списке клиентов на agentskills.io.</p></li>
+  <li class="is-major"><time>11 сентября 2026</time><p>Расширение MCP для доставки скиллов (SEP-2640) получает статус Final.</p></li>
+  <li><time>17 сентября 2026</time><p>Claude Code v2.1.275 начинает подтягивать скиллы из аккаунта claude.ai.</p></li>
+</ol>
+
+<p>На 30 сентября 2026 года в списке клиентов на agentskills.io 46 записей<a class="cite" href="#src-24">24</a>. Список — это логотипы, и проверять стоит по документации самих продуктов. Как крупные клиенты читают один и тот же формат:</p>
+
+<table class="wide">
+<thead><tr><th>Клиент</th><th>Где ищет</th><th>Как активирует</th><th>Одинаковые имена</th><th>Бюджет листинга</th></tr></thead>
+<tbody>
+<tr><th>Claude Code</th><td><code>.claude/skills</code> (и родители до корня репо), <code>~/.claude/skills</code>, managed, плагины, синк claude.ai</td><td>инструмент <code>Skill</code>, <code>/name</code></td><td>enterprise &gt; personal &gt; project</td><td>1% окна, 1&nbsp;536 символов на запись</td></tr>
+<tr><th>Codex, ChatGPT</th><td><code>.agents/skills</code> от текущего каталога до корня репо, <code>~/.agents/skills</code>, <code>/etc/codex/skills</code></td><td>по описанию; <code>$skill</code> или <code>/skills</code> в Codex, <code>@</code> в ChatGPT</td><td>не сливает, показывает оба</td><td>2% окна или 8&nbsp;000 символов</td></tr>
+<tr><th>Gemini CLI</th><td><code>.gemini/skills</code>, <code>.agents/skills</code>, то же в домашнем каталоге</td><td><code>activate_skill</code> с запросом согласия</td><td>проект выше пользователя</td><td>не описан</td></tr>
+<tr><th>VS Code, Copilot</th><td><code>.github/skills</code>, <code>.claude/skills</code>, <code>.agents/skills</code>, <code>~/.copilot/skills</code></td><td>модель или <code>/skill</code></td><td>побеждает основной корень workspace</td><td>не описан</td></tr>
+<tr><th>Cursor</th><td><code>.agents/skills</code>, <code>.cursor/skills</code>, для совместимости <code>.claude</code> и <code>.codex</code></td><td>решает агент; <code>/name</code></td><td>не описано</td><td>не описан</td></tr>
+<tr><th>OpenCode</th><td><code>.opencode/skills</code>, <code>.claude/skills</code>, <code>.agents/skills</code> и домашние аналоги</td><td>инструмент <code>skill({ name })</code></td><td>имена должны быть уникальны</td><td>не описан</td></tr>
+<tr><th>OpenClaw</th><td><code>skills/</code> в workspace, <code>.agents/skills</code>, домашний, управляемые, встроенные</td><td>XML-каталог в системном промпте, <code>$skill</code></td><td>workspace выше всех</td><td><code>maxSkillsPromptChars</code>, ~24 токена на скилл</td></tr>
+</tbody>
+</table>
+
+<p>Источники таблицы — документация клиентов на 30 сентября 2026 года<a class="cite" href="#src-2">2</a><a class="cite" href="#src-15">15</a><a class="cite" href="#src-13">13</a><a class="cite" href="#src-25">25</a><a class="cite" href="#src-26">26</a><a class="cite" href="#src-14">14</a><a class="cite" href="#src-9">9</a>. Общий каталог <code>.agents/skills/</code> стал межклиентской договорённостью, как <code>AGENTS.md</code> для инструкций, но спецификация его не требует, а Claude Code не читает. Если в команде работают и в Claude Code, и в Codex, держи скиллы в <code>.claude/skills/</code> (его понимают ещё VS Code, Cursor и OpenCode) и сделай на него симлинк <code>.agents/skills</code>. Claude Code симлинки на каталоги скиллов поддерживает, для остальных клиентов это стоит проверить у себя.</p>
+
+<h3>Что переносится, а что нет</h3>
+
+<p>Гарантированно переносятся имя, описание, тело и файлы по относительным путям, остальное у каждого клиента своё. VS Code понимает часть полей Claude Code: <code>argument-hint</code>, <code>user-invocable</code>, <code>disable-model-invocation</code> и экспериментально <code>context: fork</code>. Cursor — <code>paths</code>, <code>disable-model-invocation</code>, а ещё свои <code>icon</code> и <code>color</code><a class="cite" href="#src-25">25</a><a class="cite" href="#src-26">26</a>. OpenCode признаёт только <code>name</code>, <code>description</code>, <code>license</code>, <code>compatibility</code> и <code>metadata</code>, а прочее молча пропускает, <code>allowed-tools</code> тоже<a class="cite" href="#src-14">14</a>. В VS Code, по его документации, имена со слешем, двоеточием или префиксом пространства имён «cause the skill to silently fail to load»<a class="cite" href="#src-25">25</a>.</p>
+
+<p>Codex выносит свои расширения в отдельный файл рядом с <code>SKILL.md</code>, и это самый аккуратный вариант из существующих: спецификацию он не трогает<a class="cite" href="#src-15">15</a>.</p>
+
+<script type="text/plain" class="code" data-lang="yaml" data-title="agents/openai.yaml (фрагмент из документации Codex)">
+interface:
+  display_name: "Optional user-facing name"
+  short_description: "Optional user-facing description"
+policy:
+  allow_implicit_invocation: false
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "openaiDeveloperDocs"
+      description: "OpenAI Docs MCP server"
+      transport: "streamable_http"
+      url: "https://developers.openai.com/mcp"
+</script>
+
+<p><code>allow_implicit_invocation: false</code> — аналог <code>disable-model-invocation</code>, а блок <code>dependencies</code> отвечает на вопрос, которого спецификация не задаёт: какие MCP-серверы нужны скиллу для работы. OpenClaw решает ту же задачу через <code>metadata.openclaw.requires</code> и попутно нарушает спецификацию: там <code>metadata</code> — вложенный объект, а не словарь строк<a class="cite" href="#src-9">9</a>. Версий, подписи и зависимостей в спецификации нет, и каждый клиент дописывает их по-своему.</p>
+
+<div class="note debate"><p>Насколько это стандарт? В репозитории <code>agentskills/agentskills</code> нет документа об управлении, предложения принимаются через GitHub Discussions, в README сказано «Logo requests are reviewed by the Anthropic team», а больше всех коммитов в спецификацию (91) у одного человека<a class="cite" href="#src-24">24</a>. Стандарт Agent Plugins, который упаковывает скиллы вместе с MCP-серверами, управляется техническим комитетом из Amazon, Cursor, Microsoft, OpenAI и Vercel, без Anthropic, и требует <code>plugin.json</code> в корне и <code>mcp.json</code><a class="cite" href="#src-27">27</a>. Плагин Claude Code держит манифест в <code>.claude-plugin/plugin.json</code>, а серверы в <code>.mcp.json</code><a class="cite" href="#src-2">2</a>, так что между двумя форматами переносится только каталог <code>skills/</code>. Пиши на шести полях спецификации всё, что должно работать везде, а расширения конкретного клиента держи там, где их можно выбросить без потери смысла. Как устроено управление MCP для сравнения, разобрано в <a href="../05-mcp/index.html">главе 5</a>.</p></div>
+
+</section>
+
+<section id="versus">
+<h2>Скилл, MCP, сабагент, команда, CLAUDE.md</h2>
+
+<p>«This is coming late as skills have largely replaced MCP. Now your site can just host a SKILL.md to tell agents how to use the site», — написал на Hacker News пользователь charcircuit 16 февраля 2026 года (<a href="https://news.ycombinator.com/item?id=47038408">комментарий</a>). Семь месяцев спустя, 11 сентября, у MCP появилось официальное расширение, через которое MCP-серверы раздают скиллы. Утверждение «скиллы заменили MCP» к осени 2026 года устарело в самой неожиданной форме: MCP стал одним из способов доставки скиллов.</p>
+
+<h3>Откуда взялось «скиллы заменят MCP»</h3>
+
+<p>Источник — пост Саймона Уиллисона в день анонса, «Claude Skills are awesome, maybe a bigger deal than MCP». Довод там про токены. Официальный MCP-сервер GitHub «famously consumes tens of thousands of tokens of context», а скилл в листинге «only takes up a few dozen extra tokens». И второй довод: «LLMs know how to call <code>cli-tool --help</code>», так что инструмент, который у агента уже есть в шелле, не нужно описывать схемой заранее<a class="cite" href="#src-28">28</a>. На HN он предлагал вместо MCP-сервера скилл, который ходит в <code>api.github.com</code> через <code>curl</code> с токеном из <code>GITHUB_API_KEY</code> (<a href="https://news.ycombinator.com/item?id=45620578">17 октября 2025</a>).</p>
+
+<p>Правда в этом доводе такая. Если агент уже умеет делать что-то через шелл и CLI, скилл с процедурой дешевле MCP-сервера, чьи схемы висят в контексте на каждом ходе (как с этим борются на стороне MCP, разобрано в <a href="../05-mcp/index.html">главе 5</a>). Для бэкендера это частый случай: <code>gh</code>, <code>psql</code>, <code>kubectl</code>, <code>alembic</code> модель знает, и ей нужна не схема, а твои правила работы с ними.</p>
+
+<p>Неправда начинается там, где у агента нет шелла или где нужен доступ с авторизацией. Возражения прозвучали в том же треде, и одно — от самого Уиллисона:</p>
+
+<div class="note field">
+<blockquote>Yeah, the biggest advantages MCP has over terminal tooling is that MCP works without needing a full blown sandboxed Linux style environment - and MCP can also work with much less capable models.
+<footer>— Simon Willison, <a href="https://news.ycombinator.com/item?id=45620543">Hacker News, 17 октября 2025</a></footer></blockquote>
+<blockquote>MCP is also about consuming external services handling oauth and all of that. Skills are effectively cli tools + prompts.
+<footer>— _pdp_, <a href="https://news.ycombinator.com/item?id=45621900">Hacker News, 17 октября 2025</a></footer></blockquote>
+<p>Скилл с <code>curl</code> и токеном в переменной окружения означает, что токен лежит в шелле агента и доступен любой команде, которую модель решит выполнить. MCP-сервер держит авторизацию у себя, и хост видит каждый вызов как отдельную операцию с понятными аргументами. А в песочнице Claude API сети нет совсем, и скилл при всём желании не достучится до твоей системы.</p>
+</div>
+
+<p>Точнее всех сказал samdjstephens: «MCP is about integration of external systems and services. Skills are about context management - providing context on demand» (<a href="https://news.ycombinator.com/item?id=45622031">HN, 17 октября 2025</a>). Эти механизмы складываются. Скилл может описывать процедуру поверх MCP-инструментов, и руководство Anthropic требует называть их полностью, в формате <code>ServerName:tool_name</code>: «Use the BigQuery:bigquery_schema tool to retrieve table schemas». Без префикса сервера Claude может не найти инструмент, когда подключено несколько серверов<a class="cite" href="#src-11">11</a>.</p>
+
+<h3>Скиллы поверх MCP</h3>
+
+<p>Расширение <code>io.modelcontextprotocol/skills</code> (SEP-2640) написано для базовой ревизии MCP 2026-07-28 и получило статус Final 11 сентября 2026 года, а PR с ним влили 13-го<a class="cite" href="#src-29">29</a><a class="cite" href="#src-53">53</a>. Формат скилла оно целиком берёт из спецификации Agent Skills и добавляет только транспорт. Каждый файл скилла становится MCP-ресурсом с адресом вида <code>skill://pdf-processing/SKILL.md</code>. Сервер объявляет расширение в capabilities и обязан поддержать два метода: <code>skills/list</code> и <code>skills/get</code>. Ответ на листинг — не краткая сводка, а полный манифест, у каждого файла SHA-256 и размер:</p>
+
+<script type="text/plain" class="code wide" data-lang="json" data-title="Ответ на skills/list (из раздела Example Message Flow спецификации SEP-2640, третий файл опущен)">
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "resultType": "complete",
+    "skills": [
+      {
+        "uri": "skill://pdf-processing/SKILL.md",
+        "frontmatter": {
+          "name": "pdf-processing",
+          "description": "Extract, fill, and assemble PDF documents"
+        },
+        "resources": [
+          {
+            "uri": "skill://pdf-processing/SKILL.md",
+            "digest": "sha256:99b737495721155ece826d57521e2d66141ebdc1344a400487481ea2642ab19e",
+            "size": 151
+          },
+          {
+            "uri": "skill://pdf-processing/templates/invoice.md",
+            "digest": "sha256:61f4ea6d2c75fde1b4977219e7e3107d491c3c26aefb6686e84d6281c088d9ee",
+            "size": 29
+          }
+        ]
+      }
+    ],
+    "ttlMs": 300000,
+    "cacheScope": "public"
+  }
+}
+</script>
+
+<p>Дальше работает то же поэтапное раскрытие, только по сети (<a href="#fig-mcp-skills">схема ниже</a>). Хосту запрещено заранее скачивать файлы: <code>SKILL.md</code> читается обычным <code>resources/read</code> при активации, остальное — когда модель к нему обратится. Каждое чтение сверяется с размером и дайджестом из манифеста, а фронтматтер — с тем, что пришёл в листинге. Лимиты — 512 файлов и 16 МиБ на скилл. Чтение <code>SKILL.md</code> через <code>resources/read</code> спецификация называет транспортом, а не активацией: активирует только штатный механизм хоста<a class="cite" href="#src-29">29</a>.</p>
+
+<figure class="fig wide" id="fig-mcp-skills">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Пользователь
+  participant H as Хост
+  participant M as Модель
+  participant S as MCP-сервер
+  H->>S: skills/list
+  S-->>H: манифест, у каждого файла digest и size
+  H->>M: имя, описание и сервер-источник
+  M->>H: хочу загрузить pdf-processing
+  H->>U: одобрить скилл с этим набором дайджестов?
+  U-->>H: да
+  H->>S: resources/read для файла SKILL.md
+  S-->>H: текст SKILL.md
+  Note over H: сверяет размер, SHA-256 и фронтматтер
+  H->>M: текст с пометкой, с какого он сервера
+  Note over S: позже на сервере появился новый файл
+  H->>S: skills/get
+  S-->>H: другой набор дайджестов
+  H->>U: скилл изменился, одобрить заново?
+</script>
+<figcaption>Скилл, пришедший по MCP. Одобрение пользователя привязано к точному набору дайджестов: стоит серверу добавить, заменить или убрать файл, прежнее одобрение отзывается. Дайджесты не подписаны и приходят с того же сервера, что и файлы, поэтому защищают от рассинхрона, но не от самого сервера.</figcaption>
+</figure>
+
+<p>Самая содержательная часть расширения — раздел безопасности, и он многое говорит о скиллах вообще. Хост обязан считать скиллы из MCP «a higher-risk surface than remote tool invocation»: инструмент на сервере выполняет код на сервере, а скилл приносит текст, который велит модели выполнить код у тебя. Поэтому исполнение кода на хосте разрешено только после явного одобрения конкретного скилла, <code>allowed-tools</code> из такого скилла игнорируется, пока пользователь не одобрил именно это расширение прав, а скилл с сервера A не может заставить хост читать ресурсы сервера B. Скилл из MCP не имеет права молча перекрыть одноимённый локальный, и модель должна видеть, откуда он пришёл. Спецификация отдельно предупреждает: «Digests are not a trust anchor»<a class="cite" href="#src-29">29</a>.</p>
+
+<p>Поддержка пока ранняя. По таблице реализаций на 29 сентября 2026 года сервер сделали Hugging Face и прототип в <code>github-mcp-server</code>, частичная поддержка у хостов MCP Inspector, fast-agent, MCPJam и плагинов ChatGPT, официальные SDK — «in progress»<a class="cite" href="#src-30">30</a>. Claude в этой таблице нет. При этом справка Anthropic по сканированию упоминает «skills shared through a connected MCP server», так что какой-то путь существует, но публично не описан.</p>
+
+<p>В посте о плагинах от 25 сентября 2026 года Anthropic раскладывает роли так: плагины упаковывают «MCP connectors, Agent Skills, or both», а сами «Skills and MCP connectors stay as building blocks»<a class="cite" href="#src-31">31</a>.</p>
+
+<h3>CLAUDE.md против скилла</h3>
+
+<p>Теперь история из вводки целиком. Vercel сравнивал четыре конфигурации на задачах по Next.js 16 и опубликовал <a href="#fig-vercel">результаты</a> 27 января 2026 года<a class="cite" href="#src-1">1</a>:</p>
+
+<figure class="fig" id="fig-vercel">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Доля пройденных задач на evals Vercel по Next.js 16", "unit": "%", "max": 100,
+ "emphasis": ["Индекс документации в AGENTS.md"],
+ "rows": [["Без документации", 53], ["Скилл, поведение по умолчанию", 53, "не вызван в 56% прогонов"], ["Скилл и явная инструкция его вызвать", 79], ["Индекс документации в AGENTS.md", 100, "8 КБ после сжатия"]],
+ "note": "Vercel, 27 января 2026. Модель и число прогонов в статье не указаны."}
+</script>
+<figcaption>Одни и те же знания в трёх упаковках. Скилл, который агент не открывает, стоит ровно ноль. Инструкция «сначала изучи структуру проекта, потом вызови скилл с документацией» подняла результат до 79%, а пассивный индекс, лежащий в контексте всегда, дал 100%.</figcaption>
+</figure>
+
+<p>Вывод статьи не «скиллы не работают», и автор, Джуд Гао, сам проводит границу: скиллы лучше подходят для «vertical, action-specific workflows that users explicitly trigger, like „upgrade my Next.js version,“ „migrate to the App Router“»<a class="cite" href="#src-1">1</a>. Знание о фреймворке, которое нужно почти в каждой задаче, выгоднее держать в контексте постоянно. Процедура, которая нужна раз в неделю, должна лежать на диске и подгружаться по требованию.</p>
+
+<p>Документация Claude Code говорит то же своими словами: делай скилл, когда раз за разом вставляешь в чат одну и ту же инструкцию или чеклист, или когда раздел <code>CLAUDE.md</code> «has grown into a procedure rather than a fact»<a class="cite" href="#src-2">2</a>. Факты о проекте — в <code>CLAUDE.md</code>, процедуры — в скиллы. Рабочая связка из двух: короткая строка в <code>CLAUDE.md</code> вида «миграции делай через скилл <code>alembic-migration</code>» и сама процедура в скилле. Строка стоит пару десятков токенов на ходу и снимает проблему недовызова, процедура не занимает контекст, пока не нужна.</p>
+
+<h3>Сабагент и команда</h3>
+
+<p>С сабагентами путаница меньше. Лучшая короткая формулировка — «Subagents have their own context. Skills do not» (rahimnathwani, <a href="https://news.ycombinator.com/item?id=45609396">HN, 16 октября 2025</a>). Скилл — это данные, которые попадают в чей-то контекст. Сабагент — отдельный исполнитель со своим контекстом, моделью и инструментами. Соединяются они через <code>context: fork</code> и через поле <code>skills</code> в определении сабагента, как описано <a href="#lifecycle">выше</a>.</p>
+
+<p>С командами путаницы в Claude Code больше нет совсем: команда — это скилл, который вызываешь ты. Хочешь, чтобы его вызывал только ты, — ставь <code>disable-model-invocation: true</code>. Все механизмы сведены в таблицу, а порядок выбора — <a href="#fig-decision">в схему</a> под ней.</p>
+
+<table class="wide">
+<thead><tr><th>Механизм</th><th>Когда в контексте</th><th>Кто запускает</th><th>Свой контекст</th><th>Бери, когда</th></tr></thead>
+<tbody>
+<tr><th><code>CLAUDE.md</code>, <code>AGENTS.md</code></th><td>всегда, каждый ход</td><td>никто, лежит сам</td><td><span class="no">нет</span></td><td>факты и правила, нужные почти в каждой задаче; указатели на скиллы</td></tr>
+<tr><th>Скилл</th><td>описание всегда, тело после вызова</td><td>модель или ты</td><td><span class="no">нет</span></td><td>процедура или справочник, нужные время от времени</td></tr>
+<tr><th>Скилл с <code>disable-model-invocation</code></th><td>только после твоего вызова</td><td>только ты</td><td><span class="no">нет</span></td><td>побочные эффекты: деплой, коммит, отправка сообщений</td></tr>
+<tr><th>Скилл с <code>context: fork</code>, сабагент</th><td>в основном контексте только итог</td><td>модель или ты</td><td><span class="yes">да</span></td><td>много чтения ради короткого ответа, параллельная работа</td></tr>
+<tr><th>MCP-сервер</th><td>схемы инструментов (или их поиск)</td><td>модель</td><td><span class="no">нет</span></td><td>доступ к внешней системе с авторизацией; среды без шелла</td></tr>
+<tr><th>Хук</th><td>не в контексте</td><td>харнесс по событию</td><td>—</td><td>правило, которое должно выполняться всегда, помнит его модель или нет</td></tr>
+</tbody>
+</table>
+
+<figure class="fig" id="fig-decision">
+<div class="layers">
+  <div class="layer" data-tone="accent"><b>1. Нужно почти в каждой задаче?</b><span>Да — в <code>CLAUDE.md</code> или <code>AGENTS.md</code>, коротко или индексом со ссылками. Нет — дальше.</span></div>
+  <div class="layer" data-tone="violet"><b>2. Нужен доступ к системе с авторизацией или среда без шелла?</b><span>Да — MCP-сервер, а процедуру работы с ним положи в скилл. Нет — дальше.</span></div>
+  <div class="layer" data-tone="warn"><b>3. Должно соблюдаться всегда, без исключений?</b><span>Да — хук: его выполняет харнесс, а не модель. Нет — дальше.</span></div>
+  <div class="layer"><b>4. Побочные эффекты, запуск по твоей команде?</b><span>Да — скилл с <code>disable-model-invocation: true</code>. Нет — дальше.</span></div>
+  <div class="layer"><b>5. Много чтения ради короткого итога?</b><span>Да — скилл с <code>context: fork</code> или сабагент. Нет — дальше.</span></div>
+  <div class="layer" data-tone="ok"><b>Остальное</b><span>Обычный скилл, который модель вызывает сама по описанию.</span></div>
+</div>
+<figcaption>Куда положить знание или процедуру. Порядок вопросов важен: сначала отсекается то, что должно быть в контексте всегда, потом то, чему нужен внешний доступ, и только остаток идёт в скиллы.</figcaption>
+</figure>
+
+<div class="note debate"><p>Спор о MCP не утих и к осени 2026 года. «MCP isn't going anywhere… Skills, etc do not replace MCP», — пишет MitziMoto (<a href="https://news.ycombinator.com/item?id=46451688">HN, 1 января 2026</a>). «MCP is the wrong abstraction for all of that. Skills are better as pluggable interfaces», — отвечает kaoD 21 сентября (<a href="https://news.ycombinator.com/item?id=49789092">HN</a>) и сам оговаривается, что его «predict» значит «hope». Для своего сервиса сделай так: если у агента есть шелл и нужный CLI, начни со скилла; если доступ нужен из среды без шелла, с OAuth от имени пользователя или с аудитом каждого вызова, делай MCP-сервер и положи рядом скилл с процедурой. Оценка изменится, когда хосты начнут поддерживать SEP-2640 целиком: тогда сервер будет раздавать и инструменты, и процедуры к ним одним подключением.</p></div>
+
+</section>
+
+<section id="authoring">
+<h2>Как написать скилл, который помогает</h2>
+
+<p>13 февраля 2026 года 78 авторов выложили на arXiv SkillsBench: 86 задач в 11 доменах, детерминированные проверки результата, прогоны одних и тех же задач со скиллами и без. Главный вывод первой версии уложился в одну фразу: «Self-generated Skills provide no benefit on average». Скиллы, которые модель написала себе сама, в среднем не дали ничего. Написанные людьми дали +16,2 п.п., но с огромным разбросом по доменам, и в 16 задачах из 84 со скиллом стало хуже<a class="cite" href="#src-32">32</a>.</p>
+
+<figure class="fig" id="fig-skillsbench">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Прирост доли решённых задач со скиллами", "subtitle": "SkillsBench, скиллы написаны людьми", "unit": " п.п.", "decimals": 1,
+ "emphasis": ["v1, домен Software Engineering"],
+ "rows": [["v4, среднее по 18 конфигурациям", 16.6, "33,9% → 50,5%"], ["v4, худшая конфигурация", 4.1], ["v4, лучшая конфигурация", 25.7], ["v1, домен Software Engineering", 4.5], ["v1, домен Healthcare", 51.9]],
+ "note": "arXiv 2602.12670: v1 от 13 февраля 2026 (86 задач, 7 конфигураций), v4 от 14 июня 2026 (87 задач, 18 конфигураций модель + харнесс)."}
+</script>
+<figcaption>Скиллы помогают, но меньше всего там, где работает бэкендер. В программировании модели и так сильны, и прирост в домене Software Engineering в одиннадцать раз меньше, чем в медицине, где скилл приносит знания, которых у модели нет.</figcaption>
+</figure>
+
+<p>Четвёртая версия от 14 июня (обе версии <a href="#fig-skillsbench">на графике</a>) расширила замер до 18 конфигураций «модель плюс харнесс»: 33,9% без скиллов против 50,5% со скиллами, от +4,1 до +25,7 п.п. в зависимости от конфигурации. И добавила вывод: «Focused Skills with at most three modules outperform larger or exhaustive bundles, and smaller models with Skills can match larger models without them»<a class="cite" href="#src-32">32</a>. Узкий скилл лучше энциклопедии.</p>
+
+<p>Контролируемое исследование Сюй и У на 30 задачах SkillsBench, по пять прогонов на ячейку, развело два фактора. Само наличие скилла дало +26,7…36,0 п.п. для GPT-5.5 и +18,0…26,0 п.п. для DeepSeek V4-Flash. А подача влияла слабо: разница между абстрактной и приземлённой инструкцией и эффект одного добавленного примера укладываются в несколько пунктов, и доверительные интервалы пересекают ноль<a class="cite" href="#src-33">33</a>. Важнее, чтобы скилл был и вызывался, чем то, в каком стиле он написан.</p>
+
+<p>Скилл «как писать хороший FastAPI-код» почти ничего не добавит, а скилл про то, как в вашей команде оформляют миграции и чем тестовая база отличается от боевой, добавит много: этого модель знать не может. В посте о <code>skill-creator</code> Anthropic делит скиллы на два вида. Скиллы «capability uplift» дотягивают модель до того, чего она пока не умеет, и с новыми моделями могут стать ненужными; понять это помогают evals, а с v2.1.283 ещё и <code>/doctor prompt-audit</code>, который ищет в скиллах, <code>CLAUDE.md</code> и агентах приёмы, написанные для старых моделей<a class="cite" href="#src-5">5</a>. Скиллы «encoded preference» записывают принятый у вас процесс, и живут столько, сколько процесс, а ценность их определяется тем, насколько точно они ему следуют<a class="cite" href="#src-34">34</a>.</p>
+
+<p>Большинство скиллов в открытом доступе написаны плохо, и это измерено. Авторы исследования 138&nbsp;133 публичных файлов <code>SKILL.md</code> из 20&nbsp;556 репозиториев (9 августа 2026) нашли хотя бы один дефект в 91,8% из них: слабое описание для маршрутизации, раздутое тело, беспорядок во вспомогательных файлах. Скиллы, написанные с оглядкой на спецификацию, дефектны реже<a class="cite" href="#src-35">35</a>.</p>
+
+<h3>Описание</h3>
+
+<p>Описание — единственное, что модель видит, когда решает, звать ли скилл. Руководство Anthropic требует писать его в третьем лице («Processes Excel files…», а не «I can help you…»), потому что оно подставляется в системный промпт, и смена лица мешает поиску. Оно должно говорить и что скилл делает, и когда его применять. Плохие примеры оттуда же — <code>description: Helps with documents</code>, <code>Processes data</code>, <code>Does stuff with files</code>. Имя там же советуют давать в форме герундия, <code>processing-pdfs</code>, а не расплывчатое <code>helper</code> или <code>utils</code><a class="cite" href="#src-11">11</a>. В <code>skill-creator</code> Anthropic приводит пример «напористого» описания. Было «How to build a simple fast dashboard to display internal Anthropic data», стало с хвостом: «Make sure to use this skill whenever the user mentions dashboards, data visualization, internal metrics, or wants to display any kind of company data, even if they don't explicitly ask for a „dashboard.“»<a class="cite" href="#src-12">12</a>.</p>
+
+<p>Хвост «even if they don't explicitly ask» — главное. Пользователь редко называет задачу так, как её назвал автор скилла. Он пишет «добавь поле <code>tier</code> в пользователя», а не «сделай миграцию». Описание должно перечислять формулировки, которыми задачу ставят, а не только её официальное имя. В Claude Code первым ставь главный сценарий: запись режется на 1&nbsp;536 символах, а при нехватке бюджета описание может пропасть целиком.</p>
+
+<script type="text/plain" class="code wide" data-lang="markdown" data-title="Набросок: .claude/skills/alembic-migration/SKILL.md">
+---
+name: alembic-migration
+description: "Creates and checks Alembic migrations for this service's PostgreSQL schema. Use whenever the user changes SQLAlchemy models, adds or drops a column or index, or mentions alembic, schema or database changes, even if they don't ask for a migration."
+allowed-tools: Bash(python ${CLAUDE_SKILL_DIR}/scripts/check_migration.py *)
+---
+
+# Alembic migrations
+
+1. Run exactly `uv run alembic revision --autogenerate -m "<short_snake_case>"`. Do not hand-write revision files.
+2. Read the generated file and compare it with the model diff; autogenerate misses the cases below.
+3. Run `python ${CLAUDE_SKILL_DIR}/scripts/check_migration.py <revision_file>` and fix every finding.
+4. Run `uv run alembic upgrade head`, then `downgrade -1`, then `upgrade head` again against the local database.
+
+## Gotchas
+- A renamed column comes out as drop + add and loses data. Replace it with `op.alter_column(..., new_column_name=...)`.
+- A NOT NULL column on a populated table needs `server_default` or a separate backfill step.
+- New indexes on large tables: `postgresql_concurrently=True` inside `op.get_context().autocommit_block()`.
+
+Naming rules and examples: [references/conventions.md](references/conventions.md)
+</script>
+
+<p>В этом наброске собраны почти все правила раздела. Описание в третьем лице, с формулировками пользователя. Тело короткое: модель знает Alembic, ей нужны только ваши правила. Шаг 1 задан точной командой, шаг 4 — проверка, которую модель выполнит сама. Раздел про подводные камни — самое ценное: autogenerate действительно не видит переименований столбцов и выдаёт вместо них удаление и добавление<a class="cite" href="#src-18">18</a>. Справочник вынесен в отдельный файл на один уровень вглубь. <code>${CLAUDE_SKILL_DIR}</code> — подстановка Claude Code, она работает и в <code>allowed-tools</code>, поэтому в ходе вызова свой скрипт скилл запускает без запроса разрешения<a class="cite" href="#src-2">2</a>. В других клиентах путь к скрипту придётся писать иначе.</p>
+
+<h3>Проверка вызова</h3>
+
+<p>Проверку описания подробно расписывает руководство agentskills.io. Около 20 запросов: 8–10 должны вызывать скилл, 8–10 не должны. Самые ценные отрицательные примеры — «near-misses»: запросы с теми же словами, которым на самом деле нужен другой скилл или никакой. Каждый запрос гоняй трижды, потому что модель недетерминирована, и считай долю вызовов. Запросы раздели примерно 60 на 40: по первой части правь описание, по второй проверяй, что правка обобщается, а не подогнана под конкретные фразы<a class="cite" href="#src-36">36</a>. В том же руководстве есть готовый скрипт для Claude Code:</p>
+
+<script type="text/plain" class="code wide" data-lang="bash" data-title="Проверка вызова скилла (фрагмент из руководства agentskills.io)">
+QUERIES_FILE="${1:?Usage: $0 <queries.json>}"
+SKILL_NAME="my-skill"
+RUNS=3
+
+check_triggered() {
+  local query="$1"
+  claude -p "$query" --output-format json 2>/dev/null \
+    | jq -e --arg skill "$SKILL_NAME" \
+      'any(.messages[].content[]; .type == "tool_use" and .name == "Skill" and .input.skill == $skill)' \
+      > /dev/null 2>&1
+}
+</script>
+
+<p>Здесь видно, как вызов скилла выглядит на уровне сообщений: обычный <code>tool_use</code> инструмента <code>Skill</code> с полем <code>skill</code> во входе. Двадцать запросов по три прогона — 60 вызовов <code>claude -p</code>. Для скилла, от которого зависит работа команды, это недорого. Anthropic сообщает, что автоматическая настройка описаний в <code>skill-creator</code> улучшила срабатывание у пяти из шести её собственных публичных скиллов для документов<a class="cite" href="#src-34">34</a>. Выборка маленькая, но другого опубликованного замера «до и после» для этого механизма нет.</p>
+
+<h3>Краткость и степени свободы</h3>
+
+<p>Первое правило руководства Anthropic: «Claude is already very smart», добавляй только то, чего модель не знает. Пример оттуда: фрагмент про извлечение текста из PDF с объяснением, что такое PDF и зачем библиотеки, стоит около 150 токенов, а тот же фрагмент одним вызовом <code>pdfplumber</code> — около 50<a class="cite" href="#src-11">11</a>. Проверка на каждую строку: ошибётся ли модель без неё. Руководство agentskills.io уточняет, что самое ценное содержимое многих скиллов — список подводных камней, «environment-specific facts that defy reasonable assumptions». Пример оттуда просится в любой бэкенд: эндпоинт <code>/health</code> отвечает 200, пока жив веб-сервер, даже если соединения с базой нет, и полное здоровье сервиса показывает <code>/ready</code><a class="cite" href="#src-37">37</a>. Такие вещи держи прямо в <code>SKILL.md</code>: в отдельном файле модель может не понять, что его пора открыть. А условий с датами вроде «до августа 2025 года используй старый API» в теле быть не должно: устаревшее руководство Anthropic советует уносить в свёрнутый раздел «old patterns»<a class="cite" href="#src-11">11</a>.</p>
+
+<p>С хрупкими операциями правило другое: чем легче всё сломать, тем точнее инструкция. Anthropic называет это степенями свободы. Для ревью кода достаточно списка того, на что смотреть; для шаблона отчёта — псевдокода с параметрами; для миграции базы — точной команды:</p>
+
+<script type="text/plain" class="code" data-lang="markdown" data-title="Низкая степень свободы (пример из руководства Anthropic)">
+## Database migration
+
+Run exactly this script:
+
+```bash
+python scripts/migrate.py --verify --backup
+```
+
+Do not modify the command or add additional flags.
+</script>
+
+<p>Anthropic объясняет выбор картинкой: узкий мост с обрывами по обе стороны против открытого поля без препятствий. На мосту нужны перила и точные указания, в поле хватит направления. И ещё одно правило оттуда же, которое легко пропустить: «What works perfectly for Opus might need more detail for Haiku»<a class="cite" href="#src-11">11</a>. Если скилл будет работать в сабагенте на дешёвой модели, проверяй его на этой модели. Руководство для компаний делает это условием выкладки: 3–5 запросов на скилл (должен сработать, не должен, пограничный случай) на всех моделях, которыми пользуется организация<a class="cite" href="#src-16">16</a>.</p>
+
+<h3>Скрипты, которые пишут для агента</h3>
+
+<p>Скрипт в скилле запускает не человек, и это меняет требования. Руководство agentskills.io их перечисляет<a class="cite" href="#src-38">38</a>. Никаких интерактивных вопросов: агент работает в неинтерактивном шелле, и скрипт, ждущий ввода, «will hang indefinitely». Интерфейс описывается в <code>--help</code>, потому что оттуда агент его и узнаёт. Данные идут в stdout в структурированном виде, диагностика — в stderr. Разные ошибки — разные коды выхода. Для разрушительных операций нужен <code>--dry-run</code>. Размер вывода предсказуемый: многие харнессы обрезают вывод инструмента после 10–30 тыс. символов. Руководство Anthropic добавляет «solve, don't defer»: ошибку, которую можно обработать в скрипте, обрабатывай в скрипте, а не оставляй модели на импровизацию. И никаких «voodoo constants»: <code>TIMEOUT = 47</code> без объяснения, откуда 47, модель не сможет ни проверить, ни поправить<a class="cite" href="#src-11">11</a>.</p>
+
+<script type="text/plain" class="code wide" data-lang="python" data-title="Набросок: scripts/check_migration.py (запускался на тестовом файле)">
+#!/usr/bin/env python3
+"""Rough line-based checks of an Alembic revision. JSON to stdout, exit 1 on findings."""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# (call, flagged only if line has, fine if line has, problem)
+RULES = [
+    ("op.drop_column(", None, None, "drop_column loses data; for a rename use alter_column"),
+    ("op.add_column(", "nullable=False", "server_default", "NOT NULL column needs server_default or a backfill"),
+    ("op.create_index(", None, "postgresql_concurrently=True", "index on a live table: add postgresql_concurrently=True"),
+]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("revision", type=Path, help="path to versions/<rev>.py")
+    args = parser.parse_args()
+    if not args.revision.is_file():
+        print(f"not a file: {args.revision}", file=sys.stderr)
+        return 2
+    findings = []
+    for no, line in enumerate(args.revision.read_text().splitlines(), start=1):
+        for call, only_if, unless, problem in RULES:
+            if call in line and (only_if is None or only_if in line) and (unless is None or unless not in line):
+                findings.append({"line": no, "problem": problem})
+    print(json.dumps({"file": str(args.revision), "findings": findings}))
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+</script>
+
+<p>Проверки в наброске грубые, по строкам, и многострочный вызов <code>op.add_column</code> они пропустят. Но интерфейс сделан для агента: без вопросов, JSON с номерами строк на выходе, 1 при находках и 2 при неверном пути. Сколько бы строк ни было в таком скрипте, в контекст они не попадут: модель увидит одну строку JSON. Для пакетных и разрушительных операций Anthropic советует тот же приём в более общей форме: сначала модель пишет план изменений в файл вроде <code>changes.json</code>, скрипт его проверяет, и только потом план выполняется.</p>
+
+<p>Живые образцы этих приёмов лежат в репозитории <code>anthropics/skills</code>, 19 скиллов на 30 сентября 2026 года. В <code>pdf</code> напористое описание («Use this skill whenever the user wants to do anything with PDF files») и условная ссылка вместо лишнего текста в теле: «If you need to fill out a PDF form, read FORMS.md». В <code>webapp-testing</code> скрипты работают как чёрный ящик: тело велит сначала звать <code>--help</code> и «DO NOT read the source», потому что большие скрипты «pollute your context window». README предупреждает, что это учебные образцы: поведение Claude в продукте может отличаться от показанного<a class="cite" href="#src-39">39</a>.</p>
+
+<h3>Evals до документации</h3>
+
+<p>Anthropic советует начинать не с текста, а с замера: «Create evaluations BEFORE writing extensive documentation». Порядок такой: реши задачи без скилла и запиши, где модель ошибается; напиши три-пять сценариев на эти ошибки; сними базовую линию; напиши минимальные инструкции, которые закрывают пробелы; повторяй<a class="cite" href="#src-11">11</a>. Там же описан цикл «Claude A / Claude B». Один экземпляр помогает писать скилл, второй, в чистой сессии, его использует, а наблюдения за вторым ты приносишь первому. Документация Claude Code оговаривает: «Seeing a skill trigger tells you Claude found it, not that it did what you intended». Вызов и качество результата меряются отдельно, и каждый прогон — в свежей сессии, иначе контекст, оставшийся от написания скилла, закроет дыры в тексте<a class="cite" href="#src-2">2</a>.</p>
+
+<figure class="fig wide" id="fig-eval-loop">
+<ol class="pipeline">
+  <li><b><code>evals/evals.json</code></b><span>запросы, входные файлы, что должно получиться</span></li>
+  <li><b>Прогоны</b><span>сабагент с чистым контекстом на каждый случай, со скиллом и без</span></li>
+  <li><b><code>grading.json</code></b><span>pass или fail по каждому утверждению, с доказательством</span></li>
+  <li data-tone="accent"><b><code>benchmark.json</code></b><span>доля прохождений, токены и время: со скиллом против без</span></li>
+  <li data-tone="ok"><b>Правка</b><span>описание и тело; слепое A/B двух версий перед коммитом</span></li>
+</ol>
+<figcaption>Цикл, который автоматизирует плагин <code>skill-creator</code> в Claude Code. Центральный файл — <code>benchmark.json</code>: он показывает не «стало лучше», а сколько процентных пунктов прибавил скилл и сколько за это заплачено токенами и временем.</figcaption>
+</figure>
+
+<p>В Claude Code этот <a href="#fig-eval-loop">цикл</a> делает плагин <code>skill-creator</code> (ставится командой <code>/plugin install skill-creator@claude-plugins-official</code>; режимы для evals Anthropic описала 3 марта 2026 года). Кроме шагов с рисунка, он подбирает описание по запросам «должен/не должен срабатывать» и открывает HTML-отчёт для ручного просмотра<a class="cite" href="#src-2">2</a><a class="cite" href="#src-34">34</a>. Для скиллов в плагинах есть <code>claude plugin eval</code>: прогоны с плагином и без, проверка <code>tool_used: Skill</code> на сам факт вызова и ненулевой код выхода ниже порога, так что его можно ставить в CI. Форматы у двух инструментов разные и не взаимозаменяемы. Как строить evals вообще, разобрано в <a href="../17-evals/index.html">главе 17</a>.</p>
+
+<div class="note field">
+<p>Инструменты есть, пользуются ими мало. В отчёте Skill Crossroads из 208 публичных скиллов для Claude Code evals были у одного, а явно описанные ограничения и способы отказа — у одного из 215<a class="cite" href="#src-17">17</a>. Для командного скилла, от которого зависит, как агент трогает прод, пять запросов в <code>evals.json</code> — уже больше, чем у 99% опубликованных.</p>
+</div>
+
+</section>
+
+<section id="distribution">
+<h2>Как скиллы доезжают до людей</h2>
+
+<p>С Claude Code v2.1.275 от 17 сентября 2026 года у тех, кто входит в терминал через аккаунт claude.ai, в <code>~/.claude/skills/synced/</code> появляются скиллы, которых они туда не клали: включённые в аккаунте, выданные организацией и встроенные вроде <code>pdf</code> и <code>xlsx</code><a class="cite" href="#src-5">5</a>. Claude Code скачивает их в фоне при старте сессии и примерно раз в десять минут проверяет изменения. Синхронизация односторонняя: правка файла в <code>synced/</code> на claude.ai не уйдёт, а следующая синхронизация её затрёт. Сессии с API-ключом, на Bedrock, в bare mode или с <code>CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC</code> ничего не синхронизируют. Выключается синк настройкой <code>syncClaudeAiSkills: false</code><a class="cite" href="#src-2">2</a>.</p>
+
+<p>К скиллам из аккаунта Claude Code относится осторожнее, чем к файлам, которые ты написал сам. С v2.1.228 он чистит их описания от управляющих символов и экранирует угловые скобки, чтобы текст не мог изобразить служебную разметку Claude Code. В теле такого скилла на твоей машине не выполняются <code>!</code>-команды, не подтягиваются файлы по <code>@</code>-ссылкам и не подставляется <code>${CLAUDE_PROJECT_DIR}</code>: всё это доходит до модели как обычный текст. Короткое имя синхронизированный скилл уступает любой локальной команде и тогда вызывается только как <code>/anthropic-skills:имя</code><a class="cite" href="#src-2">2</a>.</p>
+
+<h3>Каналы</h3>
+
+<p>Путей распространения к осени 2026 года шесть, и выбирают их по тому, кто должен получить скилл и кто отвечает за его содержимое.</p>
+
+<p><b>Репозиторий.</b> <code>.claude/skills/</code> в git — самый простой и самый проверяемый путь: скилл проходит код-ревью вместе с кодом, к которому относится. Для скиллов проекта (миграции, релизы, локальный запуск) ничего лучше нет.</p>
+
+<p><b>Плагины и маркетплейсы.</b> Плагин Claude Code упаковывает скиллы вместе с сабагентами, хуками и MCP-серверами, а маркетплейс — это репозиторий со списком плагинов. Официальный маркетплейс Anthropic подключается, и плагин из него ставится так<a class="cite" href="#src-2">2</a>:</p>
+
+<script type="text/plain" class="code" data-lang="text" data-title="Команды из документации Claude Code">
+/plugin marketplace add anthropics/claude-plugins-official
+/plugin install skill-creator@claude-plugins-official
+</script>
+
+<p>Скиллы плагина живут в своём пространстве имён (<code>/plugin-name:skill-name</code>), и <code>skillOverrides</code> на них не действует, ими управляют через <code>/plugin</code>. Каталог скилла, в который положили <code>.claude-plugin/plugin.json</code>, сам становится плагином <code>&lt;name&gt;@skills-dir</code>. В проектном <code>.claude/skills/</code> это требует сначала принять диалог доверия к рабочей папке, потому что плагин может принести хуки и MCP-серверы<a class="cite" href="#src-2">2</a>. 25 сентября 2026 года Anthropic открыла приём плагинов в свой каталог: с автоматической проверкой безопасности и статистикой использования для авторов<a class="cite" href="#src-31">31</a>.</p>
+
+<p>Пространство имён в имени плагина — заявление, а не проверка. В июне 2026 года Manifold Security нашла на ClawHub, маркетплейсе OpenClaw, 23 плагина с исполняемым кодом, которые посторонние аккаунты опубликовали под скоупами <code>@openclaw/</code> и <code>@clawhub/</code>: правило «скоуп совпадает с владельцем» было описано, но не соблюдалось. После сообщения исследователей плагины сняли<a class="cite" href="#src-40">40</a>.</p>
+
+<p><b>Управляемые настройки.</b> Каталог <code>.claude/skills/</code> внутри управляемых настроек организации (на Linux, например, <code>/etc/claude-code/.claude/skills/</code>) раздаёт скилл всем пользователям машин, куда организация эти настройки доставляет, и такой скилл побеждает личные и проектные с тем же именем<a class="cite" href="#src-2">2</a>.</p>
+
+<p><b>Организация в claude.ai.</b> Страница обзора скиллов в документации платформы до сих пор утверждает, что claude.ai «does not support centralized admin management or org-wide distribution of custom Skills»<a class="cite" href="#src-7">7</a>. Это устарело ещё 18 декабря 2025 года, когда Anthropic разрешила владельцам планов Team и Enterprise раздавать скиллы централизованно<a class="cite" href="#src-41">41</a>. К сентябрю 2026 года участник может поделиться скиллом с людьми или группами (только на чтение, с автообновлением) или опубликовать его в организацию. Владелец выбирает политику публикации и то, как скилл предлагается: «Available to install», «Installed by default» или «Required»<a class="cite" href="#src-42">42</a>. Всё включённое в аккаунте приезжает в Claude Code через синк; путь целиком — <a href="#fig-org">на схеме</a>.</p>
+
+<figure class="fig" id="fig-org">
+<script type="text/x-mermaid">
+flowchart TD
+  a["Участник создаёт<br/>или загружает скилл"] --> scan{"Скан Enterprise"}
+  o["Владелец загружает<br/>в настройках организации"] --> scan
+  scan -- fail --> x["Заблокирован,<br/>админ не может разрешить"]:::warn
+  scan -- "pass или warn,<br/>от участника" --> ch{"Поделиться<br/>или опубликовать?"}
+  scan -- "pass или warn,<br/>от владельца" --> lib
+  ch -- поделиться --> sh["Люди и группы:<br/>только чтение"]
+  ch -- опубликовать --> rv["Ревью владельца,<br/>если включено"]
+  rv --> lib["Библиотека: доступен,<br/>по умолчанию, обязателен"]:::ok
+  lib --> cc["Claude Code:<br/>~/.claude/skills/synced/"]:::accent
+  sh --> cc
+</script>
+<figcaption>Путь скилла в организации на Claude Team и Enterprise. Скан стоит на входе и срабатывает при каждой загрузке и правке. Конечная точка для разработчика — каталог <code>synced/</code> в Claude Code.</figcaption>
+</figure>
+
+<p><b>Skills API.</b> Для приложений на Claude API — загрузка в workspace, как разобрано <a href="#api">выше</a>. С другими каналами этот не синхронизируется: скилл в claude.ai, скилл в Skills API и скилл в <code>.claude/skills/</code> — три отдельные копии, и держать их одинаковыми придётся самому.</p>
+
+<p><b><code>npx skills</code> и skills.sh.</b> Межклиентский установщик от Vercel, репозиторий <code>vercel-labs/skills</code> создан 14 января 2026 года, последняя версия — v1.7.0 от 17 сентября. Он ставит скиллы из GitHub, GitLab, любого git-репозитория или локальной папки в каталоги «OpenCode, Claude Code, Codex, Cursor, and 75 more» и по умолчанию хранит одну копию, а в каталоги агентов кладёт на неё симлинки<a class="cite" href="#src-43">43</a>:</p>
+
+<script type="text/plain" class="code" data-lang="bash" data-title="Примеры из README vercel-labs/skills">
+npx skills add vercel-labs/agent-skills --list
+npx skills add vercel-labs/agent-skills --skill frontend-design -g -a claude-code -y
+npx skills update
+</script>
+
+<p>У skills.sh есть публичный рейтинг установок и страница аудитов с вердиктами трёх сканеров: Gen Agent Trust Hub, Socket и Snyk. На 30 сентября 2026 года для одного скилла генерации видео из первой двадцатки они выдают «Safe», «0 alerts» и «Critical»<a class="cite" href="#src-44">44</a>. Удобство здесь то же, что у <code>npm install</code>, и риски те же: <code>npx skills update</code> притянет свежую версию чужого текста, который твой агент исполнит как инструкцию.</p>
+
+<div class="note practice"><p>Командные скиллы держи в репозитории и ревьюй как код. Чужие ставь в личный каталог только после того, как прочитал <code>SKILL.md</code> и все скрипты, и фиксируй версию: копия в своём репозитории надёжнее ссылки на чужую ветку.</p></div>
+
+</section>
+
+<section id="security">
+<h2>Скилл — это код, который выполняет модель</h2>
+
+<p>В начале февраля 2026 года Джейсон Меллер из 1Password разбирал самый скачиваемый скилл на ClawHub — маркетплейсе открытого агента OpenClaw, который использует тот же формат <code>SKILL.md</code>. Скилл обещал работу с Twitter. Внимание зацепила зависимость: инструкция просила сначала установить некий <code>openclaw-core</code>. Дальше всё шло по <a href="#fig-clawhub">цепочке</a> из ссылки на инфраструктуру атакующих, обфусцированной команды и второго этапа, который скачивал бинарник и снимал с него атрибут карантина macOS. VirusTotal опознал в бинарнике infostealer, который собирает сессии браузера, пароли, токены разработчика, SSH-ключи и облачные ключи<a class="cite" href="#src-45">45</a>. По данным 1Password, в той же кампании участвовали сотни скиллов OpenClaw.</p>
+
+<figure class="fig wide" id="fig-clawhub">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant A as Атакующий
+  participant R as ClawHub
+  participant M as Машина жертвы
+  participant S as Сервер атакующего
+  A->>R: публикует скилл для Twitter
+  M->>R: ставит самый скачиваемый скилл
+  Note over M: SKILL.md велит сначала поставить openclaw-core
+  M->>S: переход по ссылке из инструкции
+  S-->>M: обфусцированная команда
+  Note over M: команда раскрывается во второй этап
+  M->>S: второй этап запрашивает бинарник
+  S-->>M: исполняемый файл
+  Note over M: снят атрибут карантина macOS, бинарник запущен
+  M->>S: сессии браузера, пароли, токены, SSH-ключи
+</script>
+<figcaption>Атака через «Twitter»-скилл на ClawHub по разбору 1Password. В цепочке нет ни одной уязвимости в привычном смысле: каждый шаг — выполнение инструкции из <code>SKILL.md</code>, которую человек или агент принял за шаг установки.</figcaption>
+</figure>
+
+<p>В обычной цепочке поставок код отделён от документации к нему, и антивирус смотрит на код. В скилле инструкция и есть установщик: текст, который модель прочитает как указание, может велеть ей скачать и запустить что угодно. Документация Anthropic предупреждает, что вредоносный скилл «can direct Claude to invoke tools or execute code in ways that don't match the Skill's stated purpose»<a class="cite" href="#src-7">7</a>, а в блоге в день анонса совет был ставить скиллы «only from trusted sources»<a class="cite" href="#src-6">6</a>.</p>
+
+<div class="note field">
+<blockquote>I predict there will be some sort of package manager opensource project soon. Download skills from some 3rd-party website and run inside Claude. Risks of supply chain issue will be obvious but nobody will care - at least not in the short term.
+<footer>— _pdp_, <a href="https://news.ycombinator.com/item?id=45610693">Hacker News, 16 октября 2025</a></footer></blockquote>
+<p>Через три месяца появились и менеджер пакетов (<code>npx skills</code>, январь 2026), и первая крупная кампания (февраль 2026).</p>
+</div>
+
+<h3>Сколько там вредоносного</h3>
+
+<p>Snyk в исследовании ToxicSkills (5 февраля 2026) проверил 3&nbsp;984 скилла с ClawHub и skills.sh. Заголовок поста говорит о «prompt injection in 36%», и его легко прочитать неверно. На деле 36,82% (1&nbsp;467 скиллов) имели хоть какой-то изъян, 13,4% (534) — критический, подтверждённо вредоносных нашлось 76. Промпт-инъекция встретилась у 2,6% всех скиллов, но у 91% вредоносных<a class="cite" href="#src-46">46</a>.</p>
+
+<p>В работе «Agent Skills in the Wild» (январь 2026) из 31&nbsp;132 разобранных скиллов хотя бы одна уязвимость нашлась у 26,1%, а у скиллов со скриптами шансы оказаться уязвимыми в 2,12 раза выше, чем у скиллов из одних инструкций<a class="cite" href="#src-47">47</a>. Совет выносить детерминированное в скрипты от этого не отменяется, но каждый скрипт — код, который надо ревьюить. Следующая работа той же группы нашла 157 подтверждённо вредоносных скиллов среди 98&nbsp;380 и вынесла в заголовок фразу «Do Not Mention This to the User»<a class="cite" href="#src-48">48</a>.</p>
+
+<p>Хуже другое: инструменты проверки почти не согласны друг с другом. Trent AI в апреле 2026 года прогнал 2&nbsp;354 популярных скилла с ClawHub и через VirusTotal, и через разбор поведения с помощью LLM по MITRE ATLAS и OWASP Agentic AI Top 10<a class="cite" href="#src-49">49</a>. <a href="#fig-scanners">Результат</a> на графике:</p>
+
+<figure class="fig" id="fig-scanners">
+<script type="application/json" class="chart">
+{"type": "stack", "title": "Один и тот же набор скиллов глазами двух проверок", "subtitle": "2 354 популярных скилла с ClawHub", "unit": "%", "decimals": 1,
+ "categories": ["LLM-разбор поведения", "VirusTotal"],
+ "series": [
+  {"name": "Вредоносно", "values": [4.4, 0.04]},
+  {"name": "Уязвимо или подозрительно", "values": [86.0, 57.2]},
+  {"name": "Чисто", "values": [9.6, 42.6], "tone": "muted"}
+ ],
+ "note": "Trent AI, апрель 2026. Вредоносных по LLM-разбору 103, по VirusTotal — 1. Чистыми по обеим проверкам признаны 6,9%."}
+</script>
+<figcaption>Сигнатурный антивирус нашёл один вредоносный скилл там, где разбор поведения нашёл 103. Среди найденных были скиллы вовсе без исполняемого кода: одна markdown-инструкция и есть атака, и сканеру файлов в ней нечего ловить.</figcaption>
+</figure>
+
+<p>Проблема не только в VirusTotal. Исследование ClawHub Security Signals (31 мая 2026) сравнило три проверки — VirusTotal, статический анализ и SkillSpector — на 67&nbsp;453 версиях скиллов. Попарное пересечение отмеченных ими скиллов не превышало 10,4%, все три сразу сошлись на 0,69% отмеченных, а 81,9% отмеченных поймала только одна проверка из трёх<a class="cite" href="#src-50">50</a>. Если вся проверка сводится к «прошёл сканер», исход решает выбор сканера.</p>
+
+<p>Есть и принципиальный предел. 24 июня 2026 года CSO Online рассказал о скилле «brand-landingpage», который прошёл сканеры Cisco, Nvidia и skills.sh: вредоносная часть инструкций лежала не в файлах скилла, а на внешнем домене, который скилл велел открыть во время работы<a class="cite" href="#src-51">51</a>. Это была демонстрация исследователей из AIR на своём домене, а «26&nbsp;000 пользователей» из заголовка — охват рекламы в Instagram, а не установки. Вывод от этого не слабее: статическая проверка при публикации не видит того, что скилл подтянет завтра.</p>
+
+<h3>Что это значит в Claude Code</h3>
+
+<p>ClawHub — не магазин Anthropic, и сравнимых публичных инцидентов в официальном маркетплейсе Claude не описано. Но формат общий, и то, что работает против OpenClaw, работает и против тебя. В Claude Code есть четыре места, о которых стоит знать.</p>
+
+<p>Первое — <code>allowed-tools</code> в проектных скиллах. Документация говорит прямо: доверие к рабочей папке это поле не проверяет, Claude Code применяет его при вызове скилла, «including in a <code>-p</code> run in a folder you've never trusted»<a class="cite" href="#src-2">2</a>. Скилл в чужом репозитории может выдать себе широкий доступ к инструментам. Второе — <code>!</code>-команды: они выполняются при рендере, до того как модель что-то увидит, и если <code>allowed-tools</code> их разрешил, спрашивать тебя никто не станет. Правила запрета при этом сильнее: deny-правило в твоих настройках отменит и то, что скилл себе разрешил. Третье — описание: если в скилле нет <code>disable-model-invocation</code>, модель вызовет его сама, как только запрос покажется похожим, и момент, когда выполнится его код, выбираешь не ты. Четвёртое — <code>hooks</code> во фронтматтере: хук, зарегистрированный при вызове скилла, работает до конца сессии<a class="cite" href="#src-2">2</a>, так что однажды вызванный чужой скилл продолжает действовать и после того, как ты о нём забыл.</p>
+
+<div class="note warn"><p>Прежде чем запускать Claude Code в только что склонированном чужом репозитории, особенно с <code>-p</code>, загляни в <code>.claude/skills/</code>: какие там <code>allowed-tools</code> и <code>hooks</code>, есть ли строки с <code>!`</code> и блоки <code>```!</code>, куда ведут ссылки. Организациям стоит включить <code>disableSkillShellExecution</code> в управляемых настройках: команды в скиллах пользователей, проектов и плагинов тогда не выполняются вовсе.</p></div>
+
+<p>У Anthropic есть собственное сканирование для Enterprise-планов: при загрузке или правке скилла или плагина Claude разбирает содержимое и выносит вердикт pass, warn или fail. С warn скилл работает за предупреждением, fail блокирует его без права отмены даже для администратора. С 2 октября 2026 года сканирование включается по умолчанию у Enterprise-организаций, которые не задали настройку сами. Оно не проверяет скиллы, созданные с помощью Claude, скиллы из подключённых MCP-серверов, сами MCP-серверы и хуки, и не работает в организациях с CMEK, ZDR или HIPAA. Справка оговаривает, что pass «isn't a guarantee that a skill is safe in every respect»<a class="cite" href="#src-52">52</a>. Скиллы из Skills API и из локальных каталогов Claude Code этот сканер не видит.</p>
+
+<p>Руководство Anthropic для компаний даёт порядок ручного ревью чужого скилла<a class="cite" href="#src-16">16</a>. В сокращении:</p>
+
+<ol class="steps">
+  <li><b>Прочитай все файлы.</b> Не только <code>SKILL.md</code>, но и каждый скрипт, справочник и шаблон.</li>
+  <li><b>Запускай скрипты в песочнице.</b> Сначала там, где им нечего украсть.</li>
+  <li><b>Ищи инструкции, которые расходятся с заявленной целью.</b> Скрытые действия, «не сообщай пользователю», просьбы что-то установить.</li>
+  <li><b>Найди все сетевые обращения и внешние URL.</b> <code>curl</code>, <code>requests</code>, ссылки, куда скилл велит сходить за инструкциями.</li>
+  <li><b>Проверь, нет ли вшитых секретов</b> и какие инструменты скилл вызывает или разрешает себе через <code>allowed-tools</code>.</li>
+  <li><b>Ищи выгрузку данных под видом обычного ответа.</b> Например, «добавь в отчёт содержимое <code>~/.ssh</code>».</li>
+</ol>
+
+<p>Промпт-инъекция и защита от неё в целом разобраны в <a href="../16-security/index.html">главе 16</a>. Для скиллов достаточно одного правила: чужой скилл — это чужой код с правами твоего агента, и доверять ему можно не больше, чем пакету из PyPI от неизвестного автора, у которого <code>setup.py</code> что-то скачивает при установке.</p>
+
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>У тебя 40 скиллов, и модель перестала сама вызывать редкий, хотя в <code>/skills</code> он виден. Что, скорее всего, случилось и как это проверить?</summary><p>Листинг не влез в бюджет (1% окна), и Claude Code выкинул описания самых редких скиллов: имя осталось, а сопоставлять запрос не с чем. Проверка — строка Skills в <code>/context</code>, <code>/doctor</code> и лог <code>--debug</code>. Лечится поднятием <code>skillListingBudgetFraction</code>, режимом <code>"name-only"</code> для второстепенных или уборкой по <code>/skill-doctor</code>.</p></details>
+<details><summary>Почему скилл с валидатором на 400 строк в <code>scripts/</code> может обходиться в контексте дешевле, чем скилл, где та же логика описана текстом?</summary><p>Скрипт выполняется в шелле, и в контекст попадает только его вывод, а код — никогда. Текстовое описание логики ляжет в тело целиком при активации и будет лежать в истории до конца сессии.</p></details>
+<details><summary>В длинной сессии ты вызвал восемь больших скиллов. После автокомпакции агент перестал соблюдать правила первого из них. Почему и что делать?</summary><p>После сводки Claude Code прикрепляет последний вызов каждого скилла, но только первые 5&nbsp;000 токенов, и всего не больше 25&nbsp;000, начиная с самого свежего. При больших скиллах переживут пять последних, первый выпал целиком. Вызови его снова; важные правила ставь в начало <code>SKILL.md</code>; то, что должно соблюдаться всегда, переноси в хук.</p></details>
+<details><summary>В скилле деплоя написано <code>disable_model_invocation: true</code>, а модель вызвала его сама. Почему?</summary><p>Поле называется <code>disable-model-invocation</code>, через дефис. Неизвестные поля Claude Code молча игнорирует, так что запрета не было вообще.</p></details>
+<details><summary>Скилл со строкой <code>!`uv run alembic check`</code> иногда падает с ошибкой рендера. Когда именно и как это починить?</summary><p>Когда есть изменения моделей без миграции: <code>alembic check</code> в этом случае завершается с ненулевым кодом, а любой ненулевой код отменяет весь вызов скилла. Нужно дописать <code>|| true</code>, чтобы вывод команды попадал в текст, а решение принимала модель.</p></details>
+<details><summary>Почему <code>allowed-tools</code> не делает скилл безопаснее и чем от него отличается <code>disallowed-tools</code>?</summary><p><code>allowed-tools</code> заранее одобряет инструменты на один ход и ничего не ограничивает, а в проектном скилле ещё и не проверяется доверием к папке. Ограничивает только <code>disallowed-tools</code>, который убирает инструменты из доступных, пока скилл активен, и deny-правила в настройках.</p></details>
+<details><summary>Скилл отлично работает в Claude Code и ломается через Claude API. Назови три вероятные причины.</summary><p>В контейнере нет сети и нельзя ставить пакеты. Поля Claude Code во фронтматтере ломают загрузку. <code>!</code>-команды и подстановки вроде <code>${CLAUDE_SKILL_DIR}</code> работают только в Claude Code.</p></details>
+<details><summary>Коллега говорит, что <code>/deploy</code> в вашем репозитории ведёт себя не так, как у тебя. Что проверить первым?</summary><p>Нет ли у кого-то из вас личного <code>~/.claude/skills/deploy</code>: в Claude Code личный скилл перекрывает проектный с тем же именем. Заодно — нет ли корпоративного скилла с этим именем, он главнее обоих.</p></details>
+<details><summary>У Vercel индекс в <code>AGENTS.md</code> дал 100%, а скилл с той же документацией — 53%. Значит ли это, что скиллы хуже?</summary><p>Нет. Скилл не вызывался в 56% прогонов, а знание о фреймворке нужно почти в каждой задаче, поэтому выгоднее держать его в контексте постоянно. Скилл выигрывает на редких процедурах с явным запуском; рабочая связка — указатель в <code>CLAUDE.md</code> и процедура в скилле.</p></details>
+<details><summary>Ты одобрил скилл, пришедший по MCP, а через неделю сервер добавил в него файл. Что обязан сделать хост и почему дайджесты не спасают от злонамеренного сервера?</summary><p>Одобрение привязано к точному набору <code>{uri, digest}</code>; новый набор в <code>skills/list</code> или <code>skills/get</code> отзывает его, и хост должен спросить заново. Дайджесты не подписаны и приходят с того же сервера, что и файлы: они ловят рассинхрон, но не злой умысел самого сервера.</p></details>
+<details><summary>В первой версии SkillsBench скиллы дали +16,2 п.п. в среднем, но только +4,5 п.п. в Software Engineering. Какой скилл стоит писать Python-бэкендеру, а какой почти бесполезен?</summary><p>Бесполезен скилл с общими знаниями о программировании: их модель и так знает. Полезен узкий скилл с тем, чего модель знать не может: ваши правила миграций, особенности окружения, подводные камни вроде <code>/health</code> против <code>/ready</code>. И проверяй его evals, а не на глаз: скиллы, которые модель написала себе сама, в среднем не дали ничего.</p></details>
+<details><summary>Почему вердикт pass от сканера Enterprise не заменяет ручного ревью чужого скилла?</summary><p>Сканеры плохо согласуются между собой, статическая проверка не видит того, что скилл подтянет с внешнего домена потом, и справка Anthropic сама пишет, что pass не гарантия. Скиллы из Skills API, локальных каталогов и MCP-серверов скан не видит вовсе.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу с нуля написать скилл, который проходит <code>skills-ref validate</code> и загружается в claude.ai без ошибки про лишние поля</li>
+  <li>Умею найти строку Skills в <code>/context</code>, объяснить её размер и освободить бюджет через <code>skillOverrides</code></li>
+  <li>Проверял, вызывается ли мой скилл: 20 запросов по 3 прогона через <code>claude -p --output-format json</code> и <code>jq</code> по <code>tool_use</code> инструмента <code>Skill</code></li>
+  <li>Писал для скилла скрипт в расчёте на агента: без интерактивного ввода, с <code>--help</code>, JSON в stdout и разными кодами выхода</li>
+  <li>Использую <code>!</code>-команды в скиллах и знаю, какие коды выхода отменяют вызов и как разрешить команды через <code>allowed-tools</code></li>
+  <li>Для конкретной задачи своего проекта могу выбрать между <code>CLAUDE.md</code>, скиллом, <code>disable-model-invocation</code>, <code>context: fork</code>, MCP-сервером и хуком и объяснить выбор</li>
+  <li>Вызывал скилл через Messages API с <code>container.skills</code>, обрабатывал <code>pause_turn</code> и скачивал результат по <code>file_id</code></li>
+  <li>Загружал свой скилл через Skills API без beta-заголовка и помню, что новая версия — полный снимок каталога</li>
+  <li>Прогонял <code>skill-creator</code> или <code>claude plugin eval</code> и читал <code>benchmark.json</code>: сколько скилл добавляет и сколько стоит</li>
+  <li>Держу командные скиллы так, чтобы их видели и Claude Code, и Codex: <code>.claude/skills</code> плюс симлинк <code>.agents/skills</code>, только поля спецификации</li>
+  <li>Перед запуском Claude Code в чужом репозитории проверяю <code>.claude/skills/</code>: <code>allowed-tools</code>, <code>!</code>-строки, внешние ссылки, скрипты</li>
+  <li>Чистил свои скиллы по отчёту <code>/skill-doctor</code> и сравнивал размер листинга до и после</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://vercel.com/blog/agents-md-outperforms-skills-in-our-agent-evals">AGENTS.md outperforms skills in our agent evals</a>. Jude Gao, Vercel, 27 января 2026.</li>
+  <li id="src-2"><a href="https://code.claude.com/docs/en/skills">Extend Claude with skills</a>. Документация Claude Code, Anthropic; поведение до v2.1.282, прочитано 30 сентября 2026.</li>
+  <li id="src-3"><a href="https://agentskills.io/specification">Specification</a>. Agent Skills, agentskills.io, прочитано 30 сентября 2026.</li>
+  <li id="src-4"><a href="https://platform.claude.com/docs/en/build-with-claude/skills-guide">Using Agent Skills with the API</a>. Документация Claude Platform, Anthropic, прочитано 30 сентября 2026.</li>
+  <li id="src-5"><a href="https://code.claude.com/docs/en/changelog">Claude Code changelog</a>. Anthropic, записи с 7 января по 29 сентября 2026 (v2.1.0–v2.1.285).</li>
+  <li id="src-6"><a href="https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills">Equipping agents for the real world with Agent Skills</a>. Barry Zhang, Keith Lazuka, Mahesh Murag, Anthropic Engineering, 16 октября 2025, дополнено 18 декабря 2025.</li>
+  <li id="src-7"><a href="https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview">Agent Skills (overview)</a>. Документация Claude Platform, Anthropic, прочитано 30 сентября 2026.</li>
+  <li id="src-8"><a href="https://agentskills.io/client-implementation/adding-skills-support">How to add skills support to your agent</a>. agentskills.io, прочитано 30 сентября 2026.</li>
+  <li id="src-9"><a href="https://docs.openclaw.ai/tools/skills">Skills</a>. Документация OpenClaw, прочитано 30 сентября 2026.</li>
+  <li id="src-10"><a href="https://arxiv.org/abs/2609.35692">Report: Progressive Disclosure of Agent Skills</a>. Guilin Zhang et al., Workday, arXiv 2609.35692, 28 сентября 2026.</li>
+  <li id="src-11"><a href="https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices">Skill authoring best practices</a>. Документация Claude Platform, Anthropic, прочитано 30 сентября 2026.</li>
+  <li id="src-12"><a href="https://github.com/anthropics/skills/blob/main/skills/skill-creator/SKILL.md">skill-creator/SKILL.md</a>. Репозиторий anthropics/skills, прочитано 30 сентября 2026.</li>
+  <li id="src-13"><a href="https://geminicli.com/docs/cli/skills/">Agent Skills</a>. Документация Gemini CLI, последняя правка 30 апреля 2026.</li>
+  <li id="src-14"><a href="https://opencode.ai/docs/skills/">Agent Skills</a>. Документация OpenCode, обновлено 29 сентября 2026.</li>
+  <li id="src-15"><a href="https://developers.openai.com/codex/skills">Build skills</a>. Документация ChatGPT и Codex, OpenAI, прочитано 30 сентября 2026.</li>
+  <li id="src-16"><a href="https://platform.claude.com/docs/en/agents-and-tools/agent-skills/enterprise">Skills for enterprise</a>. Документация Claude Platform, Anthropic, прочитано 30 сентября 2026.</li>
+  <li id="src-17"><a href="https://skillcrossroads.com/report">The State of Claude Code Skills</a>. Skill Crossroads, 10 сентября 2026, рубрика v1.2.</li>
+  <li id="src-18"><a href="https://alembic.sqlalchemy.org/en/latest/autogenerate.html">Auto Generating Migrations: Running Alembic Check</a>. Документация Alembic, прочитано 30 сентября 2026.</li>
+  <li id="src-19"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool">Code execution tool</a>. Документация Claude Platform, Anthropic, прочитано 30 сентября 2026.</li>
+  <li id="src-20"><a href="https://macwright.com/2025/10/20/agent-skills">Agent Skills</a>. Tom MacWright, 20 октября 2025.</li>
+  <li id="src-21"><a href="https://platform.claude.com/docs/en/managed-agents/skills">Skills (Managed Agents)</a>. Документация Claude Platform, Anthropic, бета <code>managed-agents-2026-04-01</code>, прочитано 30 сентября 2026.</li>
+  <li id="src-22"><a href="https://code.claude.com/docs/en/agent-sdk/skills">Agent Skills in the SDK</a>. Документация Claude Agent SDK, Anthropic, прочитано 30 сентября 2026.</li>
+  <li id="src-23"><a href="https://claude.com/blog/skills">Introducing Agent Skills</a>. Claude blog, Anthropic, 16 октября 2025, дополнено 18 декабря 2025.</li>
+  <li id="src-24"><a href="https://github.com/agentskills/agentskills">agentskills/agentskills</a>: README, CONTRIBUTING, история коммитов и список клиентов <code>docs/snippets/clients.jsx</code>. Прочитано 30 сентября 2026.</li>
+  <li id="src-25"><a href="https://code.visualstudio.com/docs/copilot/customization/agent-skills">Use Agent Skills in VS Code</a>. Microsoft, прочитано 30 сентября 2026.</li>
+  <li id="src-26"><a href="https://cursor.com/docs/skills">Agent Skills</a>. Документация Cursor, прочитано 30 сентября 2026.</li>
+  <li id="src-27"><a href="https://agent-plugins.org/specification">Agent Plugins Specification v1.0.0</a> и MAINTAINERS/GOVERNANCE репозитория agentplugins/agent-plugins-spec. Прочитано 30 сентября 2026.</li>
+  <li id="src-28"><a href="https://simonwillison.net/2025/Oct/16/claude-skills/">Claude Skills are awesome, maybe a bigger deal than MCP</a>. Simon Willison, 16 октября 2025.</li>
+  <li id="src-29"><a href="https://github.com/modelcontextprotocol/ext-skills/blob/main/specification/stable/skills.mdx">Skills extension (SEP-2640)</a>. Skills Over MCP Working Group, Model Context Protocol, статус Final с 11 сентября 2026.</li>
+  <li id="src-30"><a href="https://github.com/modelcontextprotocol/ext-skills/blob/main/docs/implementations.md">Implementations</a>. Репозиторий modelcontextprotocol/ext-skills, состояние на 29 сентября 2026.</li>
+  <li id="src-31"><a href="https://claude.com/blog/build-plugins-for-claude">Build plugins for Claude</a>. Claude blog, Anthropic, 25 сентября 2026.</li>
+  <li id="src-32"><a href="https://arxiv.org/abs/2602.12670">SkillsBench: Benchmarking How Well Agent Skills Work Across Diverse Tasks</a>. Xiangyi Li et al., arXiv 2602.12670, v1 13 февраля 2026, v4 14 июня 2026.</li>
+  <li id="src-33"><a href="https://arxiv.org/abs/2605.31408">Skill Availability and Presentation Granularity in Large-Language-Model Agents: A Controlled SkillsBench Study</a>. Xiaonan Xu, Wenjing Wu, arXiv 2605.31408, 29 мая 2026.</li>
+  <li id="src-34"><a href="https://claude.com/blog/improving-skill-creator-test-measure-and-refine-agent-skills">Improving skill-creator: Test, measure, and refine Agent Skills</a>. Claude blog, Anthropic, 3 марта 2026, обновлено 21 июня 2026.</li>
+  <li id="src-35"><a href="https://arxiv.org/abs/2608.08453">What Keeps Agent Skills from Being Reusable? Evidence from 138K SKILL.md Files</a>. Chi Zhang et al., arXiv 2608.08453, 9 августа 2026.</li>
+  <li id="src-36"><a href="https://agentskills.io/skill-creation/optimizing-descriptions">Optimizing skill descriptions</a>. agentskills.io, прочитано 30 сентября 2026.</li>
+  <li id="src-37"><a href="https://agentskills.io/skill-creation/best-practices">Best practices for skill creators</a>. agentskills.io, прочитано 30 сентября 2026.</li>
+  <li id="src-38"><a href="https://agentskills.io/skill-creation/using-scripts">Using scripts in skills</a>. agentskills.io, прочитано 30 сентября 2026.</li>
+  <li id="src-39"><a href="https://github.com/anthropics/skills">anthropics/skills</a>: README, <code>skills/pdf/SKILL.md</code>, <code>skills/webapp-testing/SKILL.md</code>. Прочитано 30 сентября 2026.</li>
+  <li id="src-40"><a href="https://www.manifold.security/blog/scope-squatting-clawhub-plugins">Scope Squatting: Those @openclaw and @clawhub Plugins Aren't Officially Theirs</a>. Ax Sharma, Manifold Security, 19 июня 2026.</li>
+  <li id="src-41"><a href="https://claude.com/blog/organization-skills-and-directory">Skills for organizations, partners, the ecosystem</a>. Claude blog, Anthropic, 18 декабря 2025.</li>
+  <li id="src-42"><a href="https://support.claude.com/en/articles/12512180-using-skills-in-claude">Use skills in Claude</a>. Claude Help Center, Anthropic, прочитано 30 сентября 2026.</li>
+  <li id="src-43"><a href="https://github.com/vercel-labs/skills">vercel-labs/skills</a>: README и релизы, v1.7.0 от 17 сентября 2026.</li>
+  <li id="src-44"><a href="https://skills.sh/audits">Security Audits</a>. skills.sh, прочитано 30 сентября 2026.</li>
+  <li id="src-45"><a href="https://1password.com/blog/from-magic-to-malware-how-openclaws-agent-skills-become-an-attack-surface">From magic to malware: how OpenClaw's Agent Skills become an attack surface</a>. 1Password Blog, 2 февраля 2026.</li>
+  <li id="src-46"><a href="https://snyk.io/blog/toxicskills-malicious-ai-agent-skills-clawhub/">ToxicSkills: Snyk Finds Prompt Injection in 36%, 1467 Malicious Payloads…</a>. Snyk, 5 февраля 2026.</li>
+  <li id="src-47"><a href="https://arxiv.org/abs/2601.10338">Agent Skills in the Wild: An Empirical Study of Security Vulnerabilities at Scale</a>. Yi Liu et al., arXiv 2601.10338, 15 января 2026.</li>
+  <li id="src-48"><a href="https://arxiv.org/abs/2602.06547">„Do Not Mention This to the User“: Detecting and Understanding Malicious Agent Skills in the Wild</a>. Yi Liu et al., arXiv 2602.06547, v1 6 февраля 2026.</li>
+  <li id="src-49"><a href="https://trent.ai/blog/clawhub-ai-agent-security-analysis/">Distinguishing Malicious from Vulnerable: 2,354 Popular ClawHub Skills Analysed</a>. Julien Brouchier, Trent AI, 15 апреля 2026.</li>
+  <li id="src-50"><a href="https://arxiv.org/abs/2606.01494">ClawHub Security Signals: When VirusTotal, Static Analysis, and SkillSpector Disagree</a>. Vincent Koc et al., arXiv 2606.01494, 31 мая 2026.</li>
+  <li id="src-51"><a href="https://www.csoonline.com/article/4188840/how-a-malicious-ai-agent-skill-passed-security-checks-and-reached-26000-users.html">How a malicious AI agent skill passed security checks and reached 26,000 users</a>. Prasanth Aby Thomas, CSO Online, 24 июня 2026.</li>
+  <li id="src-52"><a href="https://support.claude.com/en/articles/15927065-get-started-with-skill-and-plugin-scanning">Get started with skill and plugin scanning</a>. Claude Help Center, Anthropic, прочитано 30 сентября 2026.</li>
+  <li id="src-53"><a href="https://modelcontextprotocol.io/seps/2640-skills-extension">SEP-2640: Skills Extension</a> и <a href="https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640">PR #2640</a>. Model Context Protocol: коммит «mark as Final» от спонсора 11 сентября 2026, мерж 13 сентября 2026.</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>

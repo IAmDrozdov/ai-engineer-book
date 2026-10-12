@@ -1,0 +1,1079 @@
+<!doctype html>
+<html lang="ru" data-chapter="11">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Память агента — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 11</b> из 17, часть «Архитектура»</p>
+  <h1>Память агента</h1>
+  <p class="lead">Загляни в <code>~/.claude/projects/</code>: с февраля 2026 года Claude Code складывает туда заметки о тебе и о проекте, которые ты не писал, и первые 200 строк их индекса уходят в каждую новую сессию. В июле Anthropic назвала эту auto memory заменой ручному <code>CLAUDE.md</code>, а в обсуждении на Hacker News тут же нашлись люди, которые её выключили и сказали, что агент стал работать лучше. Кто прав, зависит от того, что агент туда пишет, когда и как это потом возвращается в запрос.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="survives">
+<h2>Что переживает окно</h2>
+<p>Если добавить в запрос к Claude инструмент памяти, API сам допишет в системный промпт вот такой блок<a class="cite" href="#src-1">1</a>:</p>
+<script type="text/plain" class="code" data-lang="prompt" data-title="Что API добавляет в системный промпт вместе с memory tool">
+IMPORTANT: ALWAYS VIEW YOUR MEMORY DIRECTORY BEFORE DOING ANYTHING ELSE.
+MEMORY PROTOCOL:
+1. Use the `view` command of your `memory` tool to check for earlier progress.
+2. ... (work on the task) ...
+   - As you make progress, record status / progress / thoughts etc in your memory.
+ASSUME INTERRUPTION: Your context window might be reset at any moment, so you risk losing any progress that is not recorded in your memory directory.
+</script>
+<p>Последняя строка честнее всего остального в этой теме. Веса модели между запросами не меняются, а каждый запрос харнесс собирает заново из системного промпта, определений инструментов и истории сообщений (цикл разобран в <a href="../01-llm-api-agent-loop/index.html">главе 1</a>). Всё, что агент «помнит» со вчерашнего дня, — текст, который кто-то записал вне окна контекста, а сегодня положил обратно. Хранит его харнесс. Модель в лучшем случае решает, что записать.</p>
+<p>Поэтому у любой системы памяти, от <code>CLAUDE.md</code> до графа знаний в Neo4j, одни и те же узлы. Кто пишет и когда: сама модель посреди разговора, отдельный процесс после него или человек руками. Где и в каком виде лежит: файл, строка в векторной базе, ребро графа. Как возвращается в запрос: всегда при старте, по поиску, по триггеру. И вопрос, который обычно откладывают до первого инцидента: как запись стареет и кто её удаляет. Продукты удобнее всего сравнивать по этим четырём ответам.</p>
+<div class="note key"><p>Память агента — не база данных, а четыре решения: кто пишет, где лежит, как возвращается в запрос, как стареет. Большая часть сбоев из полевых отчётов в этой главе случается на записи, а не на поиске.</p></div>
+
+<aside class="margin"><p><b>CoALA</b> — Cognitive Architectures for Language Agents. Самерс, Яо, Нарасимхан и Гриффитс, Принстон; первая версия — сентябрь 2023, третья — март 2024.</p></aside>
+<p>Словарь для этих решений дала статья CoALA<a class="cite" href="#src-2">2</a>. Она делит память агента на рабочую и три долговременных хранилища, и в блогах её обычно пересказывают с одной ошибкой: рабочую память приравнивают к окну контекста. В оригинале наоборот. Прежние системы, пишут авторы, использовали «the LLM's own context as a form of working memory», а у них рабочая память — «a data structure that persists across LLM calls. On each LLM call, the LLM input is synthesized from a subset of working memory». План задачи, список дел, промежуточные результаты инструментов живут в состоянии харнесса (в Claude Code это список задач, в LangGraph — state графа), и в каждый запрос попадает только их часть. Компакция из <a href="../02-context-engineering/index.html">главы 2</a> режет промпт, а рабочую память не трогает.</p>
+<p>Долговременных хранилищ три. <dfn>Эпизодическая память</dfn> хранит опыт прошлых циклов: траектории, транскрипты, «в четвёртой сессии пользователь отверг этот подход». <dfn>Семантическая</dfn> хранит факты о мире и о самом агенте: «в проекте pnpm, а не npm», «тестовая база на порту 5433». <dfn>Процедурная</dfn> — знание о том, как действовать: веса модели и код агента вместе с промптами. Первые две могут стартовать пустыми, процедурную обязан заполнить разработчик. Про запись в неё авторы CoALA предупреждают отдельно: это «significantly riskier than writing to episodic or semantic memory, as it can easily introduce bugs or allow an agent to subvert its designers' intentions»: такая запись легко вносит баги или даёт агенту обойти замысел разработчиков. Фраза написана в 2023 году, задолго до агентов, которые правят собственные скиллы, и не устарела.</p>
+
+<figure class="fig" id="fig-coala">
+<script type="text/x-mermaid">
+flowchart TD
+  ep[("Эпизодическая<br/>траектории, транскрипты")]
+  sem[("Семантическая<br/>факты о мире и пользователе")]
+  proc[("Процедурная<br/>код агента, промпты, скиллы")]:::warn
+  wm["Рабочая память<br/>план, цели, результаты тулов"]:::accent
+  llm{{"Вызов LLM"}}
+  ep -- "поиск" --> wm
+  sem -- "поиск" --> wm
+  proc -- "навык по запросу" --> wm
+  wm -- "в промпт" --> llm
+  llm -- "ответ" --> wm
+  wm -. "запись опыта" .-> ep
+  wm -. "запись знания" .-> sem
+  wm -. "запись навыка, риск" .-> proc
+</script>
+<figcaption>Схема CoALA. Модель видит только то, что харнесс собрал из рабочей памяти на этом шаге; долговременные хранилища общаются с моделью через неё. Пунктир — записи, и самая опасная из них идёт в процедурную память.</figcaption>
+</figure>
+
+<p>На инструментах, которыми ты пользуешься каждый день, это раскладывается так:</p>
+<table>
+<thead><tr><th>Тип по CoALA</th><th>Где это в Claude Code</th><th>Кто пишет</th><th>Как попадает в запрос</th></tr></thead>
+<tbody>
+<tr><th>Рабочая</th><td>список задач, план, результаты тулов текущей сессии</td><td>харнесс и модель</td><td>собирается на каждом шаге</td></tr>
+<tr><th>Эпизодическая</th><td>транскрипты сессий в <code>~/.claude/projects/</code></td><td>харнесс</td><td>при <code>--resume</code> или если агент сам откроет файл</td></tr>
+<tr><th>Семантическая</th><td>auto memory: заметки <code>user</code>, <code>project</code>, <code>reference</code></td><td>Claude</td><td>индекс при старте, заметки по требованию</td></tr>
+<tr><th>Процедурная</th><td><code>CLAUDE.md</code>, <code>.claude/rules/</code>, скиллы, хуки; заметки <code>feedback</code></td><td>человек; <code>feedback</code> пишет Claude</td><td><code>CLAUDE.md</code> при старте, скилл по описанию</td></tr>
+</tbody>
+</table>
+<p>Где кончается тема. Поиск по документам, которые написали люди, — семантическая память только для чтения, то есть RAG из <a href="../14-rag/index.html">главы 14</a>. Компакция работает с окном. Скиллы как формат описаны в <a href="../06-skills/index.html">главе 6</a>, здесь они только процедурная память, которую агент дописывает сам. Остаётся память, которую пишет агент или которую пишут о нём: о пользователе, о проекте, о его собственных ошибках.</p>
+</section>
+
+<section id="claude-code">
+<h2>Память, которая уже лежит у тебя на диске</h2>
+<p>Так документация Claude Code описывает каталог auto memory<a class="cite" href="#src-3">3</a>:</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Каталог auto memory">
+~/.claude/projects/<project>/memory/
+├── MEMORY.md           # Index, one line per memory, loaded into every session
+├── user_role.md        # One memory
+├── feedback_testing.md # One memory
+└── ...                 # Any other topic files Claude creates
+</script>
+<p>Имя <code>&lt;project&gt;</code> выводится из git-репозитория, поэтому все worktree и подкаталоги одного репо делят один каталог. Живёт он только на этой машине: на второй ноутбук и в облачные окружения не синхронизируется. Настройка <code>autoMemoryDirectory</code> переносит каталог, но из <code>.claude/settings.json</code> репозитория действует только после того, как ты доверился папке. Уборка транскриптов по <code>cleanupPeriodDays</code> память не трогает.</p>
+<p>Первое упоминание в CHANGELOG — v2.1.32 от 5 февраля 2026 года: «Claude now automatically records and recalls memories as it works», то есть Claude сам записывает и вспоминает заметки по ходу работы. Через три недели, в v2.1.59, механизм получил имя auto memory и переключатель в <code>/memory</code><a class="cite" href="#src-4">4</a>. Статьи про Claude Code, написанные раньше, описывают инструмент без неё.</p>
+
+<h3>Что туда пишется</h3>
+<p>Claude записывает четыре вида заметок и помечает вид полем <code>type</code> во frontmatter. <code>user</code> — твоя роль, опыт и привычки. <code>feedback</code> — «corrections you give Claude and approaches you confirm», то есть поправки и одобренные подходы. <code>project</code> — текущая работа, сроки и решения, которых не видно ни из кода, ни из истории git. <code>reference</code> — где искать информацию вне проекта: трекер, дашборд. Всё, что выводится из кода (архитектуру, пути, исправленные баги), и всё, что уже сказано в <code>CLAUDE.md</code>, модель по документации пропускает. Сохраняет она не в каждой сессии. Когда сохраняет или вспоминает, в интерфейсе появляются строки «Saved 2 memories» и «Recalled 2 memories».</p>
+<div class="tabs">
+<section data-tab="MEMORY.md">
+<script type="text/plain" class="code" data-lang="markdown" data-title="Набросок: индекс, по строке на заметку">
+- [Роль](user_role.md) — бэкенд на Python, FastAPI, пишет тест до кода
+- [API-тесты](feedback_testing.md) — интеграционным тестам нужен локальный Redis
+- [Миграции](project_migrations.md) — до 15 октября схему billing не трогать
+- [Трекер](reference_tracker.md) — задачи в Linear, проект BACK
+</script>
+</section>
+<section data-tab="feedback_testing.md">
+<script type="text/plain" class="code" data-lang="markdown" data-title="Набросок: одна заметка типа feedback">
+---
+name: API-тесты требуют Redis
+description: перед pytest tests/api поднять локальный Redis
+type: feedback
+modified: 2026-09-14T10:22:31Z
+---
+Интеграционные тесты в tests/api падают без Redis на 6379.
+Пользователь дважды поправлял: Redis не мокать, поднимать docker compose up redis.
+</script>
+</section>
+</div>
+<p>Файлы выше — набросок. Документация называет только два поля frontmatter: <code>type</code> и <code>modified</code>. Второе Claude Code с v2.1.214 сам проставляет при каждой записи как метку времени ISO 8601, чтобы и ты, и модель видели, насколько факт свежий; в файл без frontmatter он его не добавляет. Остальные поля меняются от версии к версии, смотри в своём каталоге.</p>
+
+<h3>Что и когда попадает в запрос</h3>
+<p>При старте каждой сессии в контекст уходят первые 200 строк <code>MEMORY.md</code> или первые 25KB, смотря что наступит раньше. Topic-файлы при старте не грузятся: Claude читает их обычными инструментами, когда решит, что нужно. После каждой записи в <code>MEMORY.md</code> Claude Code меряет файл и близко к пределу напоминает модели ужать индекс. За пределом запись всё равно проходит, но модель получает ошибку с требованием переписать индекс, «because everything past the limit is dropped on the next load»: всё, что за пределом, при следующей загрузке отбросится. Явной эта ошибка стала только в v2.1.210 (14 июля 2026); до того хвост индекса просто молча не загружался в следующую сессию.</p>
+<p><code>CLAUDE.md</code> грузится по другим правилам: файл до 4 MiB целиком, больший пропускается. Корневой <code>CLAUDE.md</code> переживает <code>/compact</code>, потому что после компакции Claude Code перечитывает его с диска, а вложенные <code>CLAUDE.md</code> и правила с <code>paths:</code> возвращаются, когда Claude снова открывает подходящий файл. Главное документация говорит в самом начале: оба механизма для модели — «context, not enforced configuration», то есть контекст, а не настройка, исполнение которой гарантировано. Если действие надо запретить при любом решении модели, нужен хук <code>PreToolUse</code>, а не строка в памяти.</p>
+
+<figure class="fig wide" id="fig-cc-load">
+<script type="text/x-mermaid">
+flowchart LR
+  start(("Старт сессии"))
+  cmd["CLAUDE.md: managed, ~/.claude,<br/>проект, CLAUDE.local.md<br/>целиком, до 4 MiB"]
+  rules[".claude/rules<br/>без paths"]
+  idx["MEMORY.md<br/>первые 200 строк или 25KB"]:::accent
+  topic["topic-файлы<br/>user_role.md и др."]
+  nested["вложенные CLAUDE.md,<br/>rules с paths"]
+  sub["Сабагент"]
+  own["свой MEMORY.md<br/>memory: user, project, local"]:::violet
+  fork["Форк"]
+  start --> cmd
+  start --> rules
+  start --> idx
+  idx -. "Read по решению Claude" .-> topic
+  cmd -. "при чтении файла в подкаталоге" .-> nested
+  start -- "без индекса сессии" --> sub
+  sub --> own
+  start -- "наследует разговор и индекс" --> fork
+</script>
+<figcaption>Что Claude Code кладёт в контекст. Сплошные стрелки срабатывают при старте, пунктир — по ходу работы. Индекс auto memory ограничен, заметки читаются только по требованию, а обычный сабагент основной памяти не видит и живёт со своей.</figcaption>
+</figure>
+
+<p>Сабагенты устроены отдельно<a class="cite" href="#src-5">5</a>. Основная auto memory в них не попадает, исключение — форк, который наследует весь разговор и системный промпт. Зато у сабагента может быть своя память: поле <code>memory</code> в его определении с областью <code>user</code> (каталог <code>~/.claude/agent-memory/&lt;name&gt;/</code>), <code>project</code> (<code>.claude/agent-memory/&lt;name&gt;/</code>, её можно коммитить вместе с кодом) или <code>local</code> (<code>.claude/agent-memory-local/&lt;name&gt;/</code>). В промпт сабагента уходят первые 200 строк или 25KB его собственного <code>MEMORY.md</code>, а инструменты Read, Write и Edit включаются автоматически. Если выключить auto memory, выключится и эта.</p>
+<script type="text/plain" class="code" data-lang="markdown" data-title="Набросок: .claude/agents/migration-reviewer.md">
+---
+name: migration-reviewer
+description: Проверяет миграции Alembic перед мержем
+tools: Read, Grep, Glob
+memory: project
+---
+Проверяй миграции в migrations/versions. Перед работой прочитай свою память:
+там записаны ловушки, которые уже встречались в этом репозитории.
+</script>
+<p>Сабагент с <code>memory: project</code> — самый дешёвый способ получить общую для команды память: каталог лежит в репозитории, изменения проходят ревью, как код.</p>
+<p>Рядом с памятью стоит <code>AGENTS.md</code>, общий файл инструкций для разных агентов. С v2.1.277 (18 сентября 2026) Claude Code читает его напрямую, но только если ни в рабочем каталоге, ни выше нет <code>CLAUDE.md</code>, <code>.claude/CLAUDE.md</code> или <code>CLAUDE.local.md</code>. Отсюда неочевидная ловушка: добавив себе <code>CLAUDE.local.md</code> в проекте, который живёт на <code>AGENTS.md</code>, ты выключаешь чтение <code>AGENTS.md</code> для себя. <code>AGENTS.local.md</code> и <code>AGENTS.override.md</code> не читаются никогда. Выход — настройка Project instructions в <code>/config</code> со значением <code>claude-md-and-agents-md</code>: тогда грузятся оба файла<a class="cite" href="#src-3">3</a>. Закоммитить её в репозиторий нельзя, из настроек проекта Claude Code её игнорирует; она живёт в пользовательских или managed settings.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="~/.claude/settings.json (из документации)">
+{
+  "pluginConfigs": {
+    "agents-md@builtin": {
+      "options": { "instructionFiles": "claude-md-and-agents-md" }
+    }
+  }
+}
+</script>
+
+<ol class="timeline">
+  <li><time>5 февраля 2026</time><p>v2.1.32: «Claude now automatically records and recalls memories as it works» — Claude сам записывает и вспоминает заметки.</p></li>
+  <li class="is-major"><time>25 февраля 2026</time><p>v2.1.59: auto memory с переключателем в <code>/memory</code>.</p></li>
+  <li><time>28 февраля 2026</time><p>v2.1.63: одна память на все worktree репозитория.</p></li>
+  <li><time>11 марта 2026</time><p>v2.1.74: настройка <code>autoMemoryDirectory</code>.</p></li>
+  <li><time>24 марта 2026</time><p>v2.1.83: индекс режется и по 25KB, а не только по 200 строкам.</p></li>
+  <li><time>14 июля 2026</time><p>v2.1.210: переполненный индекс даёт явную ошибку вместо молчаливого обрезания.</p></li>
+  <li><time>18 июля 2026</time><p>v2.1.214: поле <code>modified</code> во frontmatter заметок.</p></li>
+  <li><time>18 сентября 2026</time><p>v2.1.277: <code>AGENTS.md</code> читается напрямую.</p></li>
+  <li class="is-major"><time>28 сентября 2026</time><p>v2.1.284: невидимые символы и теги, которые имитируют разметку Claude Code, нейтрализуются в <code>MEMORY.md</code> и вспомненных заметках.</p></li>
+  <li><time>29 сентября 2026</time><p>v2.1.285: из фоновой сессии auto memory можно только выключить, но не включить.</p></li>
+</ol>
+
+<h3>Включать или нет</h3>
+<p>24 июля 2026 года Тарик Шихипар из Anthropic опубликовал список того, как изменилась работа с контекстом для моделей поколения Claude 5<a class="cite" href="#src-6">6</a>. Один из пунктов звучит как «Then: Memory in CLAUDE.md files. Now: Auto-memory»: раньше пользователей учили сохранять факты в <code>CLAUDE.md</code> горячей клавишей, а теперь Claude сам сохраняет то, что важно для работы и для пользователя: «Claude now automatically saves memories that are relevant to the work and to you». Пост набрал на Hacker News 463 очка, и в ответах под ним нашлись люди, сделавшие ровно обратное.</p>
+<div class="note field">
+<blockquote>I recently disabled auto-memory in Claude Code, and performance improved. Managing the context that agents have available to them is far too important to leave to the agents themselves. Agents tend to write far too much into their memory, they are terrible at trimming it down, and their choice of what to include is very poor.
+<footer>— sothatsit, <a href="https://news.ycombinator.com/item?id=49054851">Hacker News, 26 июля 2026</a></footer></blockquote>
+<p>Автор выключил auto memory и перенёс всё нужное в <code>CLAUDE.md</code>, скиллы и документацию, которые правит сам. Его претензия не к хранению, а к записи: что модель считает важным и как плохо она чистит собственные заметки.</p>
+</div>
+<p>Это не одиночная жалоба. В апреле bushido советовал выгрузить все воспоминания Claude Code о себе и проредить их: «there is a very high chance that you have memories in there which are contradicting each other and causing bad behavior»<a class="cite" href="#src-7">7</a> — там почти наверняка найдутся противоречащие друг другу заметки, и они портят поведение. В августе fluidcruft жаловался на заметки, которые постоянно всплывают устаревшими, и на «edit wars» между несогласованными воспоминаниями: он работает в четырёх аккаунтах на двух компьютерах, а память машинно-локальная. Kiro под постом Anthropic возразил шире: дикие идеи, которые он пробует на LLM и выбрасывает, «I don't want those to pollute the context», засорять ими контекст он не хочет.</p>
+<p>Есть и защитники. ArielTM в апреле объяснял, почему схема «маленький индекс плюс заметки по требованию» работает лучше хитрого ранжирования: «the index itself acting as a filter. Every new fact has to summarize into one line that earns its keep, or it doesn't get saved». Фильтром служит сам индекс: новый факт сохраняется, только если ужимается в одну строку, которая оправдывает своё место. Проблема в том, что фильтр держится на суждении модели о том, что заслуживает строки, а это суждение и критикуют.</p>
+<div class="note debate"><p>Anthropic считает auto memory заменой ручному <code>CLAUDE.md</code>, часть практиков выключает её и видит улучшение. Разумная середина: оставь её включённой, но обращайся с ней как с кешем, а не с источником правды. Всё, что обязано выполняться, живёт в <code>CLAUDE.md</code> или в хуке. Выключай в каталогах для одноразовых экспериментов и там, где работаешь с нескольких машин или аккаунтов, пока не наведёшь порядок с синхронизацией.</p></div>
+<div class="note practice"><p>Открой <code>MEMORY.md</code> проекта, где работаешь дольше месяца (<code>/memory</code> покажет путь). По каждой строке три вопроса: это правда сегодня; это должно быть правилом (тогда в <code>CLAUDE.md</code> или хук); это выводится из кода (тогда удалить). <code>/doctor prompt-audit</code> (с v2.1.283) ищет устаревшие и противоречивые инструкции в <code>CLAUDE.md</code>, <code>AGENTS.md</code>, правилах, скиллах и сабагентах, но каталога auto memory в его списке по умолчанию нет, эту ревизию делаешь сам. Выключатель — <code>"autoMemoryEnabled": false</code> в настройках проекта или переменная <code>CLAUDE_CODE_DISABLE_AUTO_MEMORY=1</code>.</p></div>
+</section>
+
+<section id="memory-tool">
+<h2>Memory tool: память исполняет твой код</h2>
+<p>Вся настройка инструмента памяти в Claude API — одна запись в массиве <code>tools</code>: <code>{"type": "memory_20250818", "name": "memory"}</code>. Схему входа описывать не нужно, имя обязано быть <code>memory</code><a class="cite" href="#src-1">1</a>. Всё остальное — твой код. Инструмент клиентский: Claude только просит выполнить операцию над файлом, выполняет её приложение против хранилища, которое ты выбрал, и возвращает результат обычным блоком <code>tool_result</code>. Путь <code>/memories</code> — префикс, который обработчик отображает на что угодно: каталог пользователя на диске, строки в Postgres, объекты в S3.</p>
+<p>Дата в имени сбивает с толку. <code>20250818</code> — штамп версии инструмента, а вышел он 29 сентября 2025 года вместе с Claude Sonnet 4.5 и context editing, в публичной бете<a class="cite" href="#src-8">8</a>. Сейчас он работает на всех моделях Claude 4 и новее без бета-заголовка. В бета-пространстве SDK остались только помощники (в Python это <code>BetaAbstractMemoryTool</code> и готовая файловая <code>BetaLocalFilesystemMemoryTool</code>), причём в Go и Ruby их нет, цикл tool use там крутишь сам.</p>
+
+<figure class="fig wide" id="fig-memtool-seq">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant App as Приложение
+  participant API as Messages API
+  participant H as Обработчик памяти
+  participant S as Хранилище
+  App->>API: messages + tools memory_20250818
+  Note over API: в системный промпт добавлен MEMORY PROTOCOL
+  API-->>App: tool_use view /memories
+  App->>H: view /memories для user 42
+  H->>S: листинг каталога пользователя
+  H-->>App: размеры и пути через табуляцию
+  App->>API: tool_result
+  API-->>App: tool_use view /memories/progress.md
+  App->>API: tool_result, строки с номерами
+  API-->>App: tool_use str_replace old_str → new_str
+  App->>H: проверка пути и уникальности old_str
+  H->>S: запись файла
+  App->>API: tool_result The memory file has been edited.
+  API-->>App: текст ответа, stop_reason end_turn
+</script>
+<figcaption>Один ход с памятью. Модель не видит хранилище и не знает, чей это каталог: запрос «view /memories» превращается в листинг конкретного пользователя только в твоём обработчике. Каждая стрелка к API — отдельный HTTP-запрос с полной историей.</figcaption>
+</figure>
+
+<p>Первый шаг почти всегда один и тот же, его и требует добавленный в промпт протокол:</p>
+<div class="tabs">
+<section data-tab="tool_use от модели">
+<script type="text/plain" class="code" data-lang="json" data-title="Claude просит показать каталог памяти">
+{
+  "type": "tool_use",
+  "id": "toolu_01C4D5E6F7G8H9I0J1K2L3M4",
+  "name": "memory",
+  "input": {
+    "command": "view",
+    "path": "/memories"
+  }
+}
+</script>
+</section>
+<section data-tab="tool_result от приложения">
+<script type="text/plain" class="code" data-lang="json" data-title="Ответ обработчика: листинг на два уровня">
+{
+  "type": "tool_result",
+  "tool_use_id": "toolu_01C4D5E6F7G8H9I0J1K2L3M4",
+  "content": "Here're the files and directories up to 2 levels deep in /memories, excluding hidden items and node_modules:\n4.0K\t/memories\n1.5K\t/memories/customer_service_guidelines.xml\n2.0K\t/memories/refund_policies.xml"
+}
+</script>
+</section>
+<section data-tab="Ошибка">
+<script type="text/plain" class="code" data-lang="json" data-title="Ошибка возвращается с is_error">
+{
+  "type": "tool_result",
+  "tool_use_id": "toolu_01C4D5E6F7G8H9I0J1K2L3M4",
+  "content": "Error: The path /memories/notes.txt does not exist",
+  "is_error": true
+}
+</script>
+</section>
+</div>
+<p>Дальше модель открывает нужный файл и, если узнала что-то новое, правит его. Команд шесть, и для каждой документация задаёт формат ответа и тексты ошибок: модель прочтёт любую строку, но описание инструмента написано под эти формулировки.</p>
+<table class="wide">
+<thead><tr><th>Команда</th><th>Поля</th><th>Успех</th><th>Характерная ошибка</th></tr></thead>
+<tbody>
+<tr><th>view</th><td><code>path</code>, <code>view_range</code></td><td>листинг на два уровня или файл с номерами строк (6 символов, выравнивание вправо, табуляция)</td><td><code>The path {path} does not exist. Please provide a valid path.</code></td></tr>
+<tr><th>create</th><td><code>path</code>, <code>file_text</code></td><td><code>File created successfully at: {path}</code></td><td><code>Error: File {path} already exists</code></td></tr>
+<tr><th>str_replace</th><td><code>path</code>, <code>old_str</code>, <code>new_str</code></td><td><code>The memory file has been edited.</code> и фрагмент файла</td><td><code>Multiple occurrences of old_str … Please ensure it is unique</code></td></tr>
+<tr><th>insert</th><td><code>path</code>, <code>insert_line</code>, <code>insert_text</code></td><td><code>The file {path} has been edited.</code></td><td><code>Error: Invalid `insert_line` parameter</code></td></tr>
+<tr><th>delete</th><td><code>path</code></td><td><code>Successfully deleted {path}</code></td><td>удалять сам <code>/memories</code> нельзя</td></tr>
+<tr><th>rename</th><td><code>old_path</code>, <code>new_path</code></td><td><code>Successfully renamed {old_path} to {new_path}</code></td><td><code>Error: The destination {new_path} already exists</code></td></tr>
+</tbody>
+</table>
+<p>Две детали из справочника, о которые спотыкаются. В описании инструмента, которое видит модель, сказано, что <code>create</code> «creates or overwrites», а эталонная реализация на существующий файл возвращает ошибку; документация прямо разрешает оба поведения, так что выбери одно осознанно. И <code>view</code> по описанию умеет показывать картинки <code>.jpg</code> и <code>.png</code> и обрезает текстовый вывод длиннее 16&nbsp;000 символов, поэтому жди повторных вызовов с <code>view_range</code>.</p>
+
+<h3>Обработчик и граница доверия</h3>
+<p>Предупреждение в документации написано в красной рамке: «A malicious path such as <code>/memories/../../secrets.env</code> can reach files outside the <code>/memories</code> directory. Your implementation must validate every path in every command». Путь с <code>../</code> выводит за пределы каталога памяти, поэтому проверять надо каждый путь в каждой команде. Список мер там же: путь начинается с <code>/memories</code>, приводится к каноническому виду и остаётся внутри каталога, URL-кодированные <code>%2e%2e%2f</code> ловятся отдельно, а в Python для этого есть <code>Path.resolve()</code> и <code>relative_to()</code>. Ниже набросок обработчика двух команд с такой проверкой. Он запускался на Python 3.14 против временного каталога: <code>../../</code>, <code>%2e%2e</code> и <code>/memoriesX</code> отклоняются, повтор <code>old_str</code> даёт текст ошибки из документации.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="memory_handler.py (набросок: две команды из шести)">
+from pathlib import Path
+from urllib.parse import unquote
+
+ROOT = Path("/var/lib/agent-memory")  # в проде — свой каталог или ключи в БД
+
+class PathRejected(Exception):
+    pass
+
+def resolve(user_id: str, virtual: str) -> Path:
+    path = unquote(virtual)  # ловим %2e%2e%2f до проверки
+    if path != "/memories" and not path.startswith("/memories/"):
+        raise PathRejected(f"Error: path must be inside /memories: {virtual}")
+    base = (ROOT / user_id).resolve()
+    real = (base / path.removeprefix("/memories").lstrip("/")).resolve()
+    if not real.is_relative_to(base):
+        raise PathRejected(f"Error: path escapes /memories: {virtual}")
+    return real
+
+def str_replace(user_id: str, path: str, old_str: str, new_str: str = "") -> str:
+    file = resolve(user_id, path)
+    if not file.is_file():
+        return f"Error: The path {path} does not exist. Please provide a valid path."
+    text = file.read_text()
+    count = text.count(old_str)
+    if count == 0:
+        return f"No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}."
+    if count > 1:
+        lines = [n for n, line in enumerate(text.splitlines(), 1) if old_str in line]
+        return (f"No replacement was performed. Multiple occurrences of old_str `{old_str}` "
+                f"in lines: {lines}. Please ensure it is unique")
+    file.write_text(text.replace(old_str, new_str, 1))
+    return "The memory file has been edited."
+
+def handle(user_id: str, tool_input: dict) -> tuple[str, bool]:
+    """Возвращает (content, is_error) для блока tool_result."""
+    try:
+        match tool_input["command"]:
+            case "str_replace":
+                out = str_replace(user_id, tool_input["path"],
+                                  tool_input["old_str"], tool_input.get("new_str", ""))
+            case "create":
+                file = resolve(user_id, tool_input["path"])
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(tool_input["file_text"])
+                out = f"File created successfully at: {tool_input['path']}"
+            case other:
+                out = f"Error: command {other} is not implemented in this sketch"
+    except PathRejected as exc:
+        return str(exc), True
+    return out, out.startswith(("Error", "No replacement"))
+</script>
+<p>Аргумент <code>user_id</code> в этом коде важнее проверки путей. Модель о пользователях ничего не знает, для неё существует один каталог <code>/memories</code>. Если обработчик отобразит его на общий каталог, заметки одного клиента будут приходить в сессии другого, и никакой промпт этого не исправит.</p>
+<div class="note warn"><p>Всё, что обычно делает база данных, здесь на тебе. Документация перечисляет: вычищать чувствительные данные до записи («Claude usually refuses to write sensitive information»: Claude отказывается записывать чувствительное обычно, но не всегда), ограничивать размер файлов и длину вывода <code>view</code>, периодически удалять файлы, к которым давно не обращались. Ничего из этого по умолчанию не происходит.</p></div>
+
+<h3>Память, компакция и очистка контекста</h3>
+<p>Memory tool выпустили в паре с context editing, и работают они вместе. Context editing по порогу вычищает из истории старые результаты инструментов (стратегия <code>clear_tool_uses_20250919</code>, бета-заголовок <code>context-management-2025-06-27</code>), компакция на сервере сворачивает весь разговор в сводку; подробно обе описаны в <a href="../02-context-engineering/index.html">главе 2</a>. Связку с памятью документация объясняет так: когда контекст подходит к порогу очистки, Claude получает автоматическое предупреждение и успевает записать важное в файлы до того, как результаты исчезнут.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Память и очистка контекста в одном запросе (из документации)">
+response = client.beta.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=4096,
+    messages=[{"role": "user", "content": "Hello"}],
+    tools=[{"type": "memory_20250818", "name": "memory"}],
+    betas=["context-management-2025-06-27"],
+    context_management={"edits": [{"type": "clear_tool_uses_20250919"}]},
+)
+</script>
+<p>Про компакцию на странице инструмента одна фраза: «compaction keeps the active context small without client-side bookkeeping, and memory preserves the information that must survive summarization». Компакция держит активный контекст маленьким без учёта на стороне клиента, а память сохраняет то, что должно пережить суммаризацию. При запуске Anthropic привела и цифры своего внутреннего теста на агентный поиск с Sonnet 4.5. Набор данных не назван, так что это цифры вендора.</p>
+<div class="stats">
+  <div class="stat"><b>+39%</b><span>к качеству даёт память вместе с очисткой контекста против базовой версии агента</span></div>
+  <div class="stat"><b>+29%</b><span>даёт одна очистка контекста, без памяти</span></div>
+  <div class="stat"><b>−84%</b><span>токенов на тесте из 100 ходов веб-поиска</span></div>
+</div>
+
+<h3>Проект на вечер: журнал прогресса</h3>
+<p>Самый полезный паттерн с этим инструментом придуман для длинной разработки. Документация называет его multisession software development pattern, а подробно он разобран в инженерном посте Anthropic от 26 ноября 2025 года<a class="cite" href="#src-9">9</a>. Первая сессия ничего не пишет в коде: она создаёт журнал прогресса, список фич и скрипт запуска окружения, в посте это <code>claude-progress.txt</code>, JSON с фичами и <code>init.sh</code>, плюс первый коммит. Каждая следующая сессия начинает с чтения этих файлов, берёт одну фичу, коммитит и перед концом обновляет журнал.</p>
+<script type="text/plain" class="code" data-lang="jsonc" data-title="Одна фича из списка (из поста Anthropic, шаги сокращены)" data-hl="5">
+{
+    "category": "functional",
+    "description": "New chat button creates a fresh conversation",
+    "steps": [...],
+    "passes": false
+}
+</script>
+<p>Агенту разрешено менять только поле <code>passes</code>, и в промпте это сказано жёстко: «It is unacceptable to remove or edit tests because this could lead to missing or buggy functionality»: удалять или править тесты недопустимо, иначе функциональность пропадёт или сломается. Фича считается готовой после сквозной проверки, а не после того, как код написан. Если журнал врёт, следующая сессия начнёт с неправды и будет в ней уверена. Отсюда общий принцип для памяти любого агента: запись о сделанном должна опираться на проверку.</p>
+</section>
+
+<section id="managed">
+<h2>Хранилище с версиями и сны: Managed Agents</h2>
+<p>У Anthropic есть второй продукт памяти, о котором знают заметно меньше. Так к сессии Claude Managed Agents подключают memory store<a class="cite" href="#src-10">10</a>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Создание сессии с хранилищем памяти" data-hl="7-10">
+{
+  "agent": "$agent_id",
+  "environment_id": "$environment_id",
+  "resources": [
+    {
+      "type": "memory_store",
+      "memory_store_id": "$store_id",
+      "access": "read_write",
+      "instructions": "User preferences and project context. Check before starting any task."
+    }
+  ]
+}
+</script>
+<p>Memory store — «a workspace-scoped collection of text documents optimized for Claude», набор текстовых документов уровня workspace, подготовленный для Claude. Публичная бета открыта с 23 апреля 2026 года. Подключается оно только при создании сессии и монтируется в песочницу как каталог <code>/mnt/memory/&lt;slug&gt;/</code>, а в системный промпт автоматически добавляется заметка о каждом подключении. Отдельного инструмента памяти нет, агент работает с этими файлами обычными инструментами, так что они должны быть включены. Идея та же, что у memory tool, только файлы обслуживает платформа.</p>
+<p>Отличается хранилище тем, что каждая запись создаёт неизменяемую версию с идентификатором <code>memver_…</code>, и у версий есть API. Параллельные правки защищены оптимистичной блокировкой: обновление проходит, только если содержимое не изменилось с момента чтения.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Правка с предусловием по хешу">
+{
+  "content": "CORRECTED: Always use 2-space indentation.",
+  "precondition": {"type": "content_sha256", "content_sha256": "$mem_sha"}
+}
+</script>
+<p>Поле <code>access</code> принимает <code>read_only</code> или <code>read_write</code> и, по документации, «is enforced at the filesystem level», то есть соблюдается на уровне файловой системы. Пределы такие: 100 kB (около 25 тыс. токенов) на одну запись, 10&nbsp;000 записей на хранилище (дальше новые записи не создаются: «writes to new memories fail»), 8 хранилищ на сессию, <code>instructions</code> до 4096 символов. Версии хранятся 30 дней, свежие версии живых записей не удаляются никогда. Для персональных данных есть redact: он вычищает содержимое из исторической версии и сохраняет журнал аудита («Redact scrubs content out of a historical version while preserving the audit trail»), при этом текущую голову живой записи отредактировать так нельзя.</p>
+<p>У беты одна процедурная ловушка. Вызовы API хранилищ требуют заголовка <code>agent-memory-2026-07-22</code>, и совмещать его с <code>managed-agents-2026-04-01</code> в одном запросе нельзя, получишь 400. Сессии при этом по-прежнему создаются с <code>managed-agents-2026-04-01</code>.</p>
+<div class="note warn"><p>Документация предупреждает: если агент обрабатывает недоверенный ввод, «a successful prompt injection could write malicious content into the store. Later sessions then read that content as trusted memory. Use <code>read_only</code> for reference material». Успешная промпт-инъекция запишет в хранилище вредное содержимое, следующие сессии прочтут его как доверенную память, а справочные материалы стоит подключать только на чтение. Хранилище, которое читают все сессии команды, подключай на запись только тем агентам, которые не ходят в интернет и не читают чужие документы.</p></div>
+
+<h3>Dreams: консолидация как pull request</h3>
+<p>19 мая 2026 года к хранилищам добавили Dreams, пока в статусе research preview<a class="cite" href="#src-11">11</a>. Dream — асинхронная задача, которая берёт одно хранилище и от 1 до 100 транскриптов сессий, перечитывает их моделью и собирает новое, курированное хранилище. Главная строка документации: «The input store is never modified»: входное хранилище не меняется никогда.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Ответ на создание dream (фрагмент из документации)" data-hl="4-7">
+{
+  "type": "dream",
+  "id": "drm_01AbCDefGhIjKlMnOpQrStUv",
+  "status": "pending",
+  "inputs": [
+    { "type": "memory_store", "memory_store_id": "memstore_01Hx..." },
+    { "type": "sessions", "session_ids": ["sesn_01...", "sesn_02..."] }
+  ],
+  "outputs": [],
+  "model": { "id": "claude-opus-4-8" },
+  "instructions": "Focus on coding-style preferences; ignore one-off debugging notes.",
+  "session_id": null,
+  "created_at": "2026-04-29T17:04:10Z"
+}
+</script>
+<p>Задача проходит состояния <code>pending → running → completed | failed | canceled</code>, выполняется как обычная наблюдаемая сессия (поле <code>session_id</code>) и занимает от нескольких минут до нескольких часов. Токены оплачиваются по обычным тарифам, и стоимость растёт примерно линейно с числом и длиной входных сессий. Поле <code>instructions</code> направляет синтез, но точечные команды вида «удали строку про табы» обычно ничего не меняют («generally produce no change»); такие правки делаются через API хранилищ. Нужен заголовок <code>dreaming-2026-04-21</code>.</p>
+
+<figure class="fig" id="fig-managed">
+<script type="text/x-mermaid">
+flowchart TD
+  s1["Сессия A"] -- "запись файла" --> st[("Store v1<br/>/mnt/memory/prefs")]
+  s2["Сессия B"] -- "правка с content_sha256" --> st
+  st -- "каждая запись" --> ver["версии memver_<br/>хранятся 30 дней"]:::mute
+  st --> dr{{"Dream<br/>pending → running"}}:::violet
+  tr["транскрипты<br/>1–100 сессий"] --> dr
+  dr -- "completed" --> st2[("Новый store")]:::accent
+  st2 --> rev{"Ревью"}
+  rev -- "принять" --> use["подключить<br/>к новым сессиям"]:::ok
+  rev -- "отклонить" --> drop["удалить,<br/>v1 не тронут"]:::mute
+</script>
+<figcaption>Путь записи в Managed Agents. Сессии пишут в хранилище напрямую, каждая запись оставляет версию. Консолидация ничего не переписывает на месте: её результат — отдельное хранилище, которое можно проверить и выбросить.</figcaption>
+</figure>
+<p>Бэкендеру эта схема знакома по git: консолидация приходит как pull request к памяти, а не как push в main. Сжатие памяти теряет информацию, а ошибка в памяти, в отличие от ошибки в ответе, повторяется в каждой следующей сессии; отдельный выход ловит её до того, как она разойдётся. В анонсах Anthropic приводит истории клиентов: у Rakuten на 97% меньше ошибок с первой попытки<a class="cite" href="#src-10">10</a>, у Harvey примерно в 6 раз выше доля завершённых задач<a class="cite" href="#src-11">11</a>. Условия замеров в постах не раскрыты, так что сравнивать эти цифры не с чем.</p>
+</section>
+
+<section id="files">
+<h2>Почему все пришли к файлам</h2>
+<p>В августе 2025 года Letta, компания, выросшая из проекта MemGPT, поставила неудобный для рынка памяти эксперимент<a class="cite" href="#src-12">12</a>. Разговоры из бенчмарка LoCoMo разложили по файлам, агенту на GPT-4o mini дали четыре инструмента — <code>grep</code>, <code>search_files</code>, <code>open</code>, <code>close</code> — и заставили искать перед каждым ответом. Вышло 74,0%. Для сравнения Letta взяла 68,5%, которые Mem0 опубликовала для своего лучшего варианта с графом. Объяснение Letta: «agents today are highly effective at using tools, especially those likely to have been in their training data (such as filesystem operations)». Агенты хорошо пользуются инструментами, особенно теми, что знакомы им по обучению, вроде файловых операций. Агент ищет итеративно: не нашёл — переформулировал, открыл соседний файл, проверил дату. Специализированная система памяти обычно делает один поиск и отдаёт результат.</p>
+<p>Как доказательство этот результат слаб, и Letta этого не скрывала. 68,5 — самоотчёт Mem0 из другого харнесса, а воспроизвести на LoCoMo собственную MemGPT Letta, по её словам, не смогла: «was unable to determine a way to backfill LoCoMo data into MemGPT/Letta». Сравнивались два разных эксперимента.</p>
+<p>Чище результат пришёл из академии. 12 мая 2026 года группа из UCLA выложила LongMemEval-V2<a class="cite" href="#src-13">13</a> — бенчмарк на память агента о собственной работе: 451 вопрос по истории из сотен траекторий работы (до 500 траекторий и 115 млн токенов). Метод AgentRunbook-C, который «stores trajectories as files and invokes a coding agent to gather evidence» (хранит траектории файлами и отправляет кодового агента собирать доказательства), набрал в среднем 72,5%. Готовый кодовый агент Codex без доработок — 69,3%. Лучший RAG — 48,5%. Цену авторы называют сами: «coding agent based methods have high latency costs», у методов на кодовых агентах большая задержка.</p>
+<figure class="fig" id="fig-lme2">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "LongMemEval-V2: память об опыте агента", "subtitle": "Средняя точность ответов", "unit": "%", "decimals": 1, "emphasis": ["AgentRunbook-C"],
+ "rows": [["AgentRunbook-C", 72.5, "файлы + кодовый агент"], ["Codex как есть", 69.3, "кодовый агент"], ["Лучший RAG", 48.5, "поиск по фрагментам"]],
+ "note": "Wu et al., arXiv:2605.12493, май 2026. 451 вопрос, до 500 траекторий и 115 млн токенов."}
+</script>
+<figcaption>Разрыв здесь не между «умной» и «глупой» памятью, а между одним поиском и агентом, который ищет сколько нужно. Даже нетронутый Codex обходит лучший RAG больше чем на 20 пунктов; за это платят задержкой, которой на графике нет.</figcaption>
+</figure>
+<p>Два независимых эксперимента в одну сторону — тенденция, но не закон: где RAG делает один запрос к индексу, кодовый агент делает десяток вызовов.</p>
+
+<h3>От блоков MemGPT к файлам</h3>
+<p>Производители пришли к тому же и без бенчмарков. Раньше всех, 18 июля 2025 года, об этом написали в Manus: «we treat the file system as the ultimate context». Файловая система для них и есть главный контекст, а из окна выбрасывают только то, что можно вернуть по сохранённому пути или URL<a class="cite" href="#src-14">14</a>. К сентябрю 2026 года память на файлах есть почти у всех: memory tool и хранилища Managed Agents у Anthropic, auto memory в Claude Code, каталог <code>~/.codex/memories/</code> у OpenAI Codex<a class="cite" href="#src-15">15</a>, пути <code>/memories/</code> в LangChain Deep Agents<a class="cite" href="#src-16">16</a>, <code>MEMORY.md</code> и <code>USER.md</code> у Hermes Agent от Nous Research<a class="cite" href="#src-17">17</a>, многоуровневая файловая модель в OpenClaw.</p>
+<p>MemGPT (октябрь 2023) управлял контекстом так, как операционная система управляет памятью<a class="cite" href="#src-18">18</a>: часть данных в окне, остальное снаружи, и модель сама перемещает их вызовами функций. В основе лежали блоки core memory — именованные строки, всегда стоящие в промпте, которые модель правила инструментами вроде <code>core_memory_replace</code>. У блока были подпись, описание и предел длины, его можно было пометить <code>read_only</code> и подключить к нескольким агентам сразу через <code>block_ids</code>: первый массовый вариант общей памяти нескольких агентов. Сервер с этой моделью, Letta V1, теперь лежит в ветке <code>archive</code>, а репозиторий <code>letta-ai/letta</code> отсылает к <code>letta-code</code><a class="cite" href="#src-19">19</a>. Продукт называется Letta Harness (бывший Letta Code), пакет <code>letta</code> 0.34.0 вышел 30 сентября 2026 года. Память в нём — MemFS, git-репозиторий, спроецированный в Markdown: «Files under <code>system/</code> are loaded into the agent's system prompt on every turn»: файлы из <code>system/</code> попадают в системный промпт на каждом ходе, остальное читается по требованию. Семантического или векторного индекса по умолчанию нет: «MemFS does not include a semantic or vector index by default». Скиллы лежат в том же репозитории, в <code>$MEMORY_DIR/skills</code>, и версионируются вместе с памятью.</p>
+<p>У всех этих систем одинаковый скелет: небольшой ограниченный кусок всегда в промпте, остальное по требованию, поиск — инструментами, которые модель знает с обучения. Различаются пределы и поведение при переполнении.</p>
+<table class="wide">
+<thead><tr><th>Система</th><th>Всегда в промпте</th><th>По требованию</th><th>Предел</th><th>При переполнении</th></tr></thead>
+<tbody>
+<tr><th>Claude Code</th><td>индекс <code>MEMORY.md</code></td><td>topic-файлы</td><td>200 строк или 25KB</td><td>запись проходит, модель получает ошибку</td></tr>
+<tr><th>Letta MemFS</th><td>каталог <code>system/</code></td><td>остальные файлы</td><td>фоновая дефрагментация держит 15–25 файлов</td><td>—</td></tr>
+<tr><th>Hermes Agent</th><td><code>MEMORY.md</code> и <code>USER.md</code></td><td>поиск по прошлым сессиям (SQLite FTS5)</td><td>2200 и 1375 символов</td><td>инструмент возвращает ошибку</td></tr>
+<tr><th>Managed Agents</th><td>заметка о подключении</td><td>файлы в <code>/mnt/memory/</code></td><td>100 kB на запись, 10&nbsp;000 записей</td><td>новые записи отклоняются</td></tr>
+<tr><th>Deep Agents</th><td>файлы из <code>memory=[...]</code></td><td>остальное в <code>/memories/</code></td><td>задаёт разработчик</td><td>—</td></tr>
+</tbody>
+</table>
+
+<h3>Hermes: жёсткий лимит и замороженный снимок</h3>
+<p>Самый строгий вариант у Hermes Agent. <code>MEMORY.md</code> ограничен 2200 символами (около 800 токенов), <code>USER.md</code> — 1375 (около 500). Переполнение не обрезается: инструмент <code>memory</code> «returns an error instead of silently dropping entries», то есть вместо тихой обрезки возвращает ошибку, и модели приходится самой решать, что выбросить. Действий у инструмента три — <code>add</code>, <code>replace</code>, <code>remove</code>; запись находится по уникальной подстроке <code>old_text</code>, отдельного чтения нет, всё и так в промпте. Блок в системном промпте выглядит так:</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Блок памяти Hermes в системном промпте (из документации)">
+══════════════════════════════════════════════
+MEMORY (your personal notes) [67% — 1,474/2,200 chars]
+══════════════════════════════════════════════
+User's project is a Rust web service at ~/code/myapi using Axum + SQLx
+§
+This machine runs Ubuntu 22.04, has Docker and Podman installed
+</script>
+<p>Счётчик заполненности в заголовке — подсказка модели, сколько места осталось. Второй приём — замороженный снимок. Блок памяти вставляется в системный промпт один раз при старте сессии и до её конца не меняется, чтобы не сбить кеш префикса: «to preserve the LLM's prefix cache». Запись посреди сессии уходит на диск, а модель увидит её в следующей сессии. Кеш префикса экономит деньги и задержку на каждом ходе (механику разбирает <a href="../02-context-engineering/index.html">глава 2</a>); платишь тем, что память обновляется с опозданием на сессию.</p>
+<figure class="fig" id="fig-hermes">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant D as Диск
+  participant H as Харнесс
+  participant M as Модель
+  Note over D,M: сессия 1
+  H->>D: прочитать MEMORY.md и USER.md
+  H->>M: системный промпт со снимком
+  M->>H: memory add «проект на Axum»
+  H->>D: дописать в MEMORY.md
+  H-->>M: ok или ошибка переполнения
+  Note over H,M: снимок в промпте не меняется, кеш цел
+  Note over D,M: сессия 2
+  H->>D: прочитать обновлённые файлы
+  H->>M: новый снимок, уже с записью
+</script>
+<figcaption>Замороженный снимок Hermes. Запись сразу попадает на диск, но в промпт — только в следующей сессии. Так префикс запроса остаётся байт в байт одинаковым и кешируется весь разговор.</figcaption>
+</figure>
+<div class="note field">
+<blockquote>If the fact is not there, the model claimed a save it never made. Small local models (roughly under 30B parameters) and models with weak tool-calling do this often.
+<footer>— документация Hermes Agent, <a href="https://github.com/NousResearch/hermes-agent">раздел Persistent Memory</a></footer></blockquote>
+<p>Модель пишет «запомнил», а вызова инструмента не было. Чаще всего так делают небольшие локальные модели, примерно до 30B параметров, и модели со слабым вызовом инструментов. Проверяй запись по журналу вызовов и по содержимому файла, а не по тексту ответа. Для строгого режима у Hermes есть <code>write_approval: true</code>: записи встают в очередь на подтверждение.</p>
+</div>
+
+<h3>Формат вместо конвейера</h3>
+<p>Следующий шаг — договориться о формате. 24 июля 2026 года Google выпустил Open Knowledge Format v0.2<a class="cite" href="#src-20">20</a>: Markdown с YAML-заголовком, где у записи есть поля происхождения и жизненного цикла, в том числе <code>generated</code>, <code>verified</code>, <code>status</code> и <code>stale_after</code>. В августе Кэл Патерсон предложил memoryfields<a class="cite" href="#src-21">21</a>, ZIP с Markdown-страницами и необязательным векторным индексом в SQLite, и вывел на первую страницу Hacker News (191 очко) тезис «Memory should be a data format, not a multi-stage pipeline»: память должна быть форматом данных, а не многоступенчатым конвейером. Нужду в переносе признают и системы со своим хранилищем: Cognee импортирует память из Mem0, Letta, Zep и Graphiti через собственный формат обмена COGX<a class="cite" href="#src-22">22</a>.</p>
+<div class="note field">
+<blockquote>Naive memory fails at scale. File search bloats the context window once memory gets big… Even semantic search over history can't traverse the relationships between people, topics, objects, locations, and preferences.
+<footer>— pauliusztin, <a href="https://news.ycombinator.com/item?id=48337689">Hacker News, 30 мая 2026</a></footer></blockquote>
+<p>Автор год строил память агента на графе знаний и упёрся в потолок файлового поиска на своём масштабе. Там, где память — сеть людей, тем и предпочтений, grep по заметкам тащит в контекст слишком много и не видит связей.</p>
+</div>
+<p>По умолчанию начинай с файлов: модель умеет с ними работать, человек может прочитать, поправить и положить в git, а переезд на другой продукт сводится к копированию каталога. Файлов перестаёт хватать в трёх случаях. Когда важна задержка и десяток вызовов инструментов на вопрос не по карману. Когда данных столько, что даже индекс не влезает в бюджет. И когда ответ требует связей между сущностями и времени: «кто отвечал за этот сервис в марте». Для последнего случая строят графы.</p>
+</section>
+
+<section id="facts-graphs">
+<h2>Факты и графы: Mem0 и Zep</h2>
+<p>Так обрабатывался результат <code>add()</code> в Mem0 до и после обновления весны 2026 года; оба фрагмента из руководства по миграции<a class="cite" href="#src-23">23</a>:</p>
+<div class="tabs">
+<section data-tab="До апреля 2026">
+<script type="text/plain" class="code" data-lang="python" data-title="Mem0 OSS, старый алгоритм">
+# Before: could return ADD, UPDATE, DELETE events
+result = m.add("I love hiking and my dog's name is Max", user_id="alice")
+for item in result["results"]:
+    if item["event"] == "ADD":
+        print("New memory:", item["memory"])
+    elif item["event"] == "UPDATE":
+        print("Updated:", item["memory"])     # [REMOVED] No longer returned
+    elif item["event"] == "DELETE":
+        print("Deleted:", item["memory"])      # [REMOVED] No longer returned
+</script>
+</section>
+<section data-tab="После">
+<script type="text/plain" class="code" data-lang="python" data-title="Mem0 OSS, новый алгоритм">
+# After: only ADD events
+result = m.add("I love hiking and my dog's name is Max", user_id="alice")
+for item in result["results"]:
+    print("New memory:", item["memory"])  # Only ADD events
+</script>
+</section>
+</div>
+<p>Исчезли две ветки из трёх. В статье Mem0 от апреля 2025 года<a class="cite" href="#src-24">24</a> запись шла в два вызова LLM: первый вытаскивал из диалога кандидатов в факты, второй сравнивал каждого с похожими старыми записями и выбирал ADD, UPDATE, DELETE или NOOP. Новый алгоритм пришёл в Python SDK 2.0.0 (PyPI, 16 апреля 2026) и TypeScript SDK 3.0.0: один вызов, и тот только добавляет. Документация объясняет выбор так: «The model spends its capacity on understanding the input rather than diffing against existing state»: модель тратит силы на понимание входа, а не на сравнение с тем, что уже лежит. Старые факты не трогаются, новый ложится рядом, а ранжирование оставлено поиску: «When information changes, the new fact is stored alongside the old one. Retrieval handles ranking».</p>
+<figure class="fig wide" id="fig-mem0-pipeline">
+<ol class="pipeline">
+  <li><b>Контекст</b><span>топ-10 похожих старых записей</span></li>
+  <li data-tone="accent"><b>Один вызов LLM</b><span>все новые факты, только ADD</span></li>
+  <li><b>Эмбеддинги</b><span>пачкой</span></li>
+  <li data-tone="warn"><b>Дедупликация</b><span>MD5, только точные копии</span></li>
+  <li><b>Вставка</b><span>в векторную базу</span></li>
+  <li><b>Сущности</b><span>для третьего сигнала поиска</span></li>
+</ol>
+<figcaption>Путь записи в Mem0 OSS с апреля 2026 года. Старые записи модель видит только как контекст для извлечения; обновить или удалить их на этом пути нечем, а дедупликация по MD5 отсекает лишь дословные повторы.</figcaption>
+</figure>
+<p>На чтении работают три сигнала: вектор, BM25 и совпадение сущностей. Кандидатов даёт только вектор: «BM25 is a boost signal, not a recall expander», два других сигнала лишь переставляют найденное. Для BM25 и сущностей в Python нужен extra <code>mem0ai[nlp]</code> со spaCy, который ставится только на Python 3.10–3.12; без него поиск молча откатывается к чисто семантическому. У Qdrant своя ловушка: без пакета <code>fastembed</code> BM25 молча отключается («is silently disabled»), и узнаешь ты об этом из одного предупреждения в логе при первом поиске. Поменялись и умолчания: <code>top_k</code> со 100 до 20, <code>threshold</code> с <code>None</code> до 0,1, <code>rerank</code> с <code>True</code> на <code>False</code>, а <code>user_id</code> в <code>search()</code> теперь передаётся только внутри <code>filters</code>, иначе <code>ValueError</code>.</p>
+<p>Граф из открытой версии убрали совсем: флаг <code>enable_graph</code>, блок <code>graph_store</code> и драйверы пяти графовых баз, около 4000 строк. Графовая память осталась «built-in, always-on» функцией платной Mem0 Platform, а поле <code>relations</code> в результатах поиска OSS больше не заполняется. Причину Mem0 прямо не называет, но таблица её собственной статьи 2025 года кое-что подсказывает: вариант с графом Mem0g набрал на LoCoMo 68,44 против 66,88 у базового и тратил 3616 токенов на запрос против 1764.</p>
+<p>Если запись только добавляет, противоречия надо разбирать где-то ещё. В Platform этим занимается Dream<a class="cite" href="#src-25">25</a>, и слово здесь значит не то, что у Anthropic. Supersede и Merge работают на всех тарифах прямо при записи. Supersede помечает старый факт устаревшим, когда новый ему противоречит, но не удаляет: по умолчанию чтение возвращает оба, а <code>latest_only=true</code> прячет старый. Merge сливает дубли в одну запись. Synthesis раз в неделю, на тарифах от Pro и при 20+ записях у пользователя, выводит из повторяющихся фактов «pattern memories» со ссылками на исходные. Поверх можно включить Memory Decay, множитель ранжирования по давности (о нём в разделе о чтении), и срок годности <code>expiration_date</code>, появившийся в SDK 27 июня 2026 года.</p>
+<div class="note field">
+<blockquote>Because vector search returns them sorted by similarity rather than recency — and doesn't include timestamps — the LLM receives multiple conflicting 'truths' and gets confused.
+<footer>— <a href="https://github.com/mem0ai/mem0/issues/5352">mem0ai/mem0, issue #5352</a>, июнь 2026, 53 комментария</footer></blockquote>
+<p>Тред про самостоятельно развёрнутую Mem0 с Qdrant<a class="cite" href="#src-26">26</a> называет три беды: слепоту ко времени, противоречивые почти-дубли и, по словам автора, отсутствие встроенных update и delete для испорченных записей. Обходной путь собрали всем тредом: даты прямо в тексте, который уходит в промпт, явные CRUD-инструменты для агента и скрипт гигиены, который сливает записи с косинусной близостью выше 0,82 в пользу более новой. Supersede в открытой версии нет, так что при ADD-only эта работа ложится на тебя. В Platform на слепоту ко времени с 13 мая 2026 года отвечает Temporal Reasoning: запросы вида «last week» и «as of March 2025» разрешаются по меткам времени записей<a class="cite" href="#src-25">25</a>.</p>
+</div>
+
+<h3>Zep и Graphiti: у факта две оси времени</h3>
+<p>Zep решает противоречия в самой модели данных<a class="cite" href="#src-27">27</a>. Статья вышла 20 января 2025 года; открытое ядро называется Graphiti (<code>graphiti-core</code> 0.30.2 от 8 сентября 2026, Apache-2.0), управляемый сервис — Zep Cloud, а репозиторий <code>getzep/zep</code> теперь содержит только примеры и интеграции<a class="cite" href="#src-28">28</a>. Данные лежат графом: сущности в узлах, факты на рёбрах, а рядом эпизоды — сырые сообщения и документы, из которых факты извлечены. У каждого факта две пары времён:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="graphiti_core/edges.py (фрагмент)">
+class Edge(BaseModel, ABC):
+    uuid: str = Field(default_factory=lambda: str(uuid4()))
+    group_id: str = Field(description='partition of the graph')
+    source_node_uuid: str
+    target_node_uuid: str
+    created_at: datetime
+# ...
+class EntityEdge(Edge):
+    name: str = Field(description='name of the edge, relation name')
+    fact: str = Field(description='fact representing the edge and nodes that it connects')
+    episodes: list[str] = Field(
+        default=[],
+        description='list of episode ids that reference these entity edges',
+    )
+    expired_at: datetime | None = Field(
+        default=None, description='datetime of when the node was invalidated'
+    )
+    valid_at: datetime | None = Field(
+        default=None, description='datetime of when the fact became true'
+    )
+    invalid_at: datetime | None = Field(
+        default=None, description='datetime of when the fact stopped being true'
+    )
+</script>
+<p><code>valid_at</code> и <code>invalid_at</code> — время в мире: когда факт стал правдой и когда перестал. <code>created_at</code> и <code>expired_at</code> — время в системе: когда граф узнал о факте и когда пометил его недействительным. Это обычная битемпоральная модель из учебников по базам данных, перенесённая на факты, которые извлекает LLM. Когда новый эпизод противоречит старому факту, ребро не удаляется, а получает обе отметки конца: README пишет, что старые факты «invalidated — not deleted. Query what's true now, or what was true at any point in time»: их помечают недействительными, а не удаляют, и спросить можно, что правда сейчас и что было правдой на любую дату. Поиск гибридный — эмбеддинги, BM25 и обход графа — и не опирается на сводки от LLM: «without reliance on LLM summarization».</p>
+<figure class="fig wide" id="fig-bitemporal">
+<svg class="diagram" viewBox="0 0 760 310" role="img" aria-label="Один факт Graphiti на двух осях времени: в мире и в системе">
+  <text class="t-sub" x="20" y="24">Время в мире: когда факт был правдой</text>
+  <text class="t-red" x="506" y="24">запрос: где Алиса в мае 2026?</text>
+  <rect class="box--soft" x="200" y="36" width="380" height="40" rx="6"/>
+  <text class="t-title" x="390" y="61" text-anchor="middle">Алиса работает в Acme</text>
+  <rect class="box--accent" x="580" y="36" width="160" height="40" rx="6"/>
+  <text class="t-title" x="660" y="61" text-anchor="middle">в Globex</text>
+  <path class="arrow arrow--red arrow--dash" d="M500,30 L500,72"/>
+  <text class="t-sub" x="20" y="108">Время в системе: когда граф считал факт верным</text>
+  <text class="t-red" x="630" y="108" text-anchor="end">запрос: что граф знал 1 сентября?</text>
+  <rect class="box--soft" x="430" y="118" width="250" height="40" rx="6"/>
+  <text class="t-sub" x="555" y="143" text-anchor="middle">граф считает верным</text>
+  <rect class="box--accent" x="680" y="118" width="60" height="40" rx="6"/>
+  <text class="t-sub" x="710" y="143" text-anchor="middle">Globex</text>
+  <path class="arrow arrow--red arrow--dash" d="M640,112 L640,154"/>
+  <path class="arrow" d="M190,184 L748,184"/>
+  <path class="line" d="M200,178 L200,190"/>
+  <path class="line" d="M430,178 L430,190"/>
+  <path class="line" d="M580,178 L580,190"/>
+  <path class="line" d="M680,178 L680,190"/>
+  <text class="t-sub" x="200" y="206" text-anchor="middle">янв 2024</text>
+  <text class="t-sub" x="430" y="206" text-anchor="middle">10 мар 2026</text>
+  <text class="t-sub" x="580" y="206" text-anchor="middle">авг 2026</text>
+  <text class="t-sub" x="680" y="206" text-anchor="middle">20 сен 2026</text>
+  <text class="t-mono t-mute" x="200" y="224" text-anchor="middle">valid_at</text>
+  <text class="t-mono t-mute" x="430" y="224" text-anchor="middle">created_at</text>
+  <text class="t-mono t-mute" x="580" y="224" text-anchor="middle">invalid_at</text>
+  <text class="t-mono t-mute" x="680" y="224" text-anchor="middle">expired_at</text>
+  <rect class="box" x="340" y="244" width="180" height="52" rx="6"/>
+  <text class="t-title" x="430" y="265" text-anchor="middle">эпизод 1</text>
+  <text class="t-sub" x="430" y="285" text-anchor="middle">«я в Acme с 2024-го»</text>
+  <rect class="box" x="560" y="244" width="192" height="52" rx="6"/>
+  <text class="t-title" x="656" y="265" text-anchor="middle">эпизод 2</text>
+  <text class="t-sub" x="656" y="285" text-anchor="middle">«с августа я в Globex»</text>
+</svg>
+<figcaption>Один факт на двух осях; подписи на оси относятся к ребру «Acme». Алиса работала в Acme до августа, но граф узнал об этом только 20 сентября из второго эпизода. Запрос по мировому времени за май находит Acme; запрос «что граф знал 1 сентября» тоже находит Acme, потому что тогда смены работы для системы ещё не было. Старое ребро не удалено, у него просто заполнены <code>invalid_at</code> и <code>expired_at</code>.</figcaption>
+</figure>
+<p>Есть и схема, от которой Mem0 ушла весной 2026 года, и её сохранили облака<a class="cite" href="#src-29">29</a>. В Memory Bank из Google Agent Platform и в AWS Bedrock AgentCore Memory модель сначала извлекает факты из разговора, а шаг консолидации решает, обновить существующую запись, удалить её или создать новую. Memory Bank хранит у каждой записи ревизии с промежуточным выводом извлечения, так что неудачное обновление можно найти и откатить. У AgentCore среди встроенных стратегий есть эпизодическая с рефлексией — выводами сразу по нескольким эпизодам.</p>
+<p>Четыре стратегии противоречий отличаются тем, что остаётся после фразы пользователя «я переехал в Берлин»:</p>
+<table>
+<thead><tr><th>Стратегия</th><th>Где</th><th>Что остаётся</th><th>Цена</th></tr></thead>
+<tbody>
+<tr><th>Перезапись</th><td>файлы, блоки Letta V1, Deep Agents</td><td>только новая версия</td><td>история теряется, параллельные записи затирают друг друга</td></tr>
+<tr><th>Добавление и пометка</th><td>Mem0: ADD-only и Supersede</td><td>обе записи, старая помечена</td><td>память растёт; в OSS пометки нет, всё решает ранжирование</td></tr>
+<tr><th>Обновление моделью</th><td>Memory Bank, AgentCore; так работала Mem0 до апреля 2026</td><td>последняя версия; у Memory Bank ещё и ревизии</td><td>вызов LLM на запись; ошибочное обновление тихо затирает правду</td></tr>
+<tr><th>Битемпоральная инвалидация</th><td>Graphiti и Zep</td><td>оба факта с интервалами</td><td>граф и вызов LLM на каждый эпизод</td></tr>
+</tbody>
+</table>
+<p>Выбирай по требованию продукта. Если вопрос «во что мы верили в прошлый вторник» — часть бизнеса (аудит, история поддержки клиента, CRM), бери битемпоральную модель. Если нет, перезапись с версиями снаружи промпта (git, <code>content_sha256</code>, таблица истории) даёт ту же возможность отката за копейки. Обновление моделью удобно, пока ей можно верить; без журнала ревизий одна неверная консолидация стирает факт бесследно. Добавление без пометок — худший вариант: противоречия никуда не деваются, их просто перекладывают на модель при каждом чтении.</p>
+<p>У графа своя цена, и лучше всего её описал тот же pauliusztin в <a href="https://news.ycombinator.com/item?id=48337689">разборе пяти ошибок</a> за год работы над такой памятью. Заранее спроектированная онтология заморозила проект на месяцы; совет — начинать с минимальной схемы. Слияние сущностей он в итоге развёл порогами: от 0,95 сливать автоматически, выше 0,85 отдавать человеку, ниже заводить новый узел. А неизменяемый журнал событий, построенный раньше, чем понадобился, «puts a ton of pressure on your VM's RAM, which is crazy expensive»: он съедает оперативную память виртуальной машины, а она стоит безумно дорого.</p>
+</section>
+
+<section id="consumer">
+<h2>Память в ChatGPT и Claude.ai</h2>
+<p>Саймон Уиллисон в мае 2025 года попросил ChatGPT сгенерировать картинку и увидел на ней вывеску «Half Moon Bay» — город, который фигурировал в его прошлых разговорах, но не в этом запросе<a class="cite" href="#src-30">30</a>. Его вывод стал самой цитируемой претензией к потребительской памяти: «The entire game when it comes to prompting LLMs is to carefully control their context… The new memory feature removes that control completely». Весь промптинг сводится к тому, чтобы тщательно контролировать контекст, а новая память этот контроль отнимает целиком. Для инженера это описание архитектуры, в которой память подмешивается в запрос без ведома пользователя, и через неё контекст одной задачи протекает в другую.</p>
+<p>В сентябре 2025 года Уиллисон сравнил, как это сделано у двух вендоров. ChatGPT подставлял память в каждый разговор автоматически. Claude начинал с чистого листа и, когда нужно, вызывал видимые пользователю инструменты <code>conversation_search</code> и <code>recent_chats</code>, то есть работал по схеме «память как поиск по требованию». С тех пор обе системы сдвинулись навстречу друг другу.</p>
+<figure class="fig" id="fig-consumer">
+<div class="versus">
+  <div data-tone="soft"><h4>ChatGPT, сентябрь 2026</h4><ul>
+    <li>Источники: прошлые чаты, сохранённые воспоминания, custom instructions, файлы Library, подключённые приложения вроде Gmail</li>
+    <li>Improved memory — сводка, которая обновляется сама (с 4 июня 2026); явный список остался как legacy</li>
+    <li>Sources под ответом показывают, что именно подмешано (с 5 мая 2026)</li>
+    <li>Исправить сводку, «Don't mention this again» (больше не упоминать), память только внутри проекта</li>
+  </ul></div>
+  <div data-tone="accent"><h4>Claude.ai, сентябрь 2026</h4><ul>
+    <li>Отдельные темы (Topics), которые сохраняются по ходу разговора (с 25 августа 2026)</li>
+    <li>Темы видны и правятся в Settings → Memory, общие для чата и Cowork</li>
+    <li>Здоровье, религия, политика и другие чувствительные темы по умолчанию не сохраняются</li>
+    <li>Инкогнито-чаты; для Team и Enterprise память по умолчанию выключена</li>
+  </ul></div>
+</div>
+<figcaption>Две потребительские памяти после двух лет правок. Обе теперь показывают пользователю, что запомнено, и дают это исправить; различаются единица записи (общая сводка против отдельных тем) и умолчания для чувствительных данных.</figcaption>
+</figure>
+<p>У Claude.ai память сменила три поколения<a class="cite" href="#src-31">31</a>. Сначала, летом 2025 года, это был только поиск по чатам через инструменты. С сентября 2025-го (Team — 11 сентября, бесплатный тариф — только 2 марта 2026-го) появилась сводка памяти, которая обновлялась раз в 24 часа; справка сейчас называет её legacy. С 25 августа 2026 года «Claude saves memory as a set of individual topics as you chat, rather than summarizing conversations after they end»: память сохраняется отдельными темами прямо по ходу чата, а не сводкой после его конца. Для Free, Pro и Max память включена по умолчанию, для Team и Enterprise выключена, а в аккаунтах с HIPAA, для госсектора и с особыми сроками хранения недоступна вовсе.</p>
+<p>У ChatGPT<a class="cite" href="#src-32">32</a> 15 октября 2025 года сохранённые воспоминания стали управляться автоматически: система расставляет приоритеты по свежести детали и по тому, как часто ты говоришь на тему («how recent a detail is and how often you talk about a topic»), и сообщение «memory full» ушло в прошлое. Временные чаты воспоминаний не создают и не обновляют: «do not create or update memories».</p>
+<div class="note warn"><p>Удаление в потребительской памяти не атомарно. В справке OpenAI: удаление чата «does not necessarily delete a separate saved memory created from that chat», то есть отдельное воспоминание из этого чата может остаться; после отключения истории чатов производная информация удаляется из систем OpenAI в течение 30 дней («scheduled for deletion from OpenAI systems within 30 days»); журналы удалённых воспоминаний хранятся до 30 дней. Improved memory «is not covered under your BAA»: под соглашение BAA для медицинских данных она не подпадает. Если строишь похожее для своих пользователей, заранее реши, где лежат производные данные и как до них доходит запрос на удаление.</p></div>
+<p>Уроки для своего продукта прямые. Память по умолчанию ограничена областью (проектом, рабочим пространством), иначе случится Half Moon Bay. Пользователь видит, что подмешано в ответ, и может это исправить. Чувствительные категории не сохраняются без явной просьбы. А единица записи — отдельный факт или тема: его можно показать, исправить и удалить, одну большую сводку нельзя.</p>
+</section>
+
+<section id="write-path">
+<h2>Когда писать: горячий путь и фон</h2>
+<p>В документации LangChain Deep Agents выбор пути записи уложен в таблицу из двух строк<a class="cite" href="#src-16">16</a>. Горячий путь, запись прямо во время разговора: память доступна сразу и видна пользователю («Memories available immediately, transparent to user»), но растёт задержка и агенту приходится делать два дела сразу («Adds latency, agent must multitask»). Фоновый, между разговорами: задержки для пользователя нет, и можно сводить несколько разговоров («No user-facing latency, can synthesize across multiple conversations»), но память появится только в следующем разговоре и нужен второй агент («Memories not available until next conversation, requires a second agent»). Вывод там же: большинству приложений хватает горячего пути, «For most applications, the hot path is sufficient». Горячий путь в Deep Agents — это обычный <code>edit_file</code> по пути, который бэкенд маршрутизирует в постоянное хранилище:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Deep Agents: /memories/ живёт в Store, остальное в состоянии треда (из документации, сокращено)">
+from deepagents import create_deep_agent
+from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+
+agent = create_deep_agent(
+    model="google_genai:gemini-3.6-flash",
+    memory=["/memories/AGENTS.md"],
+    skills=["/skills/"],
+    backend=CompositeBackend(
+        default=StateBackend(),
+        routes={
+            "/memories/": StoreBackend(
+                namespace=lambda rt: (
+                    rt.server_info.assistant_id,
+                ),
+            ),
+            # "/skills/" маршрутизируется так же
+        },
+    ),
+)
+</script>
+<p>Файлы по умолчанию живут в состоянии треда и умирают вместе с ним, а всё под <code>/memories/</code> уходит в LangGraph Store и переживает треды. Обрати внимание на пространство имён: здесь это <code>assistant_id</code>, то есть память общая для всех пользователей ассистента. Документация сама советует по умолчанию заводить память на пользователя («Default to user scope») и делать общую память только для чтения, потому что общая записываемая память — канал промпт-инъекции от одного пользователя к другому. Параллельные записи в один файл решаются по правилу last-write-wins. Доступ к <code>rt.server_info</code> требует <code>deepagents</code> 0.5.0 или новее. LangMem, которую годами цитировали как «память от LangChain», последний раз выходила 27 октября 2025 года (0.0.30) и строится на устаревшем в LangGraph v1 <code>create_react_agent</code>.</p>
+<p>Сам Store пригодится и без Deep Agents. <code>PostgresStore</code> из <code>langgraph-checkpoint-postgres</code> (3.1.2 от 7 августа 2026) хранит JSON-документы по пространствам имён, с параметром <code>index</code> ищет по эмбеддингам через pgvector, а с <code>ttl</code> забывает<a class="cite" href="#src-16">16</a>. В TTL две ловушки. Флаг <code>omit_expired</code> по умолчанию выключен, и просроченная запись продолжает приходить из <code>get</code> и <code>search</code>, пока её не удалит чистильщик. А чистильщик в своём развёртывании нужно запустить явно. Срок считается от последнего обращения, не от записи: чтение его продлевает.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок: LangGraph Store с поиском и сроком годности" data-hl="6-8,11">
+from langgraph.store.postgres import PostgresStore
+
+with PostgresStore.from_conn_string(
+    DB_URI,
+    index={"embed": "openai:text-embedding-3-small", "dims": 1536},
+    ttl={"default_ttl": 60 * 24 * 90,      # минуты: 90 дней без обращений
+         "omit_expired": True,             # иначе просроченное приходит в search
+         "sweep_interval_minutes": 60},
+) as store:
+    store.setup()
+    store.start_ttl_sweeper()              # без этого строки не удаляются
+    store.put(("user_42", "memories"), "redis", {"text": "tests/api требуют Redis"})
+    hits = store.search(("user_42", "memories"), query="как запускать тесты", limit=5)
+</script>
+<p>Фон нужен, когда память копится из многих разговоров и горячий путь начинает мусорить: каждая сессия дописывает своё, никто не сводит. Рецепт LangChain — отдельный агент консолидации по cron, который читает свежие треды пользователя и сливает факты в память, с частотой по реальной активности: «Consolidating much more often than users converse just burns tokens on no-op runs». Если сводить память чаще, чем пользователи разговаривают, токены уходят на пустые прогоны.</p>
+
+<h3>Четыре разных «сна»</h3>
+<p>Фоновую консолидацию каждый вендор назвал по-своему, и чаще всего — сном. Названия совпадают, механизмы нет, и сливать их в одну идею опасно: у них разные гарантии.</p>
+<table class="wide">
+<thead><tr><th>Механизм</th><th>Когда запускается</th><th>Что читает</th><th>Куда пишет</th></tr></thead>
+<tbody>
+<tr><th>Anthropic Dreams</th><td>по вызову API, асинхронно</td><td>хранилище и 1–100 транскриптов</td><td>в новое хранилище, вход не меняется</td></tr>
+<tr><th>Mem0 Dream</th><td>Supersede и Merge при каждой записи; Synthesis по расписанию</td><td>новые факты и память пользователя</td><td>пометки на старых записях, новые pattern memories</td></tr>
+<tr><th>Letta dreaming</th><td>по числу шагов или при компакции</td><td>недавние разговоры</td><td>коммиты в MemFS из отдельного git worktree</td></tr>
+<tr><th>OpenClaw Dreaming</th><td>по расписанию, включён по умолчанию</td><td>дневные заметки и транскрипты</td><td>единственный путь в <code>MEMORY.md</code></td></tr>
+</tbody>
+</table>
+<p>Метафора сна пришла из Letta: в 2025 году у её сервера были фоновые sleep-time агенты, а обоснование им дала статья Sleep-time Compute (апрель 2025, Letta и UC Berkeley)<a class="cite" href="#src-33">33</a>. Идея там другая, чем у консолидации: пока пользователь молчит, модель заранее обдумывает контекст и готовит то, что вероятно спросят. На двух математических задачах с состоянием вычисления в момент запроса сократились примерно в 5 раз при той же точности, и выигрыш тем больше, чем предсказуемее запрос. Это правило годится для любой фоновой работы.</p>
+<p>Сейчас у Letta это настройка харнесса<a class="cite" href="#src-19">19</a>. Фоновые сабагенты памяти работают в отдельных git worktree, «so they can update memory concurrently without blocking the main agent», чтобы обновлять память параллельно и не блокировать основного агента, а режим «Agent reviews before applying» добавляет второй фоновый разговор-ревьюер, который «does not ask you for approval». Ревью есть, человека в нём нет.</p>
+<script type="text/plain" class="code" data-lang="javascript" data-title="Letta: настройка dreaming (из документации)">
+dreaming: {
+    trigger: "step-count", // "off" | "step-count" | "compaction-event"
+    behavior: "auto-launch", // "reminder" | "auto-launch"
+    stepCount: 25,
+  },
+</script>
+
+<h3>OpenClaw: запись как граница безопасности</h3>
+<p>Самый продуманный путь записи из открытых описаний — у OpenClaw, открытого агентного харнесса (сам харнесс разобран в <a href="../12-deep-agents/index.html">главе 12</a>)<a class="cite" href="#src-34">34</a>. У него два принципа, из которых выводится всё остальное. «Writing is the hard part»: поиск по файлам заметок конкурирует с куда более тяжёлыми системами, а портит память ненадёжная запись. И «The write path is the security boundary»: проверять содержимое уже записанной памяти бесполезно, отравленный факт так не поймать, поэтому происхождение фиксируется при записи и проверяется структурно.</p>
+<p>Память OpenClaw разложена на пять уровней, и граница, которую охраняют сильнее всего, проходит между эпизодическим уровнем и курированным ядром:</p>
+<table>
+<thead><tr><th>Уровень</th><th>Где лежит</th><th>Кто пишет</th><th>Когда попадает в запрос</th></tr></thead>
+<tbody>
+<tr><th>Инструкции</th><td><code>AGENTS.md</code></td><td>только человек</td><td>всегда, при старте</td></tr>
+<tr><th>Ядро</th><td><code>MEMORY.md</code>, <code>USER.md</code></td><td>консолидация Dreaming, прямая просьба пользователя</td><td>при старте, если позволяет происхождение, в пределах бюджета</td></tr>
+<tr><th>Эпизоды</th><td><code>memory/ГГГГ-ММ-ДД.md</code>, транскрипты</td><td>агент по ходу работы</td><td>по поиску, не при старте</td></tr>
+<tr><th>Намерения</th><td>SQLite и cron</td><td>инструмент <code>intent</code></td><td>только когда сработал триггер</td></tr>
+<tr><th>Обзор</th><td><code>DREAMS.md</code></td><td>фазы Dreaming</td><td>никогда, это для человека</td></tr>
+</tbody>
+</table>
+<p>Уровень намерений — проспективная память, «не забыть сделать», которой нет в таксономии CoALA. Прозе её OpenClaw не доверяет, потому что о намерении модель помнит тем хуже, чем длиннее контекст. «Напомни в пятницу» сразу становится задачей cron, а «когда речь зайдёт о релизе, упомяни changelog» — строкой SQLite с триггером, который проверяет код без вызова модели. По умолчанию у намерения перерыв 24 часа, три срабатывания и срок 90 дней.</p>
+<p>У каждой записи в индексе есть класс происхождения из закрытого списка: <code>owner</code> (напечатал владелец в доверенном канале), <code>agent</code> (агент вывел из контента владельца), <code>untrusted</code> (веб-страницы, вывод инструментов, чужие участники группового чата) и <code>system</code> (служебные тексты вроде преамбул cron). Метки лежат в колонках SQLite, которые модель не может переписать прозой, а неопределённое происхождение никогда не становится <code>owner</code>. Если инструмент объявил, что вернул данные из сети, весь остаток хода помечается как tainted и классифицируется как <code>untrusted</code>, даже внутри хода владельца. Сессии cron, heartbeat и сабагентов вообще не дают кандидатов в долговременную память. И то, что попало в контекст из памяти, помечается и никогда не извлекается заново. «A fact recalled one hundred times stays one fact»: факт, который вспомнили сто раз, остаётся одним фактом.</p>
+<p>Зачем такие строгости, документация объясняет без чисел: аудиты в продакшене нашли, что подавляющее большинство автоматически сохранённых воспоминаний («the overwhelming majority of auto-captured memories») — это пересказ служебных промптов, шум heartbeat и петли, в которых вспомненное записывалось как новое.</p>
+<figure class="fig wide" id="fig-openclaw-write">
+<script type="text/x-mermaid">
+flowchart TD
+  own["Ход владельца"] -- "заметки дня, транскрипт" --> epi[("Эпизодический уровень<br/>memory/ГГГГ-ММ-ДД.md")]
+  web["Результат из сети"]:::mute -- "остаток хода tainted" --> epi
+  bg["cron, heartbeat,<br/>сабагенты"]:::mute -. "не кандидаты" .-> epi
+  epi --> light["Light и REM<br/>дедупликация, темы"]
+  light -- "отчёты" --> dreams["DREAMS.md<br/>для человека"]:::mute
+  light --> gate["Детерминированный гейт<br/>ранг, пороги, origin"]
+  gate -- "untrusted, system" --> stay["остаются в поиске,<br/>в ядро не попадают"]:::warn
+  gate -- "owner, agent" --> cons["Консолидация моделью<br/>дубли, вытеснение"]:::violet
+  cons --> val["Проверка: структура,<br/>бюджет, доля потерь"]
+  val -- "ок, хеш не менялся" --> mem[("MEMORY.md")]:::accent
+  val -- "отказ" --> app["только дописать<br/>в этом цикле"]
+</script>
+<figcaption>Путь записи в OpenClaw. Модель участвует в одном месте, консолидации, и то внутри рамок детерминированного кода: происхождение проверяется до построения промпта, результат — по структуре, бюджету и доле потерянных записей, а замену файла защищает проверка хеша.</figcaption>
+</figure>
+<p>Детерминированный гейт фазы Deep ранжирует кандидатов по полезности при прошлых поисках, частоте, разнообразию запросов и свежести, а <code>untrusted</code> и <code>system</code> исключает до построения промпта: «This is a precondition, not a score penalty». Версию <code>MEMORY.md</code>, которую потом пишет модель, принимают только после проверки; иначе цикл откатывается к дописыванию.</p>
+
+<h3>Codex и Claude Code</h3>
+<p>У OpenAI Codex память по умолчанию выключена и включается в <code>config.toml</code><a class="cite" href="#src-15">15</a>:</p>
+<script type="text/plain" class="code" data-lang="toml" data-title="~/.codex/config.toml">
+[features]
+memories = true
+</script>
+<p>Путь у неё фоновый: память извлекается после того, как чат затих, активные и короткие сессии пропускаются, секреты вычищаются. Модели для извлечения и для консолидации настраиваются отдельно (<code>memories.extract_model</code>, <code>memories.consolidation_model</code>). Самый интересный ключ — <code>memories.disable_on_external_context</code>: он «keeps chats that used external context such as MCP tool calls, web search, or tool search out of memory generation». Это грубая версия правила OpenClaw про tainted: разговор, где агент читал внешнее, вообще не идёт в память. И совет из той же страницы, применимый к любому агенту: «Keep required team guidance in <code>AGENTS.md</code> … Treat memories as a helpful recall layer, not as the only source for rules that must always apply». Обязательные указания для команды держи в <code>AGENTS.md</code>, а память считай подсказкой для припоминания, а не единственным источником правил, которые должны действовать всегда.</p>
+<p>Claude Code, судя по документации, пишет auto memory в горячем пути: Claude сам решает по ходу сессии, что сохранить (в CHANGELOG встречается и шаг «memory extraction», документация его не описывает). Фоновой консолидации в Claude Code нет. Твит про «Auto Dream» в Claude Code, ходивший по Hacker News в марте 2026 года, не подтверждают ни документация, ни CHANGELOG до v2.1.285; «Dreams» у Anthropic — функция API Managed Agents.</p>
+</section>
+
+<section id="read-path">
+<h2>Как память возвращается в запрос</h2>
+<p>Почти все формулы ранжирования памяти, которые встречаются в продуктах 2026 года, — потомки одной строки из статьи Generative Agents (Стэнфорд, 2023)<a class="cite" href="#src-35">35</a>:</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Ранжирование воспоминаний в Generative Agents">
+score = α_recency · recency + α_importance · importance + α_relevance · relevance
+
+все α = 1; каждый компонент min-max нормирован в [0, 1]
+recency    = 0.995 ^ (часы песочницы с последнего обращения к записи)
+importance = оценка LLM от 1 до 10, выставленная при создании записи
+relevance  = косинус между эмбеддингом записи и текущего запроса
+</script>
+<p>Важность оценивала сама модель по фиксированному промпту: «On a scale of 1 to 10, where 1 is purely mundane … and 10 is extremely poignant … rate the likely poignancy of the following piece of memory». По шкале от 1 (совсем обыденное) до 10 (очень волнующее) модель оценивала, насколько значимо воспоминание. Давность считается не от создания записи, а от последнего обращения к ней, поэтому то, что вспоминают часто, остаётся свежим, а забытое тонет дальше. Там же родилась консолидация: когда сумма важности свежих событий переваливает за 150, агент берёт 100 последних записей, задаёт себе вопросы и записывает выводы как новые воспоминания со ссылками на исходные.</p>
+<figure class="fig" id="fig-recency">
+<script type="application/json" class="chart">
+{"type": "line", "title": "Вес давности записи", "subtitle": "Множитель через N дней без обращений: 0,995 в час против полураспада 30 дней", "decimals": 2, "yMin": 0, "yMax": 1,
+ "x": ["0", "1", "3", "7", "14", "30", "60", "90"],
+ "series": [
+  {"name": "Generative Agents", "values": [1, 0.89, 0.70, 0.43, 0.19, 0.03, 0.00, 0.00]},
+  {"name": "OpenClaw", "values": [1, 0.98, 0.93, 0.85, 0.72, 0.50, 0.25, 0.13]}
+ ],
+ "note": "Рассчитано по опубликованным константам: 0,995^(24·дни) и 0,5^(дни/30). У Generative Agents часы игровые."}
+</script>
+<figcaption>Одно слово «recency», две разные памяти. С коэффициентом Generative Agents запись, к которой не обращались месяц, почти не весит ничего; полураспад OpenClaw держит её в игре три месяца. Константа давности решает, что агент «забывает», сильнее любой базы данных.</figcaption>
+</figure>
+<p>Потомки узнаются сразу. ChatGPT с октября 2025 года расставляет приоритеты сохранённых воспоминаний по давности и частоте<a class="cite" href="#src-32">32</a>. Mem0 Decay умножает оценку на коэффициент от 0,3× до 1,5× по давности и частоте обращений, но никогда не выбрасывает запись: он расширяет пул кандидатов до <code>top_k×3</code> (не меньше 50), переставляет их и возвращает наружу оценку, обрезанную обратно в [0, 1]<a class="cite" href="#src-25">25</a>. OpenClaw в первой, бесплатной полосе поиска перемножает гибридную релевантность, экспоненциальную давность с полураспадом 30 дней и множитель важности от 1 до 10, выставленный при записи<a class="cite" href="#src-34">34</a>.</p>
+<p>Там же есть приём, который легко перенести к себе. Короткие фразы-триггеры пишутся прямо в заметку HTML-комментарием, и если сообщение пользователя совпадает с триггером с оценкой от 0,72, заметка подмешивается в контекст без вызова модели:</p>
+<script type="text/plain" class="code" data-lang="markdown" data-title="Заметка с триггером и важностью (из документации OpenClaw)">
+- Keep gateway on loopback. <!-- trigger: gateway setup, network safety --> <!-- importance: 9 -->
+</script>
+<p>Вторая полоса — блокирующий сабагент, который ищет по всей истории. Он запускается, только если в сообщении видно намерение вспомнить (ссылки на прошлое, даты, вопросы о прежних решениях) и первая полоса не дала сильного попадания: «Temporal and multi-hop questions are exactly where flat retrieval is weakest, so the expensive lane spends its latency where it plausibly buys recall quality». Вопросы о времени и многошаговые — ровно то, где плоский поиск слабее всего, поэтому дорогая полоса тратит задержку там, где она скорее всего купит полноту.</p>
+<p>Claude Code и memory tool устроены проще и по той же логике: индекс всегда в промпте, остальное — когда модель решит прочитать. Документация memory tool называет это just-in-time retrieval: «Rather than loading all relevant information up front, an agent records what it learns in memory files and reads them back on demand»<a class="cite" href="#src-1">1</a>. Ранжирования нет вовсе, его заменяет суждение модели о том, какой файл открыть. Это работает, пока индекс читается глазами за минуту.</p>
+
+<h3>Предпочтение — не факт</h3>
+<p>Одно наблюдение из документации OpenClaw меняет то, как стоит записывать память о пользователе. Ссылаясь на бенчмарк PrefEval (ICLR 2025), авторы пишут: «models stop applying a preference that is merely present in context after a handful of turns, while restating the relevant directive near the query restores adherence better than heavier retrieval or self-critique machinery». Факт, который лежит в контексте, модель найдёт, когда её спросят. Предпочтение, которое лежит там же, она через несколько ходов перестаёт применять. Повторить нужное указание рядом с вопросом помогает лучше, чем более тяжёлый поиск или самокритика модели.</p>
+<p>Отсюда формат <code>USER.md</code> в OpenClaw: записи — императивные директивы «Always», «Never», «Prefer», а не наблюдения вида «пользователь однажды сказал…»; у каждой дата и статус (действует или заменена), и изменённое предпочтение переписывает директиву на месте. В твоих заметках <code>feedback</code> и в <code>CLAUDE.md</code> это означает одно: «никогда не мокай Redis в tests/api» работает лучше, чем «пользователь не любит моки». А если правило критично и его всё равно забывают к десятому ходу, повторяй его рядом с запросом: в Claude Code вывод хука <code>UserPromptSubmit</code> попадает в контекст вместе с сообщением.</p>
+</section>
+
+<section id="failures">
+<h2>Что ломается</h2>
+<p>Исследователи Unit 42 в октябре 2025 года показали, как одна веб-страница становится долговременной памятью агента<a class="cite" href="#src-36">36</a>. Стенд — Amazon Bedrock Agents с моделью Nova Premier и включённой памятью сессий. Пользователь просит агента прочитать страницу по ссылке, которую ему подсунули. В тексте страницы спрятаны поддельные теги <code>&lt;/conversation&gt;</code> и <code>&lt;conversation&gt;</code>: когда Bedrock в конце сессии суммаризует разговор в память, они выносят инструкции атакующего за пределы блока с сообщениями пользователя. Сводка сохраняет их как одну из «целей» пользователя. В следующих сессиях память подставляется в промпт оркестрации, и агент молча отправляет данные на сервер атакующего. Ни одного подозрительного действия в момент заражения не было: агент просто прочитал страницу.</p>
+<figure class="fig wide" id="fig-poison">
+<script type="text/x-mermaid">
+flowchart TD
+  atk["Страница атакующего"]:::warn -- "ссылку дал пользователь" --> fetch["Агент читает страницу"]
+  fetch -- "поддельные теги conversation" --> sum["Суммаризация сессии в память"]
+  sum -- "инструкция как цель" --> mem[("Долговременная память")]:::warn
+  mem -- "в промпт оркестрации" --> next["Следующие сессии"]
+  next -- "тихая отправка" --> c2["Сервер атакующего"]:::warn
+  d1["origin untrusted, ход tainted"]:::ok -. "рвёт" .-> sum
+  d2["disable_on_external_context"]:::ok -. "рвёт" .-> sum
+  d3["read_only для общих хранилищ"]:::ok -. "рвёт" .-> mem
+  d4["нейтрализация разметки в MEMORY.md"]:::ok -. "ослабляет" .-> next
+</script>
+<figcaption>Цепочка Unit 42 и места, где её рвут механизмы из этой главы: метка происхождения OpenClaw, фильтр Codex, доступ только на чтение в Managed Agents и Deep Agents, нейтрализация поддельной разметки в Claude Code v2.1.284. Все защиты стоят на записи или на границе памяти, ни одна не пытается распознать вредный текст.</figcaption>
+</figure>
+<p>В списке OWASP Top 10 for Agentic Applications 2026, опубликованном 9 декабря 2025 года, отравление памяти и контекста стоит отдельным пунктом ASI06<a class="cite" href="#src-37">37</a>. Среди мер там есть три, которые прямо касаются дизайна памяти: не пускать собственные выводы агента обратно в доверенную память, чтобы загрязнение не усиливало само себя («Prevent automatic re-ingestion of an agent's own generated outputs into trusted memory to avoid self-reinforcing contamination or 'bootstrap poisoning'»), давать непроверенной памяти срок жизни, чтобы отрава не держалась долго («Expire unverified memory to limit poison persistence») и требовать двух факторов доверия, например происхождения и проверки человеком, для памяти с высоким влиянием. Масштаб угрозы хорошо показывает AgentPoison (июль 2024): отравление меньше 0,1% базы памяти давало в среднем больше 80% успешных атак при влиянии на обычные запросы меньше 1%<a class="cite" href="#src-38">38</a>. MINJA (март 2025) обходится даже без доступа к хранилищу: вредные записи попадают в общую память агента через обычные запросы к нему, и «MINJA enables any user to influence agent memory»<a class="cite" href="#src-39">39</a>. Это самый сильный довод держать память раздельной по пользователям. Работа об «origin-bound authority» (июнь 2026) объясняет, почему не спасает доверие по содержимому или по родословной записи: их можно подделать через «the agent's own summarization, a trusted-tool echo, and manufactured corroboration» (собственную сводку агента, эхо доверенного инструмента и подстроенные подтверждения), поэтому происхождение надо привязывать в момент записи<a class="cite" href="#src-40">40</a>. Сами атаки и защиты шире памяти разобраны в <a href="../16-security/index.html">главе 16</a>.</p>
+<div class="note key"><p>Сканировать уже записанную память на вредный текст бесполезно. Работает только то, что стоит на записи: метка происхождения, которую модель не может подделать, запрет автоматически повышать до доверенной памяти то, что пришло извне, и доступ только на чтение для всего общего.</p></div>
+
+<h3>Поломки без атакующего</h3>
+<p>Большинство бед памяти обходится без злого умысла. Они повторяются от продукта к продукту, и у каждой уже есть известное лекарство.</p>
+<table class="wide">
+<thead><tr><th>Поломка</th><th>Как выглядит</th><th>Что помогает</th></tr></thead>
+<tbody>
+<tr><th>Устаревание</th><td>старый факт всплывает рядом с новым, модель выбирает наугад (issue Mem0 #5352)</td><td>дата в каждой записи (<code>modified</code>, <code>stale_after</code>, <code>expiration_date</code>), удаление давно не читанного</td></tr>
+<tr><th>Противоречия</th><td>две заметки советуют разное, агент ведёт себя непредсказуемо</td><td>замещение на месте (Supersede, директивы OpenClaw), регулярная ревизия</td></tr>
+<tr><th>Рост без предела</th><td>индекс перерастает бюджет, хвост перестаёт загружаться</td><td>жёсткий предел с явной ошибкой (Claude Code с v2.1.210, Hermes), лимит записей</td></tr>
+<tr><th>Фантомная запись</th><td>модель пишет «запомнил», вызова инструмента не было</td><td>проверка по журналу вызовов, подтверждение записи</td></tr>
+<tr><th>Гонки писателей</th><td>два процесса пишут один файл, побеждает последний</td><td><code>content_sha256</code>, проверка хеша, git worktree, файл на тему</td></tr>
+<tr><th>Самоотравление</th><td>вспомненное записывается заново, агент цитирует сам себя</td><td>метка «пришло из памяти», запрет повторного извлечения</td></tr>
+<tr><th>Неполное удаление</th><td>чат удалён, выведенная из него запись осталась</td><td>карта производных данных, redact старых версий</td></tr>
+</tbody>
+</table>
+<p>Гонки заслуживают отдельного слова, потому что проявляются неожиданно. Hermes предупреждает, что два процесса с одним домашним каталогом «compound each other's entries»<a class="cite" href="#src-17">17</a>: их записи наслаиваются друг на друга. В Claude Code v2.1.280 (22 сентября 2026) исправили конфликт записи памяти в сессиях Cowork: при повторе Claude видел только начало и конец файла длиннее примерно 10&nbsp;800 символов, «so the retried write dropped the middle»<a class="cite" href="#src-4">4</a>, и повторная запись теряла середину. Потерянная середина файла памяти не даёт ни исключения, ни упавшего теста; её замечают через недели, когда агент перестаёт помнить то, что помнил.</p>
+<div class="note practice"><p>Логируй каждый вызов записи в память так же, как запись в базу: кто, когда, из какой сессии, с каким происхождением и какой был дифф. Без этого журнала ни фантомную запись, ни отравление, ни потерянную середину не расследовать.</p></div>
+</section>
+
+<section id="benchmarks">
+<h2>Бенчмарки памяти: что на самом деле измерено</h2>
+<p>Самая цитируемая цифра рынка памяти — «+26%» из статьи Mem0 (апрель 2025), и её почти всегда пересказывают неверно: как выигрыш у варианта «положить всю историю в контекст». В таблице той же статьи всё наоборот<a class="cite" href="#src-24">24</a>. +26% — относительный выигрыш у встроенной памяти OpenAI (66,88 против 52,90 по метрике LLM-as-a-Judge на LoCoMo), а полный контекст набрал 72,90 ± 0,19, больше любой системы памяти в сравнении.</p>
+<figure class="fig" id="fig-mem0-paper">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "LoCoMo, оценка LLM-судьи", "subtitle": "Подпись под названием — токенов на запрос", "unit": "", "decimals": 2, "emphasis": ["Полный контекст", "Mem0"], "max": 80,
+ "rows": [["Полный контекст", 72.90, "26 031"], ["Mem0 с графом", 68.44, "3 616"], ["Mem0", 66.88, "1 764"], ["Zep (прогон Mem0)", 65.99, "3 911"], ["LangMem", 58.10, "127"], ["Память OpenAI", 52.90, "4 437"], ["A-Mem", 48.38, "2 520"]],
+ "note": "Chhikara et al., arXiv:2504.19413, апрель 2025. Все системы запускала Mem0."}
+</script>
+<figcaption>Таблица, из которой взяли «+26%». Полный контекст точнее всех; Mem0 выигрывает у него не точностью, а ценой: в 15 раз меньше токенов на запрос за 6 пунктов оценки. Zep в этой таблице настраивала Mem0, и Zep с этой настройкой не согласна.</figcaption>
+</figure>
+<p>На нужном масштабе это хорошая сделка; плохо, что её продают как выигрыш в точности. До пересказов редко доходит и другая цифра той же статьи: у LangMem медиана задержки поиска 17,99 с, а p95 — 59,82 с.</p>
+<p>Сам LoCoMo (февраль 2024)<a class="cite" href="#src-41">41</a> для проверки памяти подходит плохо. В опубликованном наборе 10 разговоров по 19–32 сессии, в среднем 9 тыс. токенов на разговор по аннотации (не на сессию, как часто пишут) и 16–26 тыс. по подсчётам Zep и Mem0. Разговор целиком помещается в окно любой современной модели, так что бенчмарк проверяет поиск в коротком тексте. Zep в посте «Is Mem0 Really SOTA?» (6 мая 2025) нашёл в LoCoMo ошибки разметки, а Mem0 обвинил в неправильной настройке Zep: в собственном прогоне Zep получил 75,14% ± 0,17<a class="cite" href="#src-27">27</a>.</p>
+<p>До абсурда это довели в апреле 2026 года: MemPalace объявил «100% на LoCoMo», а разбор Penfield Labs показал, что с <code>top_k=50</code> при 19–32 сессиях поиск возвращал весь разговор<a class="cite" href="#src-42">42</a>. BENCHMARKS.md самого проекта признаёт, что три проваленных вопроса пропатчили вручную («This is teaching to the test», натаскивание на тест), а «500/500» на LongMemEval — полнота поиска R@5, а не точность ответов. С DMR, бенчмарком команды MemGPT, похожая история: в статье Zep полная история разговора на gpt-4o-mini даёт 98,0%, сам Zep — 98,2%<a class="cite" href="#src-27">27</a>. Тест насыщен, а разница в 0,2 пункта ничего не доказывает.</p>
+<p>LongMemEval (октябрь 2024, ICLR 2025)<a class="cite" href="#src-43">43</a> серьёзнее: 500 вопросов на пять способностей — извлечение, рассуждение по нескольким сессиям, работа со временем, обновление знаний и отказ от ответа, когда информации нет. Коммерческие ассистенты и модели с длинным контекстом теряли на нём около 30% точности на длинных взаимодействиях. На варианте LongMemEval_S, где история вопроса занимает около 115 тыс. токенов, у статьи Zep единственный результат, который что-то значит: 71,2% против 60,2% у полного контекста на gpt-4o и 63,8% против 55,4% на gpt-4o-mini, при контексте 1,6 тыс. токенов вместо 115 тыс.<a class="cite" href="#src-27">27</a></p>
+<p>Но и здесь итог во многом определяет не память, а модель, которая читает найденное и отвечает. В феврале 2026 года Mastra опубликовала 94,87% на LongMemEval для своей Observational Memory, где фоновые агенты Observer и Reflector заменяют сырую историю плотным журналом наблюдений, и в том же отчёте поменяла читающую модель<a class="cite" href="#src-44">44</a>.</p>
+<figure class="fig" id="fig-reader">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Одна память, три читателя", "subtitle": "Mastra Observational Memory на LongMemEval", "unit": "%", "decimals": 2, "emphasis": ["gpt-4o"], "max": 100,
+ "rows": [["gpt-5-mini", 94.87], ["gemini-3-pro-preview", 93.27], ["gpt-4o", 84.23]],
+ "note": "Mastra, 9 февраля 2026. Observer и Reflector на gemini-2.5-flash; меняется только модель, которая отвечает."}
+</script>
+<figcaption>Больше десяти пунктов разницы при одной и той же памяти. Если вендор не называет читающую модель, его число сравнивать не с чем.</figcaption>
+</figure>
+<p>В обсуждении результата <a href="https://news.ycombinator.com/item?id=46992444">на Hacker News</a> возражали и по существу подхода: «compression is inherently lossy», сжатие по природе теряет информацию, а успех сжатия рефлектор проверяет в основном по порогам токенов. Новые цифры Mem0 требуют той же осторожности. README обещает 92,5 на LoCoMo и 94,4 на LongMemEval для управляемой платформы с закрытыми оптимизациями, которых нет в открытом SDK («Mem0's managed platform, which includes proprietary optimizations not available in the open-source SDK»), на нераскрытом стеке моделей с бюджетом поиска <code>top_200</code><a class="cite" href="#src-23">23</a>. Документация Mem0 сама признаёт, что LoCoMo и LongMemEval «can be materially improved by aggressive retrieval strategies, larger context windows, or frontier models»: результат на них заметно поднимают агрессивный поиск, большое окно или топовые модели. Cognee заявлял на BEAM (100 разговоров, 2000 вопросов, до 10 млн токенов) 0,79 при 100 тыс. токенов; сейчас README честно расшифровывает эту цифру как «four evaluation rounds over 20 questions from one held-out conversation»<a class="cite" href="#src-22">22</a>, то есть четыре прогона по 20 вопросам из одного отложенного разговора.</p>
+<p>Прежде чем верить числу вендора, задай ему шесть вопросов.</p>
+<ol class="steps">
+  <li><b>Какая модель читала ответы?</b> На одной памяти разброс больше десяти пунктов.</li>
+  <li><b>Сколько найдено и сколько токенов ушло на запрос?</b> <code>top_k</code>, бюджет поиска, токены на ответ. Без них «точнее» может значить «больше прочитал».</li>
+  <li><b>Кто настраивал конкурентов?</b> Самоотчёт из чужого харнесса — не сравнение.</li>
+  <li><b>На скольких вопросах?</b> Двадцать вопросов из одного разговора — анекдот.</li>
+  <li><b>Что мерили?</b> Полнота поиска и точность ответа — разные числа.</li>
+  <li><b>Помещается ли весь набор в окно?</b> Если да, это тест поиска в коротком тексте, а не памяти.</li>
+</ol>
+<p>Лучший бенчмарк памяти — твои логи. 30–50 вопросов, ответ на которые лежит в прошлых сессиях твоего агента, с эталоном и полем «откуда это должно было взяться», скажут о выборе больше любой таблицы. Как собрать такой набор и не обмануть себя LLM-судьёй, разбирает <a href="../17-evals/index.html">глава 17</a>.</p>
+</section>
+
+<section id="self-improvement">
+<h2>Агент, который учится на своих ошибках</h2>
+<p>В статье ACE (Agentic Context Engineering, ICLR 2026) есть замер, который стоит показать каждому, кто хочет, чтобы агент сам переписывал свой промпт<a class="cite" href="#src-45">45</a>. Подход, при котором модель на каждом шаге целиком переписывает накопленный контекст, на одном шаге сжал его с 18&nbsp;282 токенов до 122. Точность на AppWorld упала с 66,7 до 57,1% — ниже 63,7%, которые агент показывал вовсе без накопленного контекста. Авторы назвали это context collapse: модель, которой поручили улучшить свои заметки, выбросила почти всё.</p>
+<p>Самоулучшение без обновления весов — та же память, только агент записывает не факты о мире, а уроки о себе. Reflexion (март 2023)<a class="cite" href="#src-46">46</a> разделил агента на три роли: Actor действует, Evaluator оценивает результат, Self-Reflection пишет словесный разбор неудачи, который Actor читает на следующей попытке. На HumanEval это дало 91% pass@1 против 80% у тогдашнего GPT-4, и оценщиком там служили тесты. Dynamic Cheatsheet (апрель 2025)<a class="cite" href="#src-47">47</a> обошёлся без повторных попыток: модель ведёт шпаргалку переносимых приёмов и дополняет её от задачи к задаче. В Game of 24 на GPT-4o это дало рост с 10 до 99%, когда модель нашла решение перебором на Python и записала его в шпаргалку.</p>
+<p>ACE (октябрь 2025, третья версия в марте 2026) отвечает на коллапс разделением обязанностей. Generator решает задачу и отмечает, какие пункты плейбука помогли, а какие навредили. Reflector разбирает траекторию и формулирует уроки. Curator превращает уроки в дельты — JSON-операции над плейбуком, — а применяет их обычный детерминированный код, не модель. Плейбук — список пунктов с идентификаторами и счётчиками вида <code>[ctx-00263] helpful=1 harmful=0 ::</code>; новые пункты дописываются, старые обновляются на месте, дубли время от времени вычищаются по близости эмбеддингов.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Выход Curator в ACE (из статьи)" data-hl="5-7">
+{
+"reasoning": "The reflection shows a critical error where the agent used unreliable heuristics (transaction descriptions) instead of the authoritative source (Phone app contacts) to identify relationships. ...",
+"operations": [
+{
+"type": "ADD",
+"section": "strategies_and_hard_rules",
+"content": "Always resolve identities from the correct source app\n- When you need to identify relationships (roommates, contacts, etc.), always use the Phone app's contact, and never try other heuristics from transaction descriptions, name patterns, or other indirect sources. These heuristics are unreliable and will cause incorrect results."
+}
+]
+}
+</script>
+<figure class="fig" id="fig-ace">
+<script type="text/x-mermaid">
+flowchart TD
+  pb[("Плейбук<br/>пункты с id и счётчиками")]:::accent
+  gen["Generator<br/>решает задачу"]
+  env{{"Среда или тесты"}}
+  refl["Reflector<br/>уроки из траектории"]
+  cur["Curator (LLM)<br/>JSON-дельты"]:::violet
+  merge["Слияние кодом<br/>без LLM, дедупликация"]:::ok
+  pb -- "пункты в промпт" --> gen
+  gen -- "действия" --> env
+  env -- "результат, сигнал" --> refl
+  gen -- "helpful / harmful по пунктам" --> refl
+  refl --> cur
+  cur -- "ADD, обновить счётчики" --> merge
+  merge -- "дописать, не переписывать" --> pb
+</script>
+<figcaption>Цикл ACE. Модель ни разу не переписывает плейбук целиком: она предлагает дельты, а применяет их детерминированный код. Сигнал от среды или тестов входит в цикл до рефлексии — без него уроки не из чего извлекать.</figcaption>
+</figure>
+<p>Все три роли в статье работали на одной модели, DeepSeek-V3.1 без режима рассуждений, «preventing knowledge transfer from a stronger Reflector or Curator», чтобы знание не перетекало от более сильной модели в роли Reflector или Curator. Итог — +10,6% на агентных бенчмарках и +8,6% на финансовых задачах против сильных базовых методов. ReAct с ACE на AppWorld набрал 59,4% против 60,3% у IBM CUGA, продакшен-агента на GPT-4.1. Главное предупреждение авторы вынесли в ограничения: «in the absence of reliable feedback signals (e.g., ground-truth labels or execution outcomes), both ACE and other adaptive methods such as Dynamic Cheatsheet may degrade». Без надёжной обратной связи, например разметки или результата исполнения, ACE и другие адаптивные методы вроде Dynamic Cheatsheet могут ухудшать результат.</p>
+
+<h3>Навыки как процедурная память</h3>
+<p>Процедурная память в виде кода появилась в Voyager (май 2023)<a class="cite" href="#src-48">48</a>. Агент в Minecraft копил библиотеку навыков — программ на JavaScript поверх API Mineflayer вроде <code>craftStoneShovel()</code>, — и навык попадал в библиотеку только после того, как модуль самопроверки подтверждал, что задача выполнена. По сравнению с лучшим методом того времени это дало в 3,3 раза больше уникальных предметов и до 15,3 раза более быстрое продвижение по технологическому дереву. Библиотеку навыков от склада ошибок отделяет именно самопроверка.</p>
+<p>В 2025–2026 годах та же идея переехала в скиллы (формат описан в <a href="../06-skills/index.html">главе 6</a>). В эксперименте Letta «Skill Learning» (декабрь 2025) агент на Sonnet 4.5 с расширенным мышлением писал себе скиллы по итогам задач Terminal-Bench 2.0, всего 89 задач<a class="cite" href="#src-49">49</a>. Скиллы, выведенные из одних траекторий, подняли результат на 9,0 пункта (21,1% относительно), скиллы с обратной связью от проверки — на 15,7 пункта (36,8%); стоимость при этом упала на 15,7%, а число вызовов инструментов — на 10,4%. Разница между 9 и 15,7 пункта — вклад верификатора.</p>
+<p>В продакшене верификатор пока редкость. Hermes Agent, самый популярный открытый харнесс (около 250 тыс. звёзд на GitHub в сентябре 2026), даёт агенту инструмент <code>skill_manage</code> и прямо называет скиллы его «procedural memory»<a class="cite" href="#src-17">17</a>. Скиллы пишут сам агент по ходу работы, фоновый разбор после хода и куратор, который их сводит; правка по умолчанию точечная (<code>patch</code>), а содержимое — «lessons, not logs», правило без номеров PR и цитат из чата. Настройка <code>skills.write_approval</code> по умолчанию равна <code>false</code>: агент пишет скиллы свободно, без теста и без человека. С <code>true</code> каждая запись встаёт в очередь <code>~/.hermes/pending/skills/</code> на просмотр через <code>/skills diff</code>.</p>
+
+<h3>Обучение на поправках</h3>
+<p>Ближе всего к твоей работе — обучение на поправках. В Claude Code это заметки типа <code>feedback</code>. Скажешь «remember that the API tests require a local Redis instance» — запись уйдёт в auto memory; скажешь «add this to CLAUDE.md» — в <code>CLAUDE.md</code><a class="cite" href="#src-3">3</a>. Разница важнее, чем кажется. Заметка в auto memory — вывод модели о том, что ты имел в виду, записанный её словами; строка в <code>CLAUDE.md</code> — твоя формулировка, которую ты видишь в диффе. Чего не хватает всем текущим системам, в феврале 2026 года сформулировал основатель стартапа из YC W23 в треде <a href="https://news.ycombinator.com/item?id=46891715">«Mem0 stores memories, but doesn't learn user patterns»</a>: «a preference learning layer that watches how users interact with agents and builds an evolving model», то есть слой, который наблюдает, как пользователи работают с агентами, и строит меняющуюся модель их предпочтений. Такого слоя, который учится на действиях, а не на сказанном, в продуктах из этой главы на сентябрь 2026 года нет.</p>
+<div class="note debate"><p>Давать ли агенту править собственные промпты и скиллы. Сторонники ссылаются на ACE и Letta, противники — на коллапс контекста и предупреждение CoALA о процедурной памяти. Обе стороны сходятся в одном: без проверяющего сигнала самоулучшение деградирует. Разрешай агенту менять свои скиллы и инструкции, только если есть тест или метрика, которые решают, стало ли лучше, и только дельтой к версионированному файлу, которую можно откатить, а не переписыванием целиком. В Hermes для этого включи <code>write_approval: true</code> и держи каталог скиллов в git.</p></div>
+</section>
+
+<section id="design">
+<h2>Как выбрать архитектуру памяти</h2>
+<p>Прежде чем выбирать продукт, ответь письменно на один вопрос: что должно пережить сессию, для кого и кто отвечает за то, чтобы это было правдой. Ответов обычно несколько, и каждому нужно своё хранилище.</p>
+<figure class="fig wide" id="fig-design">
+<script type="text/x-mermaid">
+flowchart TD
+  q0(["Что должно пережить сессию?"])
+  rules["CLAUDE.md, AGENTS.md, хуки<br/>пишет человек, агент только читает"]:::ok
+  prog["журнал прогресса и чеклист фич<br/>файлы или memory tool"]
+  q1(["Сколько пользователей<br/>и заметок?"])
+  files["индекс с пределом + заметки + grep<br/>memory tool или файлы"]:::accent
+  q2(["Нужно знать, что было<br/>правдой на дату?"])
+  scoped["строки в БД по user_id<br/>версии, полнотекстовый поиск"]
+  kg["битемпоральный граф<br/>Graphiti или Zep"]:::violet
+  skills["скиллы или плейбук<br/>только с верификатором"]:::warn
+  q0 -- "правила, которые обязаны выполняться" --> rules
+  q0 -- "состояние долгой задачи" --> prog
+  q0 -- "знания о пользователе и проекте" --> q1
+  q0 -- "уроки агента о себе" --> skills
+  q1 -- "один агент, сотни заметок" --> files
+  q1 -- "много пользователей" --> q2
+  q2 -- "нет" --> scoped
+  q2 -- "да" --> kg
+  files -. "индекс перерос предел" .-> scoped
+</script>
+<figcaption>Дерево выбора. Большинство веток заканчивается файлами или строками в базе; граф нужен только тогда, когда время фактов — требование продукта. Правила, которые обязаны выполняться, в память не попадают вообще.</figcaption>
+</figure>
+<ol class="steps">
+  <li><b>Раздели правила и память.</b> Правила пишет человек, агент их только читает; память пишет агент, и она версионируется. OpenAI говорит то же про Codex: память — «a helpful recall layer, not as the only source for rules that must always apply»<a class="cite" href="#src-15">15</a>.</li>
+  <li><b>Начни с файлов.</b> Маленький индекс с жёстким пределом всегда в промпте, заметки по требованию, поиск инструментами. Векторный или полнотекстовый индекс добавляй, когда индекс перестал помещаться в предел или агентный поиск слишком медленный для твоего SLA.</li>
+  <li><b>Разделяй по пользователям с первого дня.</b> <code>/memories</code> у каждого своё; общая память только для чтения, наполняет её код, а не агент.</li>
+  <li><b>Пиши в горячем пути, консолидируй в фоне.</b> Фон нужен, когда сессий много и заметки начинают дублироваться. Результат консолидации — новая версия, которую можно посмотреть и откатить, как у Dreams.</li>
+  <li><b>Выбери стратегию противоречий явно.</b> Перезапись с версиями, пометка устаревшего, обновление моделью с ревизиями или битемпоральная модель; «добавлять и надеяться на ранжирование» — не стратегия.</li>
+  <li><b>Фиксируй происхождение при записи.</b> Каждая запись знает сессию и источник; сессии, где агент читал внешнее, не поднимают ничего в доверенную память; вспомненное не извлекается заново.</li>
+  <li><b>Ставь пределы и сроки.</b> Переполнение — явная ошибка, у записи есть дата, непроверенное истекает.</li>
+  <li><b>Меряй на своих логах.</b> 30–50 вопросов из прошлых сессий с эталоном и журнал каждой записи в память; цифры вендоров — только как ориентир.</li>
+</ol>
+<p>Продукты из этой главы на 30 сентября 2026 года:</p>
+<table class="wide">
+<thead><tr><th>Продукт</th><th>Статус</th><th>Кто и когда пишет</th><th>Противоречия и забывание</th><th>Подробнее</th></tr></thead>
+<tbody>
+<tr><th>Claude Code auto memory</th><td>включена по умолчанию с v2.1.59</td><td>Claude по ходу сессии</td><td>перезапись файлов; дата <code>modified</code>, чистка вручную</td><td><a href="#claude-code">раздел</a></td></tr>
+<tr><th>Memory tool</th><td><code>memory_20250818</code>, без бета-заголовка</td><td>Claude, исполняет твой код</td><td>как реализуешь</td><td><a href="#memory-tool">раздел</a></td></tr>
+<tr><th>Managed Agents memory</th><td>бета; Dreams — research preview</td><td>сессии напрямую, Dreams в фоне</td><td>версии <code>memver_</code>, 30 дней; Dreams в новое хранилище</td><td><a href="#managed">раздел</a></td></tr>
+<tr><th>Codex memories</th><td>выключены по умолчанию</td><td>фон, после затихания чата</td><td>отдельная модель консолидации</td><td><a href="#write-path">раздел</a></td></tr>
+<tr><th>Hermes Agent</th><td>открытый, жёсткий лимит символов</td><td>агент в горячем пути</td><td>ошибка переполнения, модель выбрасывает сама</td><td><a href="#files">раздел</a></td></tr>
+<tr><th>OpenClaw</th><td>открытый, Dreaming по умолчанию</td><td>фон, гейт по происхождению</td><td>консолидация с проверкой; полураспад 30 дней</td><td><a href="#write-path">раздел</a></td></tr>
+<tr><th>Letta Harness</th><td><code>letta</code> 0.34.0, V1 в архиве</td><td>агент и dreaming в git worktree</td><td>коммиты MemFS, дефрагментация</td><td><a href="#files">раздел</a></td></tr>
+<tr><th>Mem0 OSS</th><td><code>mem0ai</code> 2.2.1, Apache-2.0</td><td>один вызов LLM, только ADD</td><td>нет, решает ранжирование</td><td><a href="#facts-graphs">раздел</a></td></tr>
+<tr><th>Mem0 Platform</th><td>платная</td><td>ADD, Supersede и Merge при записи</td><td>пометка устаревшего, Decay, <code>expiration_date</code></td><td><a href="#facts-graphs">раздел</a></td></tr>
+<tr><th>Graphiti и Zep</th><td><code>graphiti-core</code> 0.30.2, Apache-2.0; Zep Cloud</td><td>LLM на каждый эпизод</td><td>битемпоральная инвалидация, без удаления</td><td><a href="#facts-graphs">раздел</a></td></tr>
+<tr><th>Memory Bank, AgentCore</th><td>управляемые сервисы облаков</td><td>извлечение и консолидация LLM</td><td>обновление моделью; ревизии у Memory Bank</td><td><a href="#facts-graphs">раздел</a></td></tr>
+<tr><th>Deep Agents, LangGraph Store</th><td>LangMem не выходил с октября 2025</td><td>агент через <code>edit_file</code></td><td>last-write-wins; TTL в Store</td><td><a href="#write-path">раздел</a></td></tr>
+</tbody>
+</table>
+<p>Для бэкенда на Python, например агента поддержки или внутреннего ассистента на FastAPI, из этого получается конкретная схема. Memory tool с обработчиком, который отображает <code>/memories</code> на строки Postgres (своя таблица или готовый <code>PostgresStore</code>) с ключом <code>(user_id, path)</code>, колонками <code>origin</code>, <code>updated_at</code>, <code>content_sha256</code> и таблицей версий. Индексный файл с пределом, который модель читает первым. Запись в горячем пути, а раз в ночь — консолидация, которая пишет новую версию индекса и кладёт дифф на выборочную проверку. Полнотекстовый поиск Postgres, когда индекс перестанет помещаться в предел. Mem0 Platform или Zep пробуй, когда нужна готовая инфраструктура или граф, Memory Bank и AgentCore — когда всё остальное уже живёт в этом облаке. Любой из них мерь на своих вопросах, а не на LoCoMo. Схема перестаёт работать, если ответ нужен быстрее, чем агент успевает сделать несколько вызовов инструментов: тогда память должна приходить в запрос заранее, одним поиском, и ты платишь точностью за скорость, как RAG в LongMemEval-V2.</p>
+<div class="note practice"><p>План на вечер. Проведи ревизию <code>MEMORY.md</code> в своём основном проекте и перенеси в <code>CLAUDE.md</code> или хук всё, что обязано выполняться. Напиши обработчик memory tool по наброску из этой главы и пять тестов: <code>../</code>, <code>%2e%2e</code>, <code>/memoriesX</code>, чужой <code>user_id</code>, повтор <code>old_str</code>. Выпиши из логов своего агента десять вопросов, ответ на которые лежит в прошлых сессиях, и посмотри, сколько из них он решит с памятью и без.</p></div>
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>Почему в CoALA рабочая память — не окно контекста, и что из этого следует для компакции?</summary><p>Рабочая память — состояние харнесса между вызовами LLM; промпт на каждом шаге собирается из его части. Компакция режет промпт, а не состояние, поэтому план, список задач и прогресс держи в состоянии или в файлах, а не только в истории сообщений.</p></details>
+<details><summary>Индекс <code>MEMORY.md</code> вырос до 260 строк. Что увидит следующая сессия и почему молчаливое обрезание было опаснее явной ошибки?</summary><p>Следующая сессия загрузит только первые 200 строк. При молчаливом обрезании модель считала факт сохранённым, а пропажу замечали через недели. Явная ошибка в момент записи заставляет ужать индекс сразу, пока модель ещё знает, что в нём лежит.</p></details>
+<details><summary>Правило «не запускать миграции на проде» попало в auto memory. Почему этого мало и куда его поставить?</summary><p>Память для модели — контекст, а не принудительная настройка: заметку могут не записать, не загрузить или не выполнить. Правило пиши в <code>CLAUDE.md</code>, а запрет ставь хуком <code>PreToolUse</code>.</p></details>
+<details><summary>Модель прислала <code>view</code> с путём <code>/memories/../../app/.env</code>. Почему проверки префикса <code>/memories</code> недостаточно?</summary><p>Строка начинается с <code>/memories</code> и проходит проверку префикса, но после канонизации указывает за пределы каталога. Путь нужно раскодировать (<code>%2e%2e</code>), привести к каноническому виду и убедиться, что он лежит внутри каталога этого пользователя; иначе вернуть ошибку с <code>is_error: true</code>.</p></details>
+<details><summary>Почему Anthropic Dreams пишет результат в новое хранилище, а не правит исходное?</summary><p>Консолидация теряет информацию и может ошибиться, а ошибка в памяти повторяется в каждой следующей сессии. Отдельный выход можно сравнить со старым и выбросить — как pull request вместо push в main.</p></details>
+<details><summary>Letta получила 74,0% на LoCoMo против 68,5% у Mem0. Почему это не доказывает превосходство файлов и какой результат доказывает сильнее?</summary><p>Сравнивались разные харнессы, 68,5 — самоотчёт Mem0, а LoCoMo целиком помещается в окно. Сильнее LongMemEval-V2: на одном нейтральном бенчмарке файлы с кодовым агентом дали 72,5% против 48,5% у лучшего RAG, ценой задержки.</p></details>
+<details><summary>Пользователь сказал «я переехал в Берлин». Что останется в памяти у Mem0 OSS, у Mem0 Platform и у Graphiti?</summary><p>В Mem0 OSS — оба факта без пометок, и какой всплывёт, решит ранжирование. В Platform Supersede пометит старый факт устаревшим, но оставит его. В Graphiti у старого ребра появятся <code>invalid_at</code> (время в мире) и <code>expired_at</code> (время в системе), рядом ляжет новое ребро, и можно спросить, что было правдой на любую дату.</p></details>
+<details><summary>Почему «+26%» из статьи Mem0 не значит, что Mem0 точнее полного контекста?</summary><p>+26% — выигрыш у встроенной памяти OpenAI (66,88 против 52,90). Полный контекст в той же таблице набрал 72,90, больше Mem0; выигрыш Mem0 — в 15 раз меньше токенов на запрос.</p></details>
+<details><summary>Предпочтение пользователя записано и попадает в контекст, но через десяток ходов агент перестаёт ему следовать. Что поменять?</summary><p>Записать его императивной директивой («Никогда не…», «Всегда…»), заменять на месте при изменении и повторять рядом с запросом, например через хук <code>UserPromptSubmit</code>.</p></details>
+<details><summary>Ты хочешь, чтобы агент сам дописывал свои скиллы после задач. Какое условие обязательно?</summary><p>Проверяющий сигнал: тесты, результат выполнения, метрика. Без него ACE и Dynamic Cheatsheet деградируют, а у Letta скиллы с верификатором дали 15,7 пункта против 9,0. И правка должна быть дельтой к версионированному файлу, которую можно откатить.</p></details>
+<details><summary>Почему сканирование содержимого памяти не защищает от отравления, а метка происхождения защищает?</summary><p>Отравленный факт выглядит как обычный, а доверие по содержимому подделывается через суммаризацию и эхо доверенных инструментов. Метку происхождения ставит код в момент записи, модель её не перепишет, и запись <code>untrusted</code> структурно не попадает в доверенную память.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Открывал каталог auto memory своего проекта, могу сказать, что из него грузится при старте, и чистил устаревшие заметки</li>
+  <li>Перенёс хотя бы одно обязательное правило из памяти в <code>CLAUDE.md</code> или хук <code>PreToolUse</code></li>
+  <li>Настраивал сабагента с <code>memory: project</code> и видел его заметки в диффе</li>
+  <li>Написал обработчик memory tool с проверкой путей и тестами на <code>../</code>, <code>%2e%2e</code> и чужой <code>user_id</code></li>
+  <li>Подключал memory tool вместе с context editing и видел в журнале, что модель записывает важное до очистки</li>
+  <li>Могу нарисовать путь записи и чтения для файловой памяти, Mem0 и Graphiti и сказать, что каждая делает с противоречием</li>
+  <li>Писал запрос к битемпоральной памяти (Graphiti или своей таблице с <code>valid_at</code>/<code>invalid_at</code> и <code>created_at</code>/<code>expired_at</code>), который отвечает, что было правдой на дату и что система знала на дату</li>
+  <li>Разбираю число вендора по бенчмарку памяти: модель-читатель, бюджет поиска, кто настраивал конкурентов, размер выборки</li>
+  <li>Собрал из своих логов 30+ вопросов с эталоном и прогнал на них хотя бы два варианта памяти</li>
+  <li>Могу показать, где в моей системе фиксируется происхождение записи и почему контент из сети не попадает в доверенную память</li>
+  <li>Логирую каждую запись в память с сессией, происхождением и диффом</li>
+  <li>Запускал самоулучшение агента (скиллы или плейбук) только вместе с тестом, который решает, стало ли лучше</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool">Memory tool</a>. Документация Claude Platform, Anthropic, живая страница, проверено 30 сентября 2026.</li>
+  <li id="src-2"><a href="https://arxiv.org/abs/2309.02427">Cognitive Architectures for Language Agents</a>. T. Sumers, S. Yao, K. Narasimhan, T. Griffiths, arXiv:2309.02427, сентябрь 2023, v3 — 15 марта 2024 (TMLR).</li>
+  <li id="src-3"><a href="https://code.claude.com/docs/en/memory">How Claude remembers your project</a>. Документация Claude Code, Anthropic, живая страница (версии до v2.1.283), проверено 30 сентября 2026.</li>
+  <li id="src-4"><a href="https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md">Claude Code CHANGELOG</a>. Anthropic, записи v2.1.32–v2.1.285; даты релизов по реестру npm <code>@anthropic-ai/claude-code</code>.</li>
+  <li id="src-5"><a href="https://code.claude.com/docs/en/sub-agents">Subagents</a>. Документация Claude Code, Anthropic, раздел о постоянной памяти сабагентов.</li>
+  <li id="src-6"><a href="https://claude.com/blog/the-new-rules-of-context-engineering-for-claude-5-generation-models">The new rules of context engineering for Claude 5 generation models</a>. Thariq Shihipar, блог Claude, 24 июля 2026; обсуждение на <a href="https://news.ycombinator.com/item?id=49051361">Hacker News</a>, 463 очка.</li>
+  <li id="src-7">Отзывы пользователей Hacker News об auto memory: <a href="https://news.ycombinator.com/item?id=47741287">bushido, 12 апреля 2026</a>; <a href="https://news.ycombinator.com/item?id=47929507">ArielTM, 28 апреля 2026</a>; <a href="https://news.ycombinator.com/item?id=49052275">Kiro, 25 июля 2026</a>; <a href="https://news.ycombinator.com/item?id=49391724">fluidcruft, 21 августа 2026</a>.</li>
+  <li id="src-8"><a href="https://claude.com/blog/context-management">Managing context on the Claude Developer Platform</a>. Блог Claude, Anthropic, 29 сентября 2025; и <a href="https://platform.claude.com/docs/en/build-with-claude/context-editing">Context editing</a>, документация Claude Platform, раздел «Using with the memory tool».</li>
+  <li id="src-9"><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents">Effective harnesses for long-running agents</a>. Anthropic Engineering, 26 ноября 2025.</li>
+  <li id="src-10"><a href="https://platform.claude.com/docs/en/managed-agents/memory">Using agent memory</a>. Документация Claude Managed Agents, бета; анонс: <a href="https://claude.com/blog/claude-managed-agents-memory">Built-in memory for Claude Managed Agents</a>, блог Claude, 23 апреля 2026.</li>
+  <li id="src-11"><a href="https://platform.claude.com/docs/en/managed-agents/dreams">Dreams</a>. Документация Claude Managed Agents, research preview; анонс: <a href="https://claude.com/blog/new-in-claude-managed-agents">New in Claude Managed Agents: dreaming, outcomes, and multiagent orchestration</a>, блог Claude, 19 мая 2026.</li>
+  <li id="src-12"><a href="https://www.letta.com/blog/benchmarking-ai-agent-memory">Benchmarking AI Agent Memory</a>. Letta, 12 августа 2025.</li>
+  <li id="src-13"><a href="https://arxiv.org/abs/2605.12493">LongMemEval-V2: Evaluating Long-Term Agent Memory Toward Experienced Colleagues</a>. D. Wu et al., arXiv:2605.12493, 12 мая 2026; <a href="https://github.com/xiaowu0162/LongMemEval-V2">репозиторий</a>, обновление AgentRunbook-C в августе 2026.</li>
+  <li id="src-14"><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Context Engineering for AI Agents: Lessons from Building Manus</a>. Yichao „Peak“ Ji, блог Manus, 18 июля 2025.</li>
+  <li id="src-15"><a href="https://developers.openai.com/codex/memories">Memories</a>. Документация OpenAI Codex, проверено 30 сентября 2026.</li>
+  <li id="src-16"><a href="https://docs.langchain.com/oss/python/deepagents/memory">Memory</a>. Документация LangChain Deep Agents, проверено 30 сентября 2026; <a href="https://docs.langchain.com/oss/python/migrate/langgraph-v1">LangGraph v1 migration</a>; <a href="https://pypi.org/project/langmem/">LangMem на PyPI</a>, версия 0.0.30 от 27 октября 2025; <a href="https://docs.langchain.com/oss/python/langgraph/add-memory">LangGraph: add memory</a> и <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint/langgraph/store/base/__init__.py"><code>TTLConfig</code> в исходниках LangGraph</a>; PyPI <code>langgraph-checkpoint-postgres</code> 3.1.2, 7 августа 2026.</li>
+  <li id="src-17"><a href="https://github.com/NousResearch/hermes-agent">NousResearch/hermes-agent</a>: README, страницы «Persistent Memory» (<code>website/docs/user-guide/features/memory.md</code>) и «Skills», раздел «Agent-Managed Skills» (<code>website/docs/user-guide/features/skills.md</code>), проверено 30 сентября 2026.</li>
+  <li id="src-18"><a href="https://arxiv.org/abs/2310.08560">MemGPT: Towards LLMs as Operating Systems</a>. C. Packer et al., arXiv:2310.08560, 12 октября 2023.</li>
+  <li id="src-19">Letta: <a href="https://github.com/letta-ai/letta">README letta-ai/letta</a>; <a href="https://docs.letta.com/concepts/memfs">MemFS</a> и <a href="https://docs.letta.com/configuration/memory">Memory &amp; dreaming</a>, <a href="https://docs.letta.com/guides/agents/memory-blocks">Memory Blocks</a> и <a href="https://docs.letta.com/guides/agents/sleep-time-agents">Sleep-time Agents</a>, документация Letta; <a href="https://www.letta.com/blog/context-repositories">Context Repositories</a>, 12 февраля 2026; <a href="https://github.com/letta-ai/letta/blob/archive/letta/functions/function_sets/base.py">базовые функции V1</a>, ветка archive; PyPI <code>letta</code> 0.34.0, 30 сентября 2026.</li>
+  <li id="src-20"><a href="https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md">Open Knowledge Format (OKF) v0.2, SPEC.md</a>. Google Cloud, коммиты 24 июля и 21 августа 2026.</li>
+  <li id="src-21"><a href="https://calpaterson.com/memoryfields.html">Agent memory as a file format</a>. Cal Paterson, август 2026; обсуждение на <a href="https://news.ycombinator.com/item?id=49508317">Hacker News</a>, 31 августа 2026, 191 очко.</li>
+  <li id="src-22"><a href="https://github.com/topoteretes/cognee">topoteretes/cognee</a>: README (таблица BEAM) и релизы, v1.6.2 — 29 сентября 2026; бенчмарк BEAM: <a href="https://arxiv.org/abs/2510.27246">arXiv:2510.27246</a>, 31 октября 2025.</li>
+  <li id="src-23"><a href="https://docs.mem0.ai/migration/oss-v2-to-v3">Open Source: Migrating to the New Memory Algorithm</a> и <a href="https://docs.mem0.ai/core-concepts/memory-evaluation">Memory Evaluation</a>, документация Mem0; <a href="https://github.com/mem0ai/mem0">README mem0ai/mem0</a>, раздел «New Memory Algorithm (April 2026)»; PyPI <code>mem0ai</code> 2.0.0 — 16 апреля 2026, текущая 2.2.1 — 25 сентября 2026.</li>
+  <li id="src-24"><a href="https://arxiv.org/abs/2504.19413">Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory</a>. P. Chhikara et al., arXiv:2504.19413, 28 апреля 2025 (таблицы полного текста).</li>
+  <li id="src-25"><a href="https://docs.mem0.ai/platform/features/dream">Dream</a> и <a href="https://docs.mem0.ai/platform/features/memory-decay">Memory Decay</a>, документация Mem0 Platform; <a href="https://docs.mem0.ai/changelog/highlights">changelog Highlights</a> (Memory Decay — 8 мая, Temporal Reasoning — 13 мая, <code>expiration_date</code> — 27 июня 2026).</li>
+  <li id="src-26"><a href="https://github.com/mem0ai/mem0/issues/5352">Workaround: Solving time-blindness, semantic conflicts, and missing CRUD in Mem0 OSS + Qdrant</a>. GitHub mem0ai/mem0, issue #5352, открыт 3 июня 2026.</li>
+  <li id="src-27"><a href="https://arxiv.org/abs/2501.13956">Zep: A Temporal Knowledge Graph Architecture for Agent Memory</a>. P. Rasmussen et al., arXiv:2501.13956, 20 января 2025; D. Chalef, <a href="https://blog.getzep.com/lies-damn-lies-statistics-is-mem0-really-sota-in-agent-memory/">Is Mem0 Really SOTA in Agent Memory?</a>, блог Zep, 6 мая 2025.</li>
+  <li id="src-28"><a href="https://github.com/getzep/graphiti">getzep/graphiti</a>: README и <code>graphiti_core/edges.py</code>; PyPI <code>graphiti-core</code> 0.30.2, 8 сентября 2026.</li>
+  <li id="src-29"><a href="https://cloud.google.com/gemini-enterprise-agent-platform/scale/memory-bank/generate-memories">Generate memories</a>, документация Memory Bank, Google Gemini Enterprise Agent Platform; <a href="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/built-in-strategies.html">Built-in strategies</a> и <a href="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory-strategies.html">Memory strategies</a>, документация Amazon Bedrock AgentCore. Проверено 30 сентября 2026.</li>
+  <li id="src-30">Simon Willison: <a href="https://simonwillison.net/2025/May/21/chatgpt-new-memory/">I don't like ChatGPT's new memory dossier</a>, 21 мая 2025; <a href="https://simonwillison.net/2025/Sep/12/claude-memory/">Comparing the memory implementations of Claude and ChatGPT</a>, 12 сентября 2025.</li>
+  <li id="src-31"><a href="https://support.claude.com/en/articles/11817273">Use Claude's chat search and memory to build on previous context</a> и <a href="https://support.claude.com/en/articles/12138966-release-notes">Release notes</a>, Claude Help Center, проверено 30 сентября 2026; <a href="https://claude.com/blog/memory">Claude's memory</a>, блог Claude, 11 сентября 2025.</li>
+  <li id="src-32"><a href="https://help.openai.com/en/articles/8590148-memory-faq">Memory in ChatGPT</a> и <a href="https://help.openai.com/en/articles/6825453-chatgpt-release-notes">ChatGPT Release Notes</a>, OpenAI Help Center, проверено 30 сентября 2026.</li>
+  <li id="src-33"><a href="https://arxiv.org/abs/2504.13171">Sleep-time Compute: Beyond Inference Scaling at Test-time</a>. K. Lin, C. Snell, Y. Wang, C. Packer et al., arXiv:2504.13171, 17 апреля 2025.</li>
+  <li id="src-34"><a href="https://docs.openclaw.ai/concepts/memory-architecture">Memory architecture</a>. Документация OpenClaw, проверено 30 сентября 2026; см. также <a href="https://docs.openclaw.ai/concepts/dreaming">Dreaming</a>.</li>
+  <li id="src-35"><a href="https://arxiv.org/abs/2304.03442">Generative Agents: Interactive Simulacra of Human Behavior</a>. J. S. Park et al., arXiv:2304.03442, апрель 2023, v2 — 6 августа 2023 (UIST '23).</li>
+  <li id="src-36"><a href="https://unit42.paloaltonetworks.com/indirect-prompt-injection-poisons-ai-longterm-memory/">When AI Remembers Too Much: Persistent Behaviors in Agents' Memory</a>. Royce Lu, Jay Chen, Unit 42 (Palo Alto Networks), 9 октября 2025.</li>
+  <li id="src-37"><a href="https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/">OWASP Top 10 for Agentic Applications 2026</a>. OWASP GenAI Security Project, 9 декабря 2025, пункт ASI06 «Memory &amp; Context Poisoning».</li>
+  <li id="src-38"><a href="https://arxiv.org/abs/2407.12784">AgentPoison: Red-teaming LLM Agents via Poisoning Memory or Knowledge Bases</a>. Z. Chen, Z. Xiang, C. Xiao et al., arXiv:2407.12784, 17 июля 2024.</li>
+  <li id="src-39"><a href="https://arxiv.org/abs/2503.03704">Memory Injection Attacks on LLM Agents via Query-Only Interaction</a> (MINJA). S. Dong et al., arXiv:2503.03704, 5 марта 2025.</li>
+  <li id="src-40"><a href="https://arxiv.org/abs/2606.24322">Securing LLM-Agent Long-Term Memory Against Poisoning: Non-Malleable, Origin-Bound Authority with Machine-Checked Guarantees</a>. Y. Louck, arXiv:2606.24322, 23 июня 2026.</li>
+  <li id="src-41"><a href="https://arxiv.org/abs/2402.17753">Evaluating Very Long-Term Conversational Memory of LLM Agents</a> (LoCoMo). A. Maharana et al., arXiv:2402.17753, 27 февраля 2024.</li>
+  <li id="src-42"><a href="https://penfieldlabs.substack.com/p/milla-jovovich-just-released-an-ai">Milla Jovovich's MemPalace Claims 100% on LoCoMo. Its Benchmarks.md Disagrees</a>. Penfield Labs, 7 апреля 2026.</li>
+  <li id="src-43"><a href="https://arxiv.org/abs/2410.10813">LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory</a>. D. Wu et al., arXiv:2410.10813, 14 октября 2024 (ICLR 2025).</li>
+  <li id="src-44"><a href="https://mastra.ai/research/observational-memory">Observational Memory: 95% on LongMemEval</a>. Mastra Research, 9 февраля 2026.</li>
+  <li id="src-45"><a href="https://arxiv.org/abs/2510.04618">Agentic Context Engineering: Evolving Contexts for Self-Improving Language Models</a>. Q. Zhang et al., arXiv:2510.04618, октябрь 2025, v3 — 29 марта 2026 (ICLR 2026); <a href="https://github.com/ace-agent/ace">репозиторий ace-agent/ace</a>.</li>
+  <li id="src-46"><a href="https://arxiv.org/abs/2303.11366">Reflexion: Language Agents with Verbal Reinforcement Learning</a>. N. Shinn et al., arXiv:2303.11366, 20 марта 2023.</li>
+  <li id="src-47"><a href="https://arxiv.org/abs/2504.07952">Dynamic Cheatsheet: Test-Time Learning with Adaptive Memory</a>. M. Suzgun et al., arXiv:2504.07952, 10 апреля 2025.</li>
+  <li id="src-48"><a href="https://arxiv.org/abs/2305.16291">Voyager: An Open-Ended Embodied Agent with Large Language Models</a>. G. Wang et al., arXiv:2305.16291, 25 мая 2023.</li>
+  <li id="src-49"><a href="https://www.letta.com/blog/skill-learning">Skill Learning</a>. Letta, 2 декабря 2025.</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>

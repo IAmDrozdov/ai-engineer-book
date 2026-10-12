@@ -1,0 +1,1305 @@
+<!doctype html>
+<html lang="ru" data-chapter="01">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM API и цикл агента — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 1</b> из 17, часть «Основа»</p>
+  <h1>LLM API и цикл агента</h1>
+  <p class="lead">25 февраля 2026 года в трекере opencode появилась жалоба: агент выполняет инструмент и молча останавливается, но только на Gemini и на провайдерах за LiteLLM. На OpenAI тот же код работал. Причина уместилась в одну строку условия выхода из цикла, а чтобы её увидеть, надо знать, какими словами разные API сообщают «модель хочет вызвать инструмент».</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="loop">
+<h2>Цикл, который крутит любой агент</h2>
+<p>Вот строка, из-за которой агент бросал работу<a class="cite" href="#src-1">1</a>:</p>
+<script type="text/plain" class="code" data-lang="typescript" data-title="opencode, условие выхода из цикла (цитата из issue #14972)">
+if (lastAssistant?.finish && !["tool-calls", "unknown"].includes(lastAssistant.finish)...break
+</script>
+<p>Условие верит полю причины остановки: если модель закончила ход не ради вызова инструментов, значит, работа сделана. OpenAI в такой ситуации возвращает <code>finish_reason: "tool_calls"</code>. Gemini через свой OpenAI-совместимый слой и часть провайдеров за LiteLLM возвращали <code>"stop"</code>, хотя массив <code>tool_calls</code> в том же ответе был заполнен. Инструмент выполнялся, цикл выходил, результат до модели не доходил, и со стороны это выглядело как агент, который сдался после первого шага. Исправление вошло в PR #14973, а правило из него стоит перенести в любой свой код: <mark>продолжать цикл или нет, решает наличие вызовов инструментов в ответе</mark>. Причина остановки только уточняет, что делать, когда вызовов нет.</p>
+<p>Откуда у Gemini такой ответ, видно по его родному API. В перечислении <code>finishReason</code> значения «модель хочет вызвать инструмент» нет вовсе: <code>STOP</code> описан как «Natural stop point of the model or provided stop sequence», и ответ с вызовом функции кончается им же<a class="cite" href="#src-2">2</a>. Совместимый слой переводит его в <code>"stop"</code>, а цикл, написанный под OpenAI, принимает это за конец работы. Это не ошибка Google, у разных API просто разные словари.</p>
+
+<aside class="margin"><p><b>Харнесс</b> (harness, обвязка) — код вокруг модели: собирает запрос, выполняет инструменты, решает, когда остановиться. Claude Code, Codex, opencode — харнессы.</p></aside>
+<p>Сам цикл одинаков у всех, от Claude Code до скрипта на полсотни строк. Саймон Уиллисон описывает агента как «инструменты в цикле»<a class="cite" href="#src-3">3</a>. Харнесс отправляет модели описания инструментов и всю историю разговора. Модель отвечает либо текстом, либо просьбой вызвать один или несколько инструментов с конкретными аргументами. Харнесс выполняет эти вызовы сам, дописывает результаты в историю и отправляет всё заново. Так продолжается, пока модель не ответит без вызовов.</p>
+
+<figure class="fig wide" id="fig-loop">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant H as Харнесс
+  participant M as API модели
+  participant T as Инструменты
+  H->>M: tools + [user]
+  M-->>H: вызов read_file(path)
+  H->>T: выполнить read_file
+  T-->>H: содержимое файла
+  H->>M: tools + [user, assistant, tool]
+  M-->>H: вызов run_tests()
+  H->>T: выполнить run_tests
+  T-->>H: 2 failed
+  H->>M: tools + [user, assistant, tool, assistant, tool]
+  M-->>H: текст без вызовов
+  Note over H,M: каждый запрос несёт всю историю заново
+</script>
+<figcaption>Два витка цикла. Модель только просит вызвать инструмент, выполняет его харнесс. Запрос на каждом витке длиннее предыдущего: в нём вся история вместе с ответами инструментов, и модель перечитывает её целиком.</figcaption>
+</figure>
+
+<p>Из этой схемы следуют две вещи, о которых потом забывают. Первая: модель ничего не выполняет. Вызов инструмента в ответе — это JSON с именем и аргументами, заявка на действие. Запустит ли харнесс команду, спросит ли у тебя разрешения, подменит ли результат, модель узнает только из следующего запроса. Всё, что в Claude Code выглядит как «агент прочитал файл», на проводе выглядит как блок <code>tool_use</code> от модели и блок <code>tool_result</code>, который Claude Code собрал и отправил обратно.</p>
+<p>Вторая: модель ничего не помнит между запросами. У Chat Completions и Messages API нет состояния на сервере, разговор существует только в массиве, который харнесс присылает каждый раз. У Responses API состояние бывает серверным, но это меняет лишь то, кто собирает контекст: модель всё равно читает его полностью, и платишь ты за весь (подробности в <a href="#responses">разделе про Responses</a>).</p>
+<p>Отсюда цена. Команда Codex в разборе своего цикла (январь 2026) сама задаёт неудобный вопрос: «isn't the agent loop quadratic in terms of the amount of JSON sent…? And you would be right»<a class="cite" href="#src-4">4</a>. Каждый виток отправляет всю историю, и суммарный объём растёт квадратично от числа шагов. Они это принимают и следят за одним: старый промпт должен быть точным префиксом нового, тогда срабатывает кеш префикса, и, по их словам, «sampling the model is linear rather than quadratic». Правило на всю главу: историю только дописывают. Пересортированный список инструментов, метка времени в системном промпте, смена модели или уровня рассуждений посреди разговора ломают префикс и возвращают квадратичную цену. Про устройство кеша и то, сколько он экономит, — <a href="../02-context-engineering/index.html">глава 2</a>.</p>
+<p>Армин Ронахер в июне 2026 года предложил различать два цикла<a class="cite" href="#src-5">5</a>. Внутренний нарисован выше: модель вызывает инструменты и видит результаты, пока не решит, что закончила. Внешний крутит код вокруг: решает, выполнена ли задача целиком, подкладывает свежий контекст, перезапускает выдохшийся внутренний цикл, передаёт работу другой системе. Когда уровни путают, от модели ждут, что она сама поймёт, что задача сделана, хотя ответ без вызовов значит только конец хода. Здесь речь о внутреннем цикле, внешний появится в <a href="../12-deep-agents/index.html">главе 12</a>.</p>
+
+<div class="note practice"><p>Claude Code пишет каждую сессию в <code class="wrap">~/.claude/projects/&lt;путь-проекта&gt;/&lt;id-сессии&gt;.jsonl</code>. В версии 2.1.285 строки с <code>"type": "assistant"</code> и <code>"type": "user"</code> несут в поле <code>message</code> объекты Messages API: блоки <code>tool_use</code>, <code>tool_result</code>, <code>thinking</code>, поле <code>stop_reason</code>, <code>usage</code> с <code>cache_read_input_tokens</code>. Формат внутренний и не документирован, но лучшего учебного материала не найти: это твои собственные сессии. Команда ниже покажет, сколько витков заняла задача. Число <code>tool_use</code> должно совпасть с числом <code>tool_result</code>, иначе цикл где-то оборвался.</p></div>
+<script type="text/plain" class="code" data-lang="bash" data-title="Сколько блоков каждого типа в сессии Claude Code">
+jq -r 'select(.type=="assistant" or .type=="user")
+       | .message.content[]? | .type' СЕССИЯ.jsonl | sort | uniq -c
+</script>
+</section>
+
+<section id="chat-completions">
+<h2>Chat Completions: формат, который скопировали все</h2>
+<p>Так выглядит запрос к <code>POST /v1/chat/completions</code>, в котором харнесс предлагает модели один инструмент:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Набросок: запрос с инструментом (поля по OpenAPI-спецификации)" data-hl="5,13,18,20-21">
+{
+  "model": "gpt-6-luna",
+  "reasoning_effort": "none",
+  "messages": [
+    {"role": "developer", "content": "Отвечай кратко."},
+    {"role": "user", "content": "Какая погода в Бостоне?"}
+  ],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_current_weather",
+      "description": "Get the current weather in a given location",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "location": {"type": "string"},
+          "unit": {"type": ["string", "null"], "enum": ["celsius", "fahrenheit"]}
+        },
+        "required": ["location", "unit"],
+        "additionalProperties": false
+      }
+    }
+  }],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true
+}
+</script>
+<p>В массиве <code>messages</code> пять рабочих ролей: <code>developer</code>, <code>system</code>, <code>user</code>, <code>assistant</code> и <code>tool</code>. Шестая, <code>function</code>, осталась от 2023 года и помечена устаревшей<a class="cite" href="#src-6">6</a>. Роль <code>developer</code> появилась 17 декабря 2024 года вместе с o1, и спецификация описывает её так: «Developer-provided instructions that the model should follow, regardless of messages sent by the user. With o1 models and newer, developer messages replace the previous system messages». Роль <code>system</code> по-прежнему принимается, но на рассуждающих моделях инструкции разработчика кладут в <code>developer</code>.</p>
+<p>Разница не косметическая. В разборе цикла Codex OpenAI перечисляет приоритет ролей по убыванию, «system, developer, user, assistant», и уточняет, что порядок первых элементов промпта определяет сервер, а не клиент<a class="cite" href="#src-4">4</a>. Там же видно, из чего состоит запрос настоящего агента. После <code>instructions</code> и <code>tools</code> Codex кладёт в <code>input</code> developer-сообщение с песочницей и правами, developer-инструкции из конфига, user-сообщение с собранными <code>AGENTS.md</code> (по умолчанию до 32 КиБ) и навыками, user-сообщение с описанием окружения, и только потом идёт запрос пользователя. Верхняя ступень принадлежит платформе, твои инструкции стоят ниже, пользовательские ещё ниже, а текст из результатов инструментов собственного веса не имеет. Что писать в сами инструкции, разбирает <a href="../04-prompting/index.html">глава 4</a>.</p>
+<p>Ответ модели, которая решила воспользоваться инструментом, в примерах спецификации выглядит так:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Ответ с вызовом инструмента (пример из OpenAPI-спецификации OpenAI)" data-hl="8-12,16">
+{
+  "created": 1699896916,
+  "model": "gpt-6-astra",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_abc123",
+        "type": "function",
+        "function": { "name": "get_current_weather", "arguments": "{\n\"location\": \"Boston, MA\"\n}" }
+      }]
+    },
+    "logprobs": null,
+    "finish_reason": "tool_calls"
+  }],
+  "usage": {
+    "prompt_tokens": 82,
+    "completion_tokens": 17,
+    "total_tokens": 99,
+    "completion_tokens_details": { "reasoning_tokens": 0, "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0 }
+  }
+}
+</script>
+<p>Текста нет, <code>content</code> равен <code>null</code>. Вместо него массив <code>tool_calls</code>, и у каждого вызова свой <code>id</code>. Аргументы приходят строкой, внутри которой JSON: их надо распарсить и проверить, прежде чем что-то запускать (почему проверять обязательно, в <a href="#schemas">следующем разделе</a>). Поле <code>finish_reason</code> принимает значения <code>stop</code>, <code>length</code>, <code>tool_calls</code>, <code>content_filter</code> и устаревшее <code>function_call</code>.</p>
+<p>Харнесс дописывает в историю сообщение ассистента как есть, вместе с <code>tool_calls</code>, а за ним по одному сообщению с ролью <code>tool</code> на каждый вызов. Связь держится на идентификаторе: <code>tool_call_id</code> в ответе инструмента должен совпасть с <code>id</code> вызова.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Набросок: результат инструмента, который уходит следующим запросом">
+{"role": "tool", "tool_call_id": "call_abc123", "content": "15 degrees Celsius, partly cloudy"}
+</script>
+<p>Если модель попросила два инструмента сразу, в <code>tool_calls</code> будет два элемента, а в истории после ответа ассистента появятся два сообщения <code>tool</code>. С <code>parallel_tool_calls: false</code> модель вызывает не больше одного инструмента за ход. Поле <code>tool_choice</code> спецификация описывает так: «<code>none</code> means the model will not call any tool and instead generates a message. <code>auto</code> means the model can pick between generating a message or calling one or more tools. <code>required</code> means the model must call one or more tools», а объект с именем функции заставляет вызвать именно её. Без инструментов по умолчанию действует <code>none</code>, с инструментами — <code>auto</code>.</p>
+
+<figure class="fig" id="fig-cc-parallel">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant H as Харнесс
+  participant M as Chat Completions
+  H->>M: messages [developer, user] + tools
+  M-->>H: assistant, tool_calls [call_a, call_b]
+  Note right of M: finish_reason = tool_calls
+  Note over H: выполняет оба вызова
+  H->>M: [..., assistant, tool call_a, tool call_b]
+  M-->>H: assistant, content = текст
+  Note right of M: finish_reason = stop
+</script>
+<figcaption>Параллельный вызов в Chat Completions. Сообщение ассистента с обоими вызовами возвращается в историю без изменений, за ним идут два сообщения <code>tool</code>, каждое со своим <code>tool_call_id</code>.</figcaption>
+</figure>
+
+<p>Этот формат живёт с 2023 года почти без изменений, и именно его повторили все остальные: vLLM, Ollama, LiteLLM, OpenRouter, OpenAI-совместимый эндпоинт Gemini <code>/v1beta/openai/</code><a class="cite" href="#src-2">2</a>. Для сторонних серверов он и в сентябре 2026 года остаётся общим знаменателем.</p>
+<p>Для самой OpenAI уже нет. В гайде по GPT-6 сказано: «GPT-6 Astra and GPT-6.1 Sol support Chat Completions, but tool calling requires Responses»; GPT-6 Sol и GPT-6 Luna вызывают инструменты через Chat Completions только с <code>reasoning_effort: "none"</code><a class="cite" href="#src-7">7</a>. Поэтому в наброске выше стоит <code>gpt-6-luna</code> без рассуждений. Цикл, который год работал на GPT-5.x, на двух новейших моделях OpenAI не запустится вовсе. Пример ответа из спецификации с моделью <code>gpt-6-astra</code> этому гайду противоречит; когда документы расходятся, верь странице конкретной модели, а не примеру. Сам Chat Completions OpenAI закрывать не собирается, даты отключения нет, но новые агентные возможности (встроенные инструменты, фоновый режим, рассуждения между ходами) появляются только в Responses<a class="cite" href="#src-8">8</a>.</p>
+<div class="note key"><p>Под модели OpenAI новый код пиши на Responses API. Под всё остальное, включая локальные модели и шлюзы, Chat Completions остаётся самым переносимым форматом, и так будет, пока сторонние серверы не догонят Responses со всеми его полями.</p></div>
+</section>
+
+<section id="responses">
+<h2>Responses API: разговор из элементов</h2>
+<p>При переезде на Responses API часто рассчитывают, что <code>previous_response_id</code> сократит счёт: историю больше не нужно пересылать, сервер помнит её сам. Руководство по миграции отвечает одной фразой: «Even when using previous_response_id, all previous input tokens for responses in the chain are billed as input tokens»<a class="cite" href="#src-8">8</a>. Параметр экономит байты в запросе и код на клиенте, но не токены. Модель по-прежнему читает весь контекст, а дешевле становится только та часть, что попала в кеш префикса. Там же вторая ловушка: <code>previous_response_id</code> не переносит поле <code>instructions</code>, его надо присылать в каждом запросе.</p>
+<p>Responses API вышел 11 марта 2025 года вместе со встроенными инструментами и Agents SDK<a class="cite" href="#src-9">9</a>. Главное отличие от Chat Completions не в именах полей, а в единице разговора. Вместо сообщений здесь элементы (items), и руководство формулирует это так: «A message is a type of Item, as is a function_call or function_call_output». Ответ модели — плоский массив <code>output</code>, где рядом лежат рассуждения <code>reasoning</code>, текстовое <code>message</code> и вызовы <code>function_call</code>. Вызов инструмента больше не вложен в сообщение ассистента, это отдельный элемент:</p>
+<div class="tabs">
+  <section data-tab="Вызов">
+  <script type="text/plain" class="code" data-lang="json" data-title="Элемент function_call в output (руководство по миграции)" data-hl="2-3">
+  {
+    "id": "fc_12345xyz",
+    "call_id": "call_12345xyz",
+    "type": "function_call",
+    "name": "get_weather",
+    "arguments": "{\"location\":\"Paris, France\"}"
+  }
+  </script>
+  </section>
+  <section data-tab="Результат">
+  <script type="text/plain" class="code" data-lang="json" data-title="Элемент function_call_output, который харнесс дописывает в input (гайд по function calling)" data-hl="3">
+  {
+    "type": "function_call_output",
+    "call_id": "call_12345xyz",
+    "output": "{\"temperature\": \"25\", \"unit\": \"C\"}"
+  }
+  </script>
+  </section>
+</div>
+<p>У вызова два идентификатора, и их путают. <code>id</code> с префиксом <code>fc_</code> — имя самого элемента. <code>call_id</code> с префиксом <code>call_</code> — то, на что должен сослаться <code>function_call_output</code><a class="cite" href="#src-10">10</a>. Роли <code>tool</code> в Responses нет, результат инструмента тоже элемент. Его поле <code>output</code> принимает строку до 10 МБ или массив частей с текстом, картинками и файлами<a class="cite" href="#src-6">6</a>; картинки и файлы в результатах функций разрешили 26 сентября 2025 года.</p>
+
+<figure class="fig wide" id="fig-shapes">
+<svg class="diagram" viewBox="0 0 1000 430" role="img" aria-label="Одна и та же история с двумя параллельными вызовами в Chat Completions и в Responses API">
+  <text class="t-title" x="40" y="44">Chat Completions: messages[]</text>
+  <text class="t-title" x="540" y="44">Responses: элементы input и output</text>
+  <path class="line" d="M500,24 L500,416"/>
+  <rect class="box--soft" x="40" y="70" width="320" height="40" rx="6"/>
+  <text class="t-mono" x="52" y="95">user</text>
+  <text class="t-sub" x="170" y="95">вопрос пользователя</text>
+  <rect class="box" x="40" y="120" width="320" height="84" rx="6"/>
+  <text class="t-mono" x="52" y="150">assistant</text>
+  <text class="t-mono t-mute" x="52" y="174">tool_calls[]</text>
+  <rect class="box--accent" x="170" y="128" width="176" height="28" rx="4"/>
+  <text class="t-mono" x="182" y="147">call_a get_weather</text>
+  <rect class="box--accent" x="170" y="164" width="176" height="28" rx="4"/>
+  <text class="t-mono" x="182" y="183">call_b get_weather</text>
+  <rect class="box--ok" x="40" y="214" width="320" height="40" rx="6"/>
+  <text class="t-mono" x="52" y="239">tool</text>
+  <text class="t-mono" x="170" y="239">tool_call_id: call_a</text>
+  <rect class="box--ok" x="40" y="264" width="320" height="40" rx="6"/>
+  <text class="t-mono" x="52" y="289">tool</text>
+  <text class="t-mono" x="170" y="289">tool_call_id: call_b</text>
+  <rect class="box" x="40" y="314" width="320" height="40" rx="6"/>
+  <text class="t-mono" x="52" y="339">assistant</text>
+  <text class="t-sub" x="170" y="339">финальный текст</text>
+  <path class="arrow arrow--dash" d="M346,142 C392,142 392,234 362,234"/>
+  <path class="arrow arrow--dash" d="M346,178 C408,178 408,284 362,284"/>
+  <rect class="box--soft" x="540" y="70" width="360" height="40" rx="6"/>
+  <text class="t-mono" x="552" y="95">message</text>
+  <text class="t-mono" x="740" y="95">role: user</text>
+  <rect class="box--violet" x="540" y="120" width="360" height="40" rx="6"/>
+  <text class="t-mono" x="552" y="145">reasoning</text>
+  <text class="t-mono" x="740" y="145">encrypted_content</text>
+  <rect class="box--accent" x="540" y="170" width="360" height="40" rx="6"/>
+  <text class="t-mono" x="552" y="195">function_call</text>
+  <text class="t-mono" x="740" y="195">call_id: call_a</text>
+  <rect class="box--accent" x="540" y="220" width="360" height="40" rx="6"/>
+  <text class="t-mono" x="552" y="245">function_call</text>
+  <text class="t-mono" x="740" y="245">call_id: call_b</text>
+  <rect class="box--ok" x="540" y="270" width="360" height="40" rx="6"/>
+  <text class="t-mono" x="552" y="295">function_call_output</text>
+  <text class="t-mono" x="740" y="295">call_id: call_a</text>
+  <rect class="box--ok" x="540" y="320" width="360" height="40" rx="6"/>
+  <text class="t-mono" x="552" y="345">function_call_output</text>
+  <text class="t-mono" x="740" y="345">call_id: call_b</text>
+  <rect class="box" x="540" y="370" width="360" height="40" rx="6"/>
+  <text class="t-mono" x="552" y="395">message</text>
+  <text class="t-mono" x="740" y="395">phase: final_answer</text>
+  <path class="arrow arrow--dash" d="M900,190 C938,190 938,290 902,290"/>
+  <path class="arrow arrow--dash" d="M900,240 C956,240 956,340 902,340"/>
+</svg>
+<figcaption>Одна и та же история с двумя параллельными вызовами. Слева вызовы вложены в сообщение ассистента, ответы на них — сообщения с ролью <code>tool</code>. Справа все элементы одного уровня: первый ответ модели дал <code>reasoning</code> и два <code>function_call</code>, харнесс дописал два <code>function_call_output</code>, второй ответ дал <code>message</code>. Пунктир — связь по идентификатору вызова.</figcaption>
+</figure>
+
+<p>Сотрудник OpenAI в обсуждении на Hacker News в мае 2025 года описал разницу короче: Chat Completions делает один вызов модели на один вызов API и ничего не хранит, а Responses со встроенными инструментами способен внутри одного вызова сделать несколько ходов модели и несколько вызовов инструментов<a class="cite" href="#src-11">11</a>. Для встроенных инструментов вроде веб-поиска цикл крутит OpenAI. Для твоих функций его по-прежнему крутишь ты.</p>
+<p>Только граница проходит не между встроенными инструментами и функциями, а внутри встроенных. В объединении <code>Tool</code> шестнадцать типов. Часть из них OpenAI выполняет сама и кладёт в <code>output</code> готовый результат. Другая часть только описывает действие и ждёт ответа от харнесса, как обычная функция<a class="cite" href="#src-6">6</a>:</p>
+<table class="wide">
+<thead><tr><th>Элемент в <code>output</code></th><th>Кто выполняет</th><th>Что харнесс дописывает в <code>input</code></th></tr></thead>
+<tbody>
+<tr><td><code>function_call</code>, <code>custom_tool_call</code></td><td>харнесс</td><td><code>function_call_output</code>, <code>custom_tool_call_output</code></td></tr>
+<tr><td><code>computer_call</code></td><td>харнесс</td><td><code>computer_call_output</code></td></tr>
+<tr><td><code>local_shell_call</code></td><td>харнесс</td><td><code>local_shell_call_output</code></td></tr>
+<tr><td><code>shell_call</code></td><td>харнесс, если у инструмента <code>environment</code> типа <code>local</code>; иначе контейнер OpenAI</td><td><code>shell_call_output</code> для локального окружения</td></tr>
+<tr><td><code>apply_patch_call</code></td><td>харнесс</td><td><code>apply_patch_call_output</code></td></tr>
+<tr><td><code>mcp_approval_request</code></td><td>человек, через харнесс</td><td><code>mcp_approval_response</code> с <code>approve</code></td></tr>
+<tr><td><code>web_search_call</code>, <code>file_search_call</code>, <code>code_interpreter_call</code>, <code>image_generation_call</code>, <code>mcp_call</code></td><td>OpenAI</td><td>ничего, результат уже в <code>output</code></td></tr>
+</tbody>
+</table>
+<p>Харнесс, который ищет в ответе только <code>function_call</code>, на первом же <code>apply_patch_call</code> решит, что вызовов нет, и выйдет из цикла. Это ошибка opencode, только на родном API OpenAI. Встроенным вызовам OpenAI ставит отдельный потолок <code>max_tool_calls</code>: «The maximum number of total calls to built-in tools that can be processed in a response… Any further attempts to call a tool by the model will be ignored». У Anthropic разделение видно по типу блока: <code>server_tool_use</code> выполнила сама Anthropic, его результат приходит рядом, в том же ответе, и отвечать на него не нужно<a class="cite" href="#src-12">12</a>. Как выбирать между такими инструментами и своими функциями, разбирает <a href="../03-tool-design/index.html">глава 3</a>, одобрение вызовов MCP — <a href="../05-mcp/index.html">глава 5</a>.</p>
+
+<h3>Где живёт история</h3>
+<p>Состояние между ходами держат тремя способами. Можно сослаться на прошлый ответ через <code>previous_response_id</code> и прислать только новые элементы: сервер хранит цепочку, сохранённые ответы по умолчанию живут 30 дней. Можно хранить всё самому: <code>store: false</code> и каждый раз полный массив элементов. И можно завести беседу через Conversations API (он вышел 20 августа 2025 года<a class="cite" href="#src-9">9</a>): в запросе передаётся <code>conversation</code>, и, по спецификации, «Items from this conversation are prepended to input_items»; у бесед 30-дневного срока хранения нет<a class="cite" href="#src-6">6</a>.</p>
+
+<figure class="fig" id="fig-state">
+<script type="text/x-mermaid">
+flowchart TD
+  n["Ход N завершён"]:::plain
+  n -- "previous_response_id" --> a["Шлёшь только новые элементы<br/>цепочка на сервере 30 дней"]
+  n -- "store: false" --> b["Шлёшь все элементы заново<br/>reasoning с encrypted_content"]:::accent
+  n -- "conversation" --> c["Элементы беседы<br/>подставляются перед input"]
+  a --> p["Ход N+1: модель читает всё,<br/>оплачивается весь вход"]:::warn
+  b --> p
+  c --> p
+</script>
+<figcaption>Три способа передать историю в Responses API. Меняется то, кто хранит элементы и что едет по сети. Что читает модель и за что ты платишь, не меняется: в любом варианте это вся история.</figcaption>
+</figure>
+
+<aside class="margin"><p><b>ZDR</b> (Zero Data Retention) — режим, в котором OpenAI не хранит данные запросов. Для таких организаций <code>store</code> принудительно <code>false</code>.</p></aside>
+<p>Собственный агент OpenAI обходится без <code>previous_response_id</code>. Codex шлёт каждый запрос целиком, «to keep requests fully stateless and to support ZDR», а непрерывность рассуждений для клиентов с нулевым хранением обеспечена шифрованием: «OpenAI persists a ZDR customer's decryption key, but not their data»<a class="cite" href="#src-4">4</a>.</p>
+<p>Речь о рассуждениях модели. Они приходят элементом <code>reasoning</code>, и текста мысли там нет: есть краткое изложение, если его попросить, и <code>encrypted_content</code>, зашифрованный блоб, который надо вернуть в следующем запросе. По текущей спецификации блоб заполняется по умолчанию, а форма <code class="wrap">include: ["reasoning.encrypted_content"]</code> из кукбуков 2025 года осталась от прошлого<a class="cite" href="#src-6">6</a>. Если при сборке истории выбросить элементы <code>reasoning</code> и оставить только текст, модель на следующем ходе потеряет нить. OpenAI оценивает выигрыш Responses для рассуждающих моделей в 3% на SWE-bench «with same prompt and setup» и в 40–80% лучшую утилизацию кеша во внутренних тестах; модель и дату замера руководство не называет<a class="cite" href="#src-8">8</a>.</p>
+<p>У сообщений ассистента с 24 февраля 2026 года есть поле <code>phase</code> со значениями <code>commentary</code> и <code>final_answer</code>. Спецификация требует: «For models like gpt-5.3-codex and beyond, when sending follow-up requests, preserve and resend phase on all assistant messages — dropping it can degrade performance». Практическое правило для всего Responses API: <mark>историю собирай из элементов <code>output</code> как есть</mark>, а не пересобирай сообщения ассистента из <code>output_text</code>. Пересобранное сообщение теряет и <code>phase</code>, и рассуждения. Какие из прошлых рассуждений модель вообще увидит, решает отдельный параметр, о нём в <a href="#reasoning">разделе про рассуждения</a>.</p>
+<p>С 10 февраля 2026 года Responses умеет сжимать длинную историю на сервере: в цепочке появляется непрозрачный элемент компакции, и выбрасывать его нельзя, он теперь часть истории<a class="cite" href="#src-9">9</a>. Как компакция устроена у OpenAI и у Anthropic и чем она опасна — в <a href="../02-context-engineering/index.html">главе 2</a>.</p>
+
+<h3>Что ломается при переезде молча</h3>
+<p>Разбор на benchlm.ai перечисляет семь мест, где переезд с Chat Completions ломается без единой ошибки API<a class="cite" href="#src-13">13</a>. Все семь подтверждаются документацией OpenAI, одно с оговоркой.</p>
+<table class="wide">
+<thead><tr><th>Chat Completions</th><th>Responses</th><th>Что ломается</th></tr></thead>
+<tbody>
+<tr><td><code>prompt_tokens</code>, <code>completion_tokens</code></td><td><code>input_tokens</code>, <code>output_tokens</code></td><td>Дашборды расходов показывают нули</td></tr>
+<tr><td><code>finish_reason</code></td><td><code>status</code> и <code>incomplete_details.reason</code></td><td>Проверка на обрезку по <code>length</code> перестаёт срабатывать</td></tr>
+<tr><td><code>choices[0].message</code></td><td>Массив <code>output</code>, первым может идти <code>reasoning</code></td><td>Код, который берёт <code>output[0]</code> как ответ</td></tr>
+<tr><td>Системное сообщение в истории</td><td><code>instructions</code>, не переносится через <code>previous_response_id</code></td><td>Инструкции пропадают со второго хода</td></tr>
+<tr><td>Вся история в запросе</td><td><code>previous_response_id</code>, оплата всей цепочки</td><td>Ожидаемая экономия не случается</td></tr>
+<tr><td><code>strict</code> по умолчанию выключен</td><td>Схему пытаются привести к strict; если нельзя, откат и <code>strict: false</code> в ответе</td><td>Поведение инструментов меняется без предупреждения<a class="cite" href="#src-10">10</a></td></tr>
+<tr><td>Поток кончается <code>data: [DONE]</code></td><td>Поток кончается событием <code>response.completed</code></td><td>Клиент ждёт <code>[DONE]</code>, которого не будет</td></tr>
+</tbody>
+</table>
+
+<h3>Assistants API: чем кончился прошлый API с состоянием</h3>
+<p>Предыдущая попытка OpenAI сделать API с серверным состоянием закончилась 26 августа 2026 года. Assistants API объявили устаревшим ровно за год до этого, 26 августа 2025, и в назначенный день выключили без переходного периода: вызовы <code>/v1/assistants</code>, <code>/v1/threads</code> и <code>/v1/threads/runs</code> возвращают ошибку<a class="cite" href="#src-14">14</a>. В посте об отключении есть фраза, которая объясняет выбор: «The Responses API has already overtaken Chat Completions in token activity». Переезжать предлагали на Responses плюс Conversations, автоматического переноса тредов в беседы не было. А сохранённые в дашборде промпты, которые должны были заменить объекты ассистентов, 3 июня 2026 года сами получили дату отключения, 30 ноября 2026<a class="cite" href="#src-9">9</a>.</p>
+<div class="note field">
+<blockquote>Is the new API a beta as well? How can we trust it will not also experience the same treatment?
+<footer>— Peter Harrison, <a href="https://community.openai.com/t/assistants-api-beta-deprecation-august-26-2026-sunset/1354666">OpenAI Developer Community, август 2025</a></footer></blockquote>
+<p>Вопрос из треда об отключении Assistants. Через год, когда OpenAI выпустила хостируемый Agents API, его задавали снова, уже на Hacker News (об этом в <a href="#sdk">последнем разделе</a>).</p>
+</div>
+<ol class="timeline">
+  <li><time>17 декабря 2024</time><p>Роль <code>developer</code> и <code>reasoning_effort</code> вместе с o1.</p></li>
+  <li class="is-major"><time>11 марта 2025</time><p>Responses API, встроенные инструменты, Agents SDK.</p></li>
+  <li><time>20 августа 2025</time><p>Conversations API.</p></li>
+  <li><time>26 августа 2025</time><p>Assistants API получает дату отключения.</p></li>
+  <li><time>15 января 2026</time><p>Открытая спецификация Open Responses.</p></li>
+  <li><time>10–24 февраля 2026</time><p>Серверная компакция, WebSocket mode, поле <code>phase</code>.</p></li>
+  <li class="is-major"><time>26 августа 2026</time><p>Assistants API выключен.</p></li>
+  <li class="is-major"><time>3 сентября 2026</time><p>GPT-6 Astra: вызов инструментов только через Responses; асинхронные инструменты и steering.</p></li>
+  <li><time>10 сентября 2026</time><p>Agents API, публичная бета.</p></li>
+</ol>
+<div class="note key"><p>Храни историю сам: <code>store: false</code> и полный replay элементов <code>output</code>. Так работает Codex, это совместимо с ZDR и переносится на сторонние серверы, которые поддерживают только такой режим. <code>previous_response_id</code> бери ради коротких запросов по сети, помня, что <code>instructions</code> он не переносит, а платишь ты за всю цепочку.</p></div>
+</section>
+
+<section id="schemas">
+<h2>Схема инструмента, strict и structured outputs</h2>
+<p>В OpenAPI-спецификации OpenAI у поля <code>arguments</code> есть описание, которое полезно прочитать полностью: «The arguments to call the function with, as generated by the model in JSON format. Note that the model does not always generate valid JSON, and may hallucinate parameters not defined by your function schema. Validate the arguments in your code before calling your function»<a class="cite" href="#src-6">6</a>. Без дополнительных флагов JSON Schema в описании инструмента — подсказка модели, а не контракт. Модель читает её как текст и старается ей соответствовать.</p>
+<p>Контрактом схема становится с <code>strict: true</code>. Сервер компилирует её в грамматику и на каждом шаге генерации отсекает токены, которые из грамматики выводят: написать лишнее поле или строку вместо числа модель не может физически. Это <dfn>constrained decoding</dfn> (ограниченное декодирование), и оба крупных вендора реализуют strict именно так. Anthropic пишет: «Structured outputs guarantee schema-compliant responses through constrained decoding», а строгие инструменты у неё работают через «grammar-constrained sampling» по входу инструмента<a class="cite" href="#src-15">15</a>. Первый запрос с новой схемой платит задержкой на компиляцию, следующие идут с обычной скоростью<a class="cite" href="#src-16">16</a>.</p>
+
+<figure class="fig wide" id="fig-strict">
+<ol class="pipeline">
+  <li><b>JSON Schema</b><span>все поля в required, additionalProperties: false</span></li>
+  <li><b>Грамматика</b><span>компилируется при первом запросе с этой схемой</span></li>
+  <li data-tone="accent"><b>Маска токенов</b><span>на каждом шаге запрещённые токены отсечены</span></li>
+  <li><b>Семплирование</b><span>только из разрешённого</span></li>
+  <li data-tone="ok"><b>JSON по схеме</b><span>форма гарантирована, смысл нет</span></li>
+</ol>
+<figcaption>Что происходит при <code>strict: true</code>. Гарантия касается формы: поля, типы, перечисления. Правильный ли город модель подставила в <code>location</code>, грамматика не знает, эту проверку делает твой код.</figcaption>
+</figure>
+
+<p>Цена — ограничения на саму схему. strict поддерживает подмножество JSON Schema, и OpenAI объясняет это соображениями «performance or technical reasons». У каждого объекта, включая вложенные, должно стоять <code>additionalProperties: false</code>, и каждое свойство должно быть перечислено в <code>required</code>. Необязательное поле объявляют через <code>null</code> в типе:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Строгое описание инструмента в Responses (гайд по function calling)" data-hl="9,11-12,14">
+{
+  "type": "function",
+  "name": "get_weather",
+  "description": "Retrieves current weather for the given location.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "location": {"type": "string", "description": "City and country e.g. Bogotá, Colombia"},
+      "units": {"type": ["string", "null"], "enum": ["celsius", "fahrenheit"]}
+    },
+    "required": ["location", "units"],
+    "additionalProperties": false
+  },
+  "strict": true
+}
+</script>
+<p>Дефолты у двух API OpenAI разные, и на этом спотыкаются при переезде. В Chat Completions strict по умолчанию выключен. В Responses, если флаг не указан, сервер, по словам гайда, «will attempt to normalize your schema into strict mode when possible, and will fall back to non-strict», и при откате в ответе у инструмента появится <code>strict: false</code>. Явный <code>strict: true</code> на несовместимой схеме запрос отклоняет<a class="cite" href="#src-10">10</a>. Поэтому пиши <code>strict: true</code> явно и держи схему совместимой: тогда несовместимость всплывёт ошибкой на твоём тесте, а не тихим откатом в продакшене.</p>
+<p>Тот же механизм работает для финального ответа, когда нужен не вызов инструмента, а JSON вместо текста. В Chat Completions это <code>response_format</code> с типом <code>json_schema</code>, в Responses — <code>text.format</code>. У Anthropic structured outputs вышли из беты: схема передаётся в <code>output_config.format</code>. Гарантия формы не отменяет отказа: вместо JSON модель может вернуть отказ, и схеме он не подчиняется (как его ловить, в <a href="#stop">разделе про остановку</a>).</p>
+<div class="tabs">
+  <section data-tab="OpenAI Responses">
+  <script type="text/plain" class="code" data-lang="json" data-title="Structured outputs в Responses (гайд Structured Outputs)">
+  {
+    "text": {
+      "format": {
+        "type": "json_schema",
+        "strict": true,
+        "name": "schema_name",
+        "schema": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}
+      }
+    }
+  }
+  </script>
+  </section>
+  <section data-tab="Anthropic">
+  <script type="text/plain" class="code" data-lang="yaml" data-title="Structured outputs в Messages API (документация Anthropic, YAML-форма запроса)">
+  output_config:
+    format:
+      type: json_schema
+      schema:
+        type: object
+        properties:
+          name: {type: string}
+          email: {type: string}
+          plan_interest: {type: string}
+          demo_requested: {type: boolean}
+        required: [name, email, plan_interest, demo_requested]
+        additionalProperties: false
+  </script>
+  </section>
+</div>
+
+<h3>Выбор инструмента без правки списка</h3>
+<p>Кроме <code>auto</code>, <code>required</code>, <code>none</code> и принудительного вызова одной функции, в Responses есть четвёртый вариант <code>tool_choice</code>, который сужает выбор, не трогая сам список:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="allowed_tools (гайд по function calling)">
+{
+  "tool_choice": {
+    "type": "allowed_tools",
+    "mode": "auto",
+    "tools": [
+      { "type": "function", "name": "get_weather" },
+      { "type": "function", "name": "search_docs" }
+    ]
+  }
+}
+</script>
+<p>Передать меньше инструментов было бы проще, но массив <code>tools</code> лежит в самом начале промпта, и любое изменение в нём сбрасывает кеш всего разговора. Гайд так и объясняет: список оставляют прежним, «so you can maximize savings from prompt caching». В Open Responses короче: «This is primarily a cache-preserving control surface»<a class="cite" href="#src-17">17</a>. Рядом живёт <code>parallel_tool_calls: false</code>, который, по гайду, «ensures exactly zero or one tool is called». Встроенные инструменты в пачку параллельных вызовов не попадают никогда.</p>
+<p>Если вход инструмента по природе не JSON (SQL, патч, команда оболочки), в Responses есть custom tools: <code>"type": "custom"</code>, на входе свободная строка, которую можно ограничить грамматикой через <code class="wrap">format: {type: "grammar", syntax: "lark" | "regex", definition}</code><a class="cite" href="#src-10">10</a>. Механизм тот же, только вместо JSON Schema твоя грамматика; гайд предупреждает, что слишком сложную он может отвергнуть. Как решать, что делать инструментом, а что грамматикой, обсуждается в <a href="../03-tool-design/index.html">главе 3</a>.</p>
+
+<h3>Трюк с фиктивным инструментом больше не работает</h3>
+<p>Структурированные данные из Claude долго извлекали так: объявляли фиктивный инструмент со схемой нужного ответа и заставляли его вызвать через <code class="wrap">tool_choice: {"type": "tool", "name": ...}</code>. На моделях, вышедших в сентябре 2026 года, трюк ломается. Fable 5.1, Mythos 5.1, Opus 5.5 и Sonnet 5.5 на принудительный выбор отвечают 400 с текстом <code class="wrap">tool_choice: type "tool" and "any" are not supported for this model.</code><a class="cite" href="#src-18">18</a> Замена — structured outputs через <code>output_config.format</code> либо <code>auto</code> плюс <code>strict: true</code> на инструментах<a class="cite" href="#src-19">19</a>.</p>
+<div class="note debate"><p>Ограничение формата не бесплатно для качества. В статье «Let Me Speak Freely?» (Tam и соавторы, 2024) модели, которых заставляли отвечать в JSON или XML, заметно хуже рассуждали, чем при свободном ответе, и чем строже был формат, тем сильнее падало качество<a class="cite" href="#src-47">47</a>. Практичный компромисс: strict везде, где выход разбирает машина (аргументы инструментов, данные для кода), потому что ошибка формата там дороже любой потери качества. Для свободного ответа на трудную задачу сначала сравни на своих примерах (<a href="../17-evals/index.html">глава 17</a>) текстовый ответ и ответ по схеме, и только потом навязывай схему.</p></div>
+</section>
+
+<section id="tokens">
+<h2>Во что превращаются сообщения и инструменты</h2>
+<p>В гайде OpenAI по function calling есть фраза, которая объясняет, почему описания инструментов стоят денег: «Under the hood, functions are injected into the system message in a syntax the model has been trained on. This means callable function definitions count against the model's context limit and are billed as input tokens»<a class="cite" href="#src-10">10</a>. JSON из запроса модель не видит. Сервер превращает роли, сообщения и схемы в одну последовательность токенов в синтаксисе, на котором модель обучали, а из токенов её ответа потом собирает JSON с вызовами. У закрытых моделей этот синтаксис спрятан. У открытых он лежит рядом с весами, в шаблоне чата.</p>
+<p><dfn>Шаблон чата</dfn> (chat template) — обычно Jinja-шаблон в конфиге токенайзера, который переводит список <code>{role, content}</code> в текст со служебными токенами конкретной модели. Общего формата нет даже у моделей на одной базе. Документация Hugging Face показывает одни и те же сообщения в двух дообучениях Mistral-7B<a class="cite" href="#src-20">20</a>:</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Один диалог в двух шаблонах (документация Transformers)">
+Mistral-7B-Instruct: <s>[INST] Hello, how are you? [/INST]I'm doing great...</s> [INST] ... [/INST]
+Zephyr-7B-beta:      <|user|>\nHello, how are you?</s>\n<|assistant|>\nI'm doing great...
+</script>
+<p>Рендерит шаблон <code class="wrap">tokenizer.apply_chat_template(messages, tools=tools, add_generation_prompt=True)</code>. Флаг <code>add_generation_prompt</code> дописывает токены, которые открывают ход ассистента; без него модель может просто продолжить текст пользователя. Инструменты передают JSON Schema или прямо Python-функциями, тогда схему вытащат из аннотаций типов и docstring в стиле Google. Для тех, кто переносит историю из OpenAI API, в документации Transformers есть предупреждение: «Although <code>tool_calls</code> is similar to the OpenAI API, the OpenAI API uses a JSON string as its <code>tool_calls</code> format. This may cause errors or strange model behavior if used in Transformers, which expects a dict». Модель в стиле Hermes выдаёт вызов так:</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Вызов инструмента моделью с шаблоном Hermes (документация Transformers)">
+<tool_call>
+{"arguments": {"location": "Paris, France", "unit": "celsius"}, "name": "get_current_temperature"}
+</tool_call><|im_end|>
+</script>
+
+<h3>Harmony: формат OpenAI, который можно прочитать</h3>
+<p>Для открытых моделей gpt-oss OpenAI опубликовала собственный формат, Harmony. Он задуман как отражение устройства Responses API (каналы, пространства имён инструментов, иерархия инструкций), и по нему видно, как OpenAI превращает запрос с инструментами в токены, по крайней мере для этих моделей. Так выглядят системное сообщение и сообщение разработчика с двумя функциями<a class="cite" href="#src-21">21</a>:</p>
+<script type="text/plain" class="code wide" data-lang="text" data-title="Harmony: системное и developer-сообщение с инструментами (README openai/harmony)" data-hl="5,7-8,13-21">
+<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.
+Knowledge cutoff: 2024-06
+Current date: 2025-06-28
+
+Reasoning: high
+
+# Valid channels: analysis, commentary, final. Channel must be included for every message.
+Calls to these tools must go to the commentary channel: 'functions'.<|end|>
+<|start|>developer<|message|># Instructions
+Always respond in riddles
+# Tools
+## functions
+namespace functions {
+// Gets the location of the user.
+type get_location = () => any;
+// Gets the current weather in the provided location.
+type get_current_weather = (_: {
+location: string,
+format?: "celsius" | "fahrenheit", // default: celsius
+}) => any;
+} // namespace functions<|end|><|start|>user<|message|>What is the weather like in SF?<|end|><|start|>assistant
+</script>
+<p>JSON Schema исчезла: инструменты стали объявлениями типов TypeScript в пространстве имён <code>functions</code>, описания — комментариями, уровень рассуждений — строкой <code>Reasoning: high</code> в системном сообщении. У каждого сообщения ассистента есть канал: <code>analysis</code> для рассуждений, <code>commentary</code> для вызовов инструментов и преамбул к ним, <code>final</code> для ответа пользователю. Вызов и результат выглядят так:</p>
+<script type="text/plain" class="code wide" data-lang="text" data-title="Harmony: вызов функции и её результат (OpenAI Cookbook)">
+<|start|>assistant<|channel|>commentary to=functions.get_current_weather <|constrain|>json<|message|>{"location":"San Francisco"}<|call|>
+<|start|>functions.get_current_weather to=assistant<|channel|>commentary<|message|>{"sunny": true, "temperature": 20}<|end|>
+</script>
+<p>Токен <code>&lt;|call|&gt;</code> останавливает генерацию, чтобы харнесс выполнил инструмент. <code>&lt;|return|&gt;</code> нужен только при декодировании: сохраняя историю, его заменяют на <code>&lt;|end|&gt;</code>. И ещё одно правило из cookbook: «you should drop any previous CoT content on subsequent sampling if the responses by the assistant ended in a message to the final channel». Рассуждения живут, пока идёт цикл вызовов, и выбрасываются после ответа пользователю. В Responses API это поведение называется <code>current_turn</code>, и его же заметил читатель разбора Codex на HN: reasoning «persist[s] during the agent tool call loop, but [is] discarded after every user turn»<a class="cite" href="#src-4">4</a>. README Harmony предупреждает, что без этого формата gpt-oss «will not work correctly».</p>
+
+<h3>M×N: почему у каждого движка свои парсеры</h3>
+<p>Рэми Луф в апреле 2026 года показал один и тот же вызов <code>search(query="GPU")</code> в трёх семействах открытых моделей<a class="cite" href="#src-22">22</a>:</p>
+<div class="tabs">
+  <section data-tab="gpt-oss (Harmony)">
+  <script type="text/plain" class="code" data-lang="text" data-title="Harmony">
+  <|channel|>commentary to=functions.search
+  <|constrain|>json<|message|>
+  {"query": "GPU"}
+  <|call|>
+  </script>
+  </section>
+  <section data-tab="DeepSeek">
+  <script type="text/plain" class="code" data-lang="text" data-title="DeepSeek">
+  <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>search
+  '''json
+  {"query": "GPU"}
+  '''
+  <｜tool▁call▁end｜><｜tool▁calls▁end｜>
+  </script>
+  </section>
+  <section data-tab="GLM">
+  <script type="text/plain" class="code" data-lang="text" data-title="GLM">
+  <tool_call>search
+  <arg_key>query</arg_key><arg_value>GPU</arg_value>
+  </tool_call>
+  </script>
+  </section>
+</div>
+<p>Его тезис: «wire formats are training-time decisions, and nothing constrains them to a shared convention». Каждому из M движков инференса приходится писать парсер под формат каждого из N семейств моделей. Поэтому vLLM при запуске требует <code>--enable-auto-tool-choice</code> и <code>--tool-call-parser</code> под конкретную модель (<code>llama3_json</code>, <code>qwen3_xml</code>, <code>hermes</code> и другие), а рассуждения разбирает отдельный <code>--reasoning-parser</code><a class="cite" href="#src-23">23</a>. Парсеры ломаются. Луф перечисляет случаи 2026 года: у Gemma 4 токены рассуждений вырезались раньше, чем до них добирался парсер (vLLM #38855), рассуждения протекали в аргументы инструментов (vLLM PR #39027), llama.cpp отказался от универсального автопарсера в пользу отдельного (PR #21418).</p>
+
+<figure class="fig wide" id="fig-template">
+<ol class="pipeline">
+  <li><b>messages + tools</b><span>JSON из запроса</span></li>
+  <li><b>Шаблон чата</b><span>Jinja или Harmony</span></li>
+  <li><b>Токены промпта</b><span>весь разговор строкой</span></li>
+  <li data-tone="accent"><b>Модель</b><span>генерирует токены</span></li>
+  <li><b>Токены ответа</b><span>вызов в формате своего семейства</span></li>
+  <li data-tone="warn"><b>Парсер движка</b><span>--tool-call-parser</span></li>
+  <li data-tone="ok"><b>tool_calls</b><span>JSON для харнесса</span></li>
+</ol>
+<figcaption>Где JSON превращается в токены и обратно. У OpenAI и Anthropic обе половины спрятаны внутри API. На своём vLLM или Ollama шаблон и парсер — твоя зона ответственности, и красный шаг ломается чаще остальных.</figcaption>
+</figure>
+
+<p>Закрытые вендоры шаблон не показывают, но Anthropic публикует его цену: сколько токенов системного промпта добавляется к запросу, как только в нём появились инструменты<a class="cite" href="#src-19">19</a>.</p>
+<figure class="fig" id="fig-overhead">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Системный промпт для инструментов, Claude Opus", "unit": "токенов", "emphasis": ["Opus 4.7", "Opus 5.5"],
+ "rows": [["Opus 4.1", 313], ["Opus 4.5", 496], ["Opus 4.6", 497], ["Opus 4.7", 675], ["Opus 4.8", 290], ["Opus 5", 286], ["Opus 5.5", 286]],
+ "note": "При tool_choice auto или none. Таблица из документации Anthropic по tool use, сентябрь 2026."}
+</script>
+<figcaption>Накладные расходы на сам факт наличия инструментов, без их описаний. Пик у Opus 4.7, с Opus 4.8 цифра упала более чем вдвое. Описания инструментов добавляются сверху.</figcaption>
+</figure>
+<p>При <code>any</code> или <code>tool</code> у старых моделей добавлялось ещё около сотни токенов, у Opus 4.7 выходило 804. У Opus 5.5 такого столбца нет: принудительного выбора там не бывает. Описания самих инструментов обычно весят куда больше; как их сокращать, разбирают <a href="../03-tool-design/index.html">глава 3</a> и <a href="../05-mcp/index.html">глава 5</a>.</p>
+<div class="note practice"><p>Возьми открытую модель с поддержкой инструментов из Hugging Face, вызови <code>apply_chat_template</code> с <code>tools=…</code> и <code>tokenize=False</code> и прочитай строку, которая получилась. Пять минут, и ты видишь глазами, во что превращается твой JSON и куда ставится описание каждого параметра.</p></div>
+</section>
+
+<section id="streaming">
+<h2>Стриминг: три формы одного потока</h2>
+<p>28 сентября 2026 года вышла Claude Sonnet 5.5, и в описании изменений есть поведение, которое не выдаёт себя ни одной ошибкой. «Text between tool calls comes back in thinking blocks»: текст между вызовами инструментов теперь приходит блоками рассуждений. При значении по умолчанию <code>display: "omitted"</code> их содержимое не передаётся. Интерфейс, который стримит текст, «goes quiet between tool calls, with no error»<a class="cite" href="#src-24">24</a>. Лечится одним полем, <code>thinking.display: "summarized"</code>, и платишь за мышление столько же. Но заметить такое можно, только если понимаешь, из каких событий состоит поток.</p>
+<aside class="margin"><p><b>SSE</b> (Server-Sent Events) — HTTP-ответ, который не закрывается и построчно присылает события вида <code>data: {…}</code>.</p></aside>
+<p>У трёх API три разные формы стрима. Chat Completions шлёт чанки <code>chat.completion.chunk</code> с полем <code>delta</code>, в которых прирастает сообщение. У Responses события типизированы и пронумерованы полем <code>sequence_number</code>. Anthropic группирует события по блокам контента, у каждого блока свой индекс. Отличаются они и именами событий, и моментом, когда аргументы вызова можно разбирать.</p>
+<div class="tabs">
+  <section data-tab="Chat Completions">
+  <script type="text/plain" class="code wide" data-lang="sse" data-title="Поток Chat Completions (пример из OpenAPI-спецификации)" data-hl="7,9">
+  data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra", "system_fingerprint": "fp_44709d6fcb", "choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+  data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra", "system_fingerprint": "fp_44709d6fcb", "choices":[{"index":0,"delta":{"content":"Hello"},"logprobs":null,"finish_reason":null}]}
+
+  : Intermediate chat completion chunks omitted.
+
+  data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra", "system_fingerprint": "fp_44709d6fcb", "choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
+
+  data: [DONE]
+  </script>
+  </section>
+  <section data-tab="Responses">
+  <script type="text/plain" class="code wide" data-lang="sse" data-title="Поток Responses с вызовом функции (гайд по function calling)" data-hl="9-10">
+  {"type":"response.output_item.added","response_id":"resp_1234xyz","output_index":0,"item":{"type":"function_call","id":"fc_1234xyz","call_id":"call_1234xyz","name":"get_weather","arguments":""}}
+  {"type":"response.function_call_arguments.delta","response_id":"resp_1234xyz","item_id":"fc_1234xyz","output_index":0,"delta":"{\""}
+  {"type":"response.function_call_arguments.delta","response_id":"resp_1234xyz","item_id":"fc_1234xyz","output_index":0,"delta":"location"}
+  {"type":"response.function_call_arguments.delta","response_id":"resp_1234xyz","item_id":"fc_1234xyz","output_index":0,"delta":"\":\""}
+  {"type":"response.function_call_arguments.delta","response_id":"resp_1234xyz","item_id":"fc_1234xyz","output_index":0,"delta":"Paris"}
+  {"type":"response.function_call_arguments.delta","response_id":"resp_1234xyz","item_id":"fc_1234xyz","output_index":0,"delta":","}
+  {"type":"response.function_call_arguments.delta","response_id":"resp_1234xyz","item_id":"fc_1234xyz","output_index":0,"delta":" France"}
+  {"type":"response.function_call_arguments.delta","response_id":"resp_1234xyz","item_id":"fc_1234xyz","output_index":0,"delta":"\"}"}
+  {"type":"response.function_call_arguments.done","response_id":"resp_1234xyz","item_id":"fc_1234xyz","output_index":0,"arguments":"{\"location\":\"Paris, France\"}"}
+  {"type":"response.output_item.done","response_id":"resp_1234xyz","output_index":0,"item":{"type":"function_call","id":"fc_1234xyz","call_id":"call_1234xyz","name":"get_weather","arguments":"{\"location\":\"Paris, France\"}"}}
+  </script>
+  </section>
+  <section data-tab="Anthropic">
+  <script type="text/plain" class="code wide" data-lang="sse" data-title="Поток Messages API с вызовом инструмента, сокращённо (документация Anthropic)" data-hl="7-8">
+  event: content_block_start
+  data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
+  event: content_block_delta
+  data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"location\":"}}
+  event: content_block_delta
+  data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" \"San Francisco, CA\"}"}}
+  event: content_block_stop
+  data: {"type":"content_block_stop","index":1}
+  </script>
+  </section>
+</div>
+
+<figure class="fig wide" id="fig-streams">
+<svg class="diagram" viewBox="0 0 1000 270" role="img" aria-label="Один вызов инструмента в трёх потоках и момент, когда аргументы можно разбирать">
+  <text class="t-title" x="20" y="72">Chat Completions</text>
+  <text class="t-title" x="20" y="152">Responses</text>
+  <text class="t-title" x="20" y="232">Anthropic</text>
+  <rect class="box" x="170" y="40" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="182" y="64">tool_calls[0]</text>
+  <text class="t-sub" x="182" y="84">index, id, name</text>
+  <rect class="box" x="380" y="40" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="392" y="64">arguments ×N</text>
+  <text class="t-sub" x="392" y="84">фрагменты по index</text>
+  <rect class="box--ok" x="590" y="40" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="602" y="64">finish_reason</text>
+  <text class="t-sub" x="602" y="84">tool_calls: разбирай</text>
+  <rect class="box--mute" x="800" y="40" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="812" y="64">data: [DONE]</text>
+  <text class="t-sub" x="812" y="84">не JSON, конец</text>
+  <path class="arrow" d="M360,68 L378,68"/>
+  <path class="arrow" d="M570,68 L588,68"/>
+  <path class="arrow" d="M780,68 L798,68"/>
+  <rect class="box" x="170" y="120" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="182" y="144">output_item.added</text>
+  <text class="t-sub" x="182" y="164">arguments пустые</text>
+  <rect class="box" x="380" y="120" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="392" y="144">arguments.delta ×N</text>
+  <text class="t-sub" x="392" y="164">фрагменты по item_id</text>
+  <rect class="box--ok" x="590" y="120" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="602" y="144">arguments.done</text>
+  <text class="t-sub" x="602" y="164">строка целиком</text>
+  <rect class="box--mute" x="800" y="120" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="812" y="144">output_item.done</text>
+  <text class="t-sub" x="812" y="164">полный элемент</text>
+  <path class="arrow" d="M360,148 L378,148"/>
+  <path class="arrow" d="M570,148 L588,148"/>
+  <path class="arrow" d="M780,148 L798,148"/>
+  <rect class="box" x="170" y="200" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="182" y="224">content_block_start</text>
+  <text class="t-sub" x="182" y="244">tool_use, input пуст</text>
+  <rect class="box" x="380" y="200" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="392" y="224">input_json_delta ×N</text>
+  <text class="t-sub" x="392" y="244">partial_json по index</text>
+  <rect class="box--ok" x="590" y="200" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="602" y="224">content_block_stop</text>
+  <text class="t-sub" x="602" y="244">блок закрыт: разбирай</text>
+  <rect class="box--mute" x="800" y="200" width="190" height="56" rx="6"/>
+  <text class="t-mono" x="812" y="224">message_delta</text>
+  <text class="t-sub" x="812" y="244">stop_reason, usage</text>
+  <path class="arrow" d="M360,228 L378,228"/>
+  <path class="arrow" d="M570,228 L588,228"/>
+  <path class="arrow" d="M780,228 L798,228"/>
+</svg>
+<figcaption>Один вызов инструмента в трёх потоках. Во всех трёх аргументы приходят кусками строки, которые до зелёного шага невалидны как JSON. Разбирать их можно только после события, закрывающего вызов: до него <code>json.loads</code> на накопленной строке упадёт.</figcaption>
+</figure>
+
+<p>В Chat Completions каждый кусок вызова несёт обязательное поле <code>index</code>, а <code>id</code> и <code>name</code> есть только в первом куске<a class="cite" href="#src-6">6</a>. Склеивать аргументы нужно по <code>index</code>: при параллельных вызовах куски разных вызовов приходят вперемешку, и без индекса их не разделить. Поток заканчивается буквальной строкой <code>data: [DONE]</code>, это не JSON. <code>usage</code> в потоке Chat Completions приходит, только если попросить <code class="wrap">stream_options: {"include_usage": true}</code>, иначе клиент не узнает расход вовсе. С этим флагом перед <code>[DONE]</code> будет лишний чанк с расходом за весь запрос и пустым массивом <code>choices</code>.</p>
+<p>В Responses аргументы тоже приходят кусками, но с именованными событиями: <code class="wrap">response.function_call_arguments.delta</code> по <code>item_id</code>, затем <code>.done</code> с полной строкой, затем <code>response.output_item.done</code> с полным элементом. Из последнего и надо брать элементы для истории. Спецификация прямо предупреждает, что <code>encrypted_content</code> рассуждений в событии <code>.added</code> «may be incomplete», и сохранять его нужно из <code>.done</code>. Поток кончается событием <code>response.completed</code>, <code>response.incomplete</code> или <code>response.failed</code>. Строки <code>[DONE]</code> OpenAI для Responses не документирует, а спецификация Open Responses, наоборот, требует: «The terminal event MUST be the literal string [DONE]»<a class="cite" href="#src-17">17</a>. Клиент, который собирается работать с обоими, принимает оба окончания. Типов событий в Responses несколько десятков, от <code class="wrap">response.reasoning_summary_text.delta</code> до <code>response.mcp_call_arguments.delta</code>, и незнакомые клиент должен просто пропускать.</p>
+<p>Anthropic держит жёсткий порядок: <code>message_start</code>, затем для каждого блока <code>content_block_start</code>, несколько <code>content_block_delta</code> и <code>content_block_stop</code>, затем <code>message_delta</code> с <code>stop_reason</code> и <code>message_stop</code><a class="cite" href="#src-12">12</a>. События <code>ping</code> могут появиться где угодно, незнакомые типы по политике версионирования надо игнорировать. Аргументы инструмента приходят как <code>input_json_delta</code> с полем <code>partial_json</code>. У блока рассуждений перед закрытием приходит <code>signature_delta</code> с подписью, без которой блок нельзя вернуть в историю. Две ловушки: <code>usage</code> в <code>message_delta</code> кумулятивный, а не приращение, и ошибка перегрузки может прийти прямо в потоке, событием <code>error</code> с типом <code>overloaded_error</code>, уже после статуса 200.</p>
+<div class="note practice"><p>Посмотри на сырой поток хотя бы раз, без SDK. <code>curl -N</code> отключает буферизацию, и события печатаются по мере прихода. Сравни, где в каждом потоке появляется имя инструмента и где закрываются аргументы.</p></div>
+<script type="text/plain" class="code" data-lang="bash" data-title="Набросок: сырой поток Responses и Messages API">
+curl -N https://api.openai.com/v1/responses \
+  -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model": "gpt-6.1-sol", "input": "Скажи привет", "stream": true}'
+
+curl -N https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model": "claude-opus-5-5", "max_tokens": 1024, "stream": true,
+       "messages": [{"role": "user", "content": "Скажи привет"}]}'
+</script>
+</section>
+
+<section id="stop">
+<h2>Почему модель остановилась</h2>
+<p>Вот ответ Messages API, после которого наивный цикл вернёт пользователю пустую строку<a class="cite" href="#src-25">25</a>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Отказ модели (документация Anthropic, Refusals and fallback)" data-hl="6-12,15">
+{
+  "id": "msg_01XFUDYJgAACzvnptvVoYEL",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-fable-5",
+  "content": [],
+  "stop_reason": "refusal",
+  "stop_details": {
+    "type": "refusal",
+    "category": "cyber",
+    "explanation": "This request was declined because it could enable cyber harm."
+  },
+  "usage": {
+    "input_tokens": 412,
+    "output_tokens": 0
+  }
+}
+</script>
+<p>Вызовов инструментов нет, значит, по правилу из opencode, цикл заканчивается. Текста тоже нет: <code>content</code> пуст. Код, который собирает текстовые блоки и отдаёт их как ответ, вернёт пустую строку. А с 24 сентября 2026 года такой отказ ещё и оплачивается, если он случился до начала вывода и относится к категориям <code>bio</code>, <code>frontier_llm</code> или <code>reasoning_extraction</code><a class="cite" href="#src-18">18</a>. Наличие вызовов решает, крутить ли цикл дальше. Что делать, когда он остановился, решает причина остановки, и разбирать надо все её значения, а не только «нормальное».</p>
+<table class="wide">
+<thead><tr><th>Что случилось</th><th>Chat Completions</th><th>Responses</th><th>Anthropic</th><th>Gemini</th><th>Что делать</th></tr></thead>
+<tbody>
+<tr><td>Модель ответила</td><td><code>stop</code></td><td><code>completed</code>, вызовов в <code>output</code> нет</td><td><code>end_turn</code></td><td><code>STOP</code> без <code>functionCall</code></td><td>Вернуть ответ</td></tr>
+<tr><td>Нужны инструменты</td><td><code>tool_calls</code></td><td>в <code>output</code> есть вызов, который ждёт клиента</td><td><code>tool_use</code></td><td><code>STOP</code> и <code>functionCall</code> в <code>parts</code></td><td>Выполнить, дописать результаты, продолжить</td></tr>
+<tr><td>Кончился лимит вывода</td><td><code>length</code></td><td><code>incomplete</code>, <code>max_output_tokens</code></td><td><code>max_tokens</code></td><td><code>MAX_TOKENS</code></td><td>Ответ обрезан, за готовый не выдавать</td></tr>
+<tr><td>Кончилось окно контекста</td><td>—</td><td>HTTP 400 до генерации</td><td><code>model_context_window_exceeded</code></td><td>—</td><td>Сжимать историю (<a href="../02-context-engineering/index.html">гл. 2</a>)</td></tr>
+<tr><td>Стоп-последовательность</td><td><code>stop</code></td><td>—</td><td><code>stop_sequence</code></td><td><code>STOP</code></td><td>Решает приложение</td></tr>
+<tr><td>Фильтр или отказ</td><td><code>content_filter</code> или поле <code>message.refusal</code></td><td><code>incomplete</code>, <code>content_filter</code>; часть <code>refusal</code> в <code>message</code></td><td><code>refusal</code></td><td><code>SAFETY</code>, <code>PROHIBITED_CONTENT</code> и соседи</td><td>Не повторять вслепую: запасная модель или честный отказ</td></tr>
+<tr><td>Блокировка политикой</td><td>—</td><td><code>failed</code>, <code>error.code</code>: <code>bio_policy</code>, <code>misalignment_policy_violation</code></td><td>—</td><td>—</td><td>Остановить задачу и показать человеку</td></tr>
+<tr><td>Сломан вызов инструмента</td><td>—</td><td>—</td><td>—</td><td><code>MALFORMED_FUNCTION_CALL</code></td><td>Повторить, считая попытки</td></tr>
+<tr><td>Пауза серверного цикла</td><td>—</td><td>—</td><td><code>pause_turn</code></td><td>—</td><td>Отправить ответ обратно как есть</td></tr>
+<tr><td>Прервано steering</td><td>—</td><td><code>incomplete</code>, <code>steered</code></td><td>—</td><td>—</td><td>Продолжение сервер создаст сам</td></tr>
+</tbody>
+</table>
+<p>У Anthropic причин семь, а не четыре, как в старых руководствах: <code>end_turn</code>, <code>max_tokens</code>, <code>stop_sequence</code>, <code>tool_use</code>, <code>pause_turn</code>, <code>refusal</code> и <code>model_context_window_exceeded</code><a class="cite" href="#src-25">25</a>. Последняя на Sonnet 4.5 и новее приходит без бета-заголовка и значит, что ответ упёрся в окно контекста раньше, чем в <code>max_tokens</code>. Объект <code>stop_details</code> заполнен только при отказе. В нём категория (одна из <code>cyber</code>, <code>bio</code>, <code>frontier_llm</code>, <code>reasoning_extraction</code>, <code>general_harms</code>, либо <code>null</code>) и объяснение. Отказы классификатором документированы для Fable 5.1, Fable 5, Opus 5.5, Opus 5 и Sonnet 5.5. Можно поручить запасной ход серверу: с параметром <code>fallbacks: "default"</code> (бета <code>server-side-fallback-2026-07-01</code>) отказанный запрос повторяется на другой модели внутри того же вызова.</p>
+<p><code>pause_turn</code> путают с концом хода чаще остальных. Он относится к серверным инструментам, которые выполняет сама Anthropic, вроде веб-поиска: их внутренний цикл упёрся в лимит, 10 итераций на запрос. Документация велит «continue the conversation by sending the response back as-is». Ответ, который ждёт твоего, клиентского инструмента, никогда не приходит с <code>pause_turn</code>. Если цикл считает эту причину концом хода, пользователь получает недоделанный ответ поиска, и ошибки нигде нет.</p>
+<p>У <code>max_tokens</code> в цикле с инструментами есть неочевидная сторона: «<code>max_tokens</code> is a hard cap on total output for the request, thinking and response text combined… In a tool-use loop, each request in the turn has its own <code>max_tokens</code>, so it doesn't bound the whole turn's spend»<a class="cite" href="#src-26">26</a>. Лимит на запрос не ограничивает стоимость задачи. Для этого нужен счётчик в самом цикле, о нём в <a href="#production">разделе про продакшен</a>.</p>
+
+<figure class="fig wide" id="fig-stop">
+<script type="text/x-mermaid">
+flowchart LR
+  r["Ответ Messages API"]:::plain
+  s{"stop_reason"}
+  x["tool_use: выполнить,<br/>tool_result в новый запрос"]:::accent
+  e["end_turn: вернуть ответ"]:::ok
+  pt["pause_turn: отправить<br/>ответ обратно как есть"]:::accent
+  mt["max_tokens или окно:<br/>ответ обрезан"]:::warn
+  rf["refusal: stop_details,<br/>запасная модель или отказ"]:::warn
+  ss["stop_sequence:<br/>решает приложение"]
+  r --> s
+  s --> x
+  s --> e
+  s --> pt
+  s --> mt
+  s --> rf
+  s --> ss
+</script>
+<figcaption>Маршрутизатор для родного Messages API: шесть выходов из одной развилки. Только жёлтые возвращают в цикл, следующим запросом. Через OpenAI-совместимые слои полю причины доверять нельзя (история opencode), там сначала проверяй, есть ли в ответе вызовы.</figcaption>
+</figure>
+
+<p>В Responses API поля <code>finish_reason</code> нет вовсе. У ответа есть <code>status</code> (<code>completed</code>, <code>failed</code>, <code>in_progress</code>, <code>cancelled</code>, <code>queued</code>, <code>incomplete</code>) и при неполном ответе <code>incomplete_details.reason</code>: <code>max_output_tokens</code>, <code>max_messages</code>, <code>content_filter</code> или <code>steered</code><a class="cite" href="#src-6">6</a>. Условие цикла — есть ли в <code>output</code> элементы, которые ждут ответа клиента: <code>function_call</code>, <code>custom_tool_call</code> и вызовы клиентских встроенных инструментов из <a href="#responses">таблицы в разделе про Responses</a>. Codex формулирует его так: повторять, пока модель «stops emitting tool calls and instead produces a message for the user»<a class="cite" href="#src-4">4</a>. С рассуждающими моделями <code>max_output_tokens</code> делится между мыслями и ответом, и маленький лимит кончается на рассуждениях раньше, чем модель дойдёт до текста. OpenAI советует для начала резервировать не меньше 25 тыс. токенов на рассуждения и вывод<a class="cite" href="#src-27">27</a>.</p>
+<p>Три строки таблицы у OpenAI легко пропустить, потому что они приходят не причиной остановки. Отказ модели в Chat Completions лежит в отдельном поле <code>message.refusal</code>, в Responses — частью <code>{"type": "refusal"}</code> внутри сообщения. С structured outputs это опаснее всего: гайд предупреждает, что отказ «does not necessarily follow the schema you have supplied», так что проверяй <code>refusal</code> раньше, чем зовёшь <code>json.loads</code><a class="cite" href="#src-16">16</a>. Блокировка политикой приходит ответом со <code>status: "failed"</code> и кодом в <code>error.code</code>. У <code>misalignment_policy_violation</code> есть объект <code>misalignment</code> с публичным объяснением и необязательным <code>steer</code>, инструкцией, как продолжить<a class="cite" href="#src-6">6</a>. Про GPT-6 Astra гайд пишет: «Our systems asynchronously monitor for misalignment and trigger alerts when necessary»<a class="cite" href="#src-7">7</a>; как тревога превращается в заблокированный ответ, он не уточняет. А переполнение окна до генерации не доходит вовсе. При <code>truncation: "disabled"</code>, а это дефолт, запрос, который не влезает в окно, «will fail with a 400 error». Вариант <code>auto</code> молча выбрасывает элементы из начала разговора и помечен устаревшим; в агенте начало истории обычно содержит саму задачу, так что лови 400 и сжимай историю сам.</p>
+<p>У Gemini сломанный вызов — отдельная причина <code>MALFORMED_FUNCTION_CALL</code>, «The function call generated by the model is invalid». Рядом стоит <code>TOO_MANY_TOOL_CALLS</code>: модель вызывала инструменты подряд слишком долго, и система прервала выполнение сама<a class="cite" href="#src-2">2</a>. Обе причины цикл должен различать, а не сводить к общему «вызовов нет, значит, готово».</p>
+<div class="note warn"><p>Ответ без вызовов — не обязательно ответ. OpenAI предупреждает, что GPT-6 Astra «is more likely to ask for clarification where earlier models would make assumptions»<a class="cite" href="#src-7">7</a>. В автономном цикле это значит, что условие «вызовов нет» сработает на уточняющем вопросе, и задача встанет. OpenAI поставляет для этой модели промпты автономности (о них <a href="../04-prompting/index.html">глава 4</a>). А внешний цикл должен отличать вопрос от результата.</p></div>
+</section>
+
+<section id="reasoning">
+<h2>Ручки рассуждающих моделей</h2>
+<p>Два запроса, которые год назад были нормой, в сентябре 2026 года возвращают 400. Первый — <code>reasoning: {"effort": "none"}</code> на GPT-6 Astra: эта модель, как и GPT-6.1 Sol, такое значение не принимает<a class="cite" href="#src-7">7</a>. Второй — <code class="wrap">thinking: {"type": "enabled", "budget_tokens": 10000}</code> на Claude 4.7 и новее: ручной бюджет мышления там убран<a class="cite" href="#src-26">26</a>. Параметры рассуждений перестали быть общими для всех моделей вендора. У каждой модели свой набор допустимых значений и свой дефолт.</p>
+<p>У OpenAI шкала <code>reasoning.effort</code> (в Chat Completions — плоский <code>reasoning_effort</code>) расширялась четыре раза, и в схеме сейчас семь значений<a class="cite" href="#src-9">9</a>:</p>
+<table>
+<thead><tr><th>Значение</th><th>Появилось</th><th>Вместе с</th></tr></thead>
+<tbody>
+<tr><td><code>low</code>, <code>medium</code>, <code>high</code></td><td>17 декабря 2024</td><td>o1</td></tr>
+<tr><td><code>minimal</code></td><td>7 августа 2025</td><td>GPT-5</td></tr>
+<tr><td><code>none</code></td><td>13 ноября 2025</td><td>GPT-5.1, где оно стало дефолтом</td></tr>
+<tr><td><code>xhigh</code></td><td>11 декабря 2025</td><td>GPT-5.2</td></tr>
+<tr><td><code>max</code></td><td>9 июля 2026</td><td>GPT-5.6</td></tr>
+</tbody>
+</table>
+<p>Дефолт менялся вместе с моделями. У GPT-5.1 он был <code>none</code>, с GPT-5.5 (24 апреля 2026) стал <code>medium</code>, и у GPT-5.6, GPT-6 Sol, GPT-6 Luna и GPT-6.1 Sol тоже <code>medium</code>. GPT-6 Astra и GPT-6.1 Sol отвергают <code>none</code>, GPT-6.1 Sol заодно и <code>minimal</code><a class="cite" href="#src-27">27</a>. Уровень рассуждений стал частью имени модели в разговорной речи: в обсуждении Agents API на HN пишут «switched back to my favorite (5.6 sol, medium)»<a class="cite" href="#src-28">28</a>. Относись к нему так же в коде: указывай явно в каждом запросе и храни рядом с именем модели.</p>
+<p>Заодно исчезают привычные ручки семплирования. Для семейства GPT-6 OpenAI пишет: «When reasoning effort is not <code>none</code>, remove <code>temperature</code>, <code>top_p</code>, and <code>top_logprobs</code>»<a class="cite" href="#src-7">7</a>. Python SDK Anthropic версии 1.0 (20 августа 2026) убрал <code>temperature</code>, <code>top_p</code> и <code>top_k</code> из методов Messages<a class="cite" href="#src-18">18</a>. Код, который ставил <code>temperature=0</code> ради воспроизводимости, сломается при обновлении SDK или модели.</p>
+
+<h3>Что ещё крутится в Responses</h3>
+<script type="text/plain" class="code" data-lang="json" data-title="Набросок: форма объекта reasoning (поля из схемы Reasoning)">
+{"reasoning": {"effort": "medium", "mode": "standard|pro", "summary": "auto|concise|detailed", "context": "auto|current_turn|all_turns"}}
+</script>
+<p><code>summary</code> решает, вернуть ли читаемое изложение рассуждений. <code>mode: "pro"</code> на GPT-5.6 и GPT-6 заменил отдельные модели с суффиксом <code>-pro</code>; он не зависит от effort и, по документации, «aggregates the model work performed to produce the final answer and bills those tokens at the selected model's standard token rates»<a class="cite" href="#src-27">27</a>. Отдельной осью идёт <code>verbosity</code> (<code>low</code>, <code>medium</code>, <code>high</code>): она управляет длиной ответа, а не глубиной мысли.</p>
+<p>Самое интересное здесь <code>context</code>. Он «controls which reasoning items are rendered back to the model on later turns»: <code>current_turn</code> показывает модели только рассуждения текущего хода, как в Harmony, <code>all_turns</code> — все прошлые. У семейства GPT-5.6 дефолт <code>all_turns</code>, у более ранних моделей <code>current_turn</code>. Работает это, только если прошлые элементы <code>reasoning</code> доступны: через <code>previous_response_id</code>, беседу или полный replay. И только внутри одного семейства: «reasoning does not carry between the GPT-5.6 and GPT-5.5 families». Сменил семейство посреди разговора — прошлые рассуждения новой модели недоступны.</p>
+<p>Смена уровня рассуждений посреди разговора сбрасывает кеш. Среди типизированных причин промаха в диагностике кеша OpenAI есть отдельные <code>reasoning_effort_changed</code> и <code>verbosity_changed</code><a class="cite" href="#src-6">6</a>. Для семейства GPT-6 появился обходной путь: не трогать <code>reasoning.effort</code> в запросе, а дописать в <code>input</code> элемент, который меняет его для следующих ходов. OpenAI так и советует: «Keep request-level <code>reasoning.effort</code> unchanged to preserve the prompt prefix for caching»<a class="cite" href="#src-7">7</a>.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="configuration_update: смена effort посреди разговора (гайд Reasoning models)">
+{
+  "type": "configuration_update",
+  "reasoning": {
+    "effort": "high"
+  }
+}
+</script>
+<p>Как дорого обходится смена параметров рассуждений, Anthropic показала на собственном замере ещё для ручного режима. Три запроса к Sonnet 4.6 с одним и тем же кешируемым префиксом; между вторым и третьим бюджет мышления подняли с 4000 до 8000 токенов<a class="cite" href="#src-26">26</a>:</p>
+<figure class="fig" id="fig-cache-thinking">
+<script type="application/json" class="chart">
+{"type": "stack", "title": "Смена бюджета мышления сбросила кеш", "unit": "токенов",
+ "categories": ["Запрос 1", "Запрос 2, тот же бюджет", "Запрос 3, бюджет 4000 → 8000"],
+ "series": [
+   {"name": "Запись в кеш", "values": [1370, 0, 1370]},
+   {"name": "Чтение из кеша", "values": [0, 1370, 0]},
+   {"name": "Некешированный вход", "values": [17, 303, 747]}
+ ],
+ "note": "Замер Anthropic на Claude Sonnet 4.6, документация Extended thinking. Поля cache_creation_input_tokens, cache_read_input_tokens и input_tokens."}
+</script>
+<figcaption>Второй запрос прочитал префикс из кеша, третий записал его заново: изменился только бюджет мышления. Ручного бюджета на новых моделях Claude нет, но смена режима мышления, по той же документации, сбрасывает кеш так же, а у OpenAI смена effort — отдельная причина промаха.</figcaption>
+</figure>
+
+<h3>Anthropic и Gemini</h3>
+<p>У Anthropic ручной режим заменён адаптивным: <code>thinking: {"type": "adaptive"}</code>, а глубину задаёт <code>output_config.effort</code> со значениями от <code>low</code> до <code>max</code>. Модель сама решает, думать ли и сколько. Документация показывает миграцию одной строкой<a class="cite" href="#src-26">26</a>:</p>
+<script type="text/plain" class="code" data-lang="jsonc" data-title="Переход с ручного бюджета на адаптивное мышление (документация Anthropic)">
+// before
+{"model":"claude-sonnet-4-6","max_tokens":16000,"thinking":{"type":"enabled","budget_tokens":10000}}
+// after
+{"model":"claude-sonnet-4-6","max_tokens":16000,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}
+</script>
+<p>С фиксированным бюджетом Claude думал всегда; в адаптивном режиме на низком effort он может на лёгком вопросе не думать вовсе, и после «простой» миграции меняются задержка и стоимость. Дефолтный effort у Opus 5.5 — <code>medium</code>, у остальных моделей с этим параметром — <code>high</code>. Выключить мышление на Opus 5.5 нельзя: и <code>{"type": "disabled"}</code>, и <code>{"type": "enabled", …}</code> дают 400. На Sonnet 5.5 минимум — <code>{"type": "between_tools"}</code>: мышление в начале ответа подавлено, и работает это только при effort не выше <code>high</code>. На Opus 5 выключение разрешено тоже только при effort до <code>high</code><a class="cite" href="#src-18">18</a>. Что показывать из мыслей, задаёт <code>thinking.display</code>: <code>summarized</code> или <code>omitted</code>, по цене одинаково, а оплаченные токены мышления видны в <code class="wrap">usage.output_tokens_details.thinking_tokens</code>.</p>
+<p>У Gemini глубину задаёт <code>thinking_level</code>, и набор значений тоже зависит от модели<a class="cite" href="#src-2">2</a>. У <code>gemini-3.8-flash</code> (стабильная с 2 сентября 2026) дефолт <code>medium</code> и значения <code>low</code>, <code>medium</code>, <code>high</code>; у <code>gemini-3.6-flash</code> добавляется <code>minimal</code>; у <code>gemini-3-pro-preview</code> только <code>low</code> и <code>high</code>. Значения <code>max</code> нет ни у одной модели, что бы ни писали сторонние гайды. Старый числовой <code>thinking_budget</code> с <code>thinking_level</code> в одном запросе не сочетается, а OpenAI-совместимый эндпоинт Gemini переводит <code>reasoning_effort</code> в один из них.</p>
+<table class="wide">
+<thead><tr><th></th><th>OpenAI</th><th>Anthropic</th><th>Gemini</th></tr></thead>
+<tbody>
+<tr><th>Глубина</th><td><code>reasoning.effort</code>, от <code>none</code> до <code>max</code></td><td><code>output_config.effort</code>, от <code>low</code> до <code>max</code></td><td><code>thinking_level</code>, от <code>minimal</code> до <code>high</code></td></tr>
+<tr><th>Дефолт</th><td><code>medium</code> с GPT-5.5</td><td><code>medium</code> у Opus 5.5, <code>high</code> у остальных</td><td><code>medium</code> у 3.8 Flash</td></tr>
+<tr><th>Выключить</th><td><code>none</code>, где принимается</td><td><code>disabled</code>, но не на Opus 5.5 и Sonnet 5.5</td><td>через <code>reasoning_effort: "none"</code> в совместимом слое, где поддерживается</td></tr>
+<tr><th>Непрерывность между ходами</th><td><code>reasoning</code> с <code>encrypted_content</code>, <code>reasoning.context</code></td><td>блок <code>thinking</code> с <code>signature</code></td><td><code>thoughtSignature</code></td></tr>
+<tr><th>Смена посреди разговора</th><td><code>configuration_update</code> (GPT-6)</td><td>effort на сообщение (бета с Fable 5.1)</td><td>—</td></tr>
+</tbody>
+</table>
+<div class="note key"><p>Уровень рассуждений — часть конфигурации модели, а не параметр запроса «по вкусу». Указывай его явно, проверяй допустимые значения для каждой модели отдельно и не меняй в середине разговора полем запроса: для этого есть <code>configuration_update</code> у OpenAI и effort на сообщение у Anthropic.</p></div>
+</section>
+
+<section id="anthropic-gemini">
+<h2>Messages API и Gemini: тот же цикл другими словами</h2>
+<p>Один и тот же круг «вопрос, вызов, результат» в четырёх API. Рассуждения в историях опущены.</p>
+<div class="tabs">
+  <section data-tab="Chat Completions">
+  <script type="text/plain" class="code" data-lang="json" data-title="Набросок: история после одного вызова, Chat Completions">
+  [
+    {"role": "user", "content": "What is the weather in Paris?"},
+    {"role": "assistant", "content": null, "tool_calls": [
+      {"id": "call_abc123", "type": "function",
+       "function": {"name": "get_weather", "arguments": "{\"location\": \"Paris\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_abc123", "content": "72°F and sunny"}
+  ]
+  </script>
+  </section>
+  <section data-tab="Responses">
+  <script type="text/plain" class="code" data-lang="json" data-title="Набросок: те же элементы в input, Responses">
+  [
+    {"role": "user", "content": "What is the weather in Paris?"},
+    {"type": "function_call", "id": "fc_abc123", "call_id": "call_abc123",
+     "name": "get_weather", "arguments": "{\"location\": \"Paris\"}"},
+    {"type": "function_call_output", "call_id": "call_abc123", "output": "72°F and sunny"}
+  ]
+  </script>
+  </section>
+  <section data-tab="Anthropic">
+  <script type="text/plain" class="code" data-lang="json" data-title="messages после одного вызова (документация Anthropic)" data-hl="5,8">
+  [
+    {"role":"user","content":"What is the weather in Paris?"},
+    {"role":"assistant","content":[
+      {"type":"text","text":"Let me check the weather."},
+      {"type":"tool_use","id":"toolu_abc123","name":"get_weather","input":{"location":"Paris"}}
+    ]},
+    {"role":"user","content":[
+      {"type":"tool_result","tool_use_id":"toolu_abc123","content":"72°F and sunny"}
+    ]}
+  ]
+  </script>
+  </section>
+  <section data-tab="Gemini">
+  <script type="text/plain" class="code" data-lang="json" data-title="Набросок по документации Gemini: contents после одного вызова, generateContent">
+  {"contents": [
+    {"role": "user", "parts": [{"text": "What is the weather in Paris?"}]},
+    {"role": "model", "parts": [{"functionCall": {"id": "call-1", "name": "get_weather",
+                                                  "args": {"location": "Paris"}},
+                                 "thoughtSignature": "<opaque>"}]},
+    {"role": "user", "parts": [{"functionResponse": {"id": "call-1", "name": "get_weather",
+                                                     "response": {"weather": "72°F and sunny"}}}]}
+  ]}
+  </script>
+  </section>
+</div>
+<p>У Anthropic и Gemini аргументы вызова — объект (<code>input</code>, <code>args</code>), а не строка с JSON, как у OpenAI, так что парсить их не нужно, а проверять по-прежнему нужно. Результат инструмента у обоих едет в сообщении с ролью <code>user</code>, отдельной роли для него нет. И у Anthropic в одном ходе ассистента спокойно соседствуют текст и вызов, поэтому цикл смотрит на <code>stop_reason</code> или на наличие блоков <code>tool_use</code>, а не на тип первого или последнего блока. Схема инструмента у Anthropic лежит в <code>input_schema</code>, у остальных — в <code>parameters</code><a class="cite" href="#src-19">19</a>.</p>
+
+<h3>Порядок блоков у Anthropic</h3>
+<p>Messages API строг к порядку, и документация формулирует правила без оговорок: «Tool result blocks must immediately follow their corresponding tool use blocks in the message history. You cannot include any messages between the assistant's tool use message and the user's tool result message». И второе: «In the user message containing tool results, the tool_result blocks must come FIRST in the content array. Any text must come AFTER all tool results»<a class="cite" href="#src-19">19</a>. Нарушение возвращает 400 с текстом, который надо узнавать в логах: <code class="wrap">tool_use ids were found without tool_result blocks immediately after</code>. Если инструмент упал, результат всё равно отправляется, с <code>"is_error": true</code>.</p>
+<p>Параллельные вызовы включены по умолчанию. Все их результаты должны уйти одним сообщением <code>user</code>; если разложить их по нескольким, это, по словам документации SDK, «silently trains Claude to stop making parallel calls». Ошибки нет, модель просто начинает вызывать инструменты по одному, и агент становится медленнее. Ограничить модель одним вызовом за ход можно явно: <code class="wrap">tool_choice: {"type": "auto", "disable_parallel_tool_use": true}</code>.</p>
+
+<figure class="fig" id="fig-anthropic">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant H as Харнесс
+  participant C as Messages API
+  H->>C: tools + messages [user]
+  C-->>H: content [text, tool_use A, tool_use B]
+  Note right of C: stop_reason = tool_use
+  Note over H: выполняет A и B
+  H->>C: user, content [tool_result A, tool_result B, text]
+  C-->>H: content [text]
+  Note right of C: stop_reason = end_turn
+</script>
+<figcaption>Параллельный вызов в Messages API. <code>response.content</code> возвращается в историю без изменений, как ход ассистента. Результаты обоих вызовов лежат в одном сообщении <code>user</code>, первыми в массиве; текст, если он нужен, идёт после них.</figcaption>
+</figure>
+
+<h3>Системные сообщения посреди разговора</h3>
+<p>Системный промпт в Messages API — параметр <code>system</code> верхнего уровня, и долго он был единственным местом для инструкций. С 15 июля 2026 года в массиве <code>messages</code> можно отправлять и <code>{"role": "system"}</code>, без бета-заголовка, на Fable 5.1, Mythos 5.1, Fable 5, Mythos 5, Opus 5.5, Opus 5, Opus 4.8 и Sonnet 5.5; на Sonnet 5 нельзя<a class="cite" href="#src-29">29</a>. Смысл в кеше: новое системное сообщение в конце истории меняет инструкции, не трогая закешированный префикс. С бета-заголовком <code>inline-tools-2026-09-15</code> так же можно добавлять и убирать инструменты:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Убрать инструмент посреди разговора (документация Anthropic)">
+{
+  "role": "system",
+  "content": [
+    {
+      "type": "tool_removal",
+      "tool": {"type": "tool_reference", "name": "get_weather"}
+    }
+  ]
+}
+</script>
+<p>Объяснение из документации: «The <code>tools</code> array sits even earlier in the hashed request prefix than the top-level <code>system</code> field, so editing it invalidates the prompt cache for the entire conversation». Команда Codex пришла к тому же на стороне OpenAI. Когда у агента меняются песочница, права или рабочая папка, Codex не правит ранние сообщения, а дописывает новое, с описанием изменения. Уведомление MCP <code>notifications/tools/list_changed</code> в их разборе названо источником «expensive cache miss»<a class="cite" href="#src-4">4</a>.</p>
+
+<h3>Блоки рассуждений привязаны к истории</h3>
+<p>Рассуждения Claude приходят блоками <code>thinking</code> с полем <code>signature</code>, и возвращать их в историю нужно байт в байт. При смене модели такие блоки молча отбрасываются, а на моделях 2026 года правило ещё жёстче. Блоки Sonnet 5.5 может прочитать только Sonnet 5.5, и если вернуть их после правки <code>system</code>, <code>tools</code> или любого раннего сообщения, аккаунты, созданные 31 августа 2026 года и позже, получают 400; с заголовком <code class="wrap">thinking-binding-controls-2026-08-01</code> блоки вместо этого выбрасываются без ошибки. Совет документации короткий: «Keep the conversation append-only so the check never fails»<a class="cite" href="#src-24">24</a>.</p>
+<figure class="fig" id="fig-append">
+<script type="text/x-mermaid">
+flowchart TD
+  h["История: user, assistant с thinking,<br/>user с tool_result"]:::plain
+  e["Правка раннего сообщения,<br/>system или tools"]:::warn
+  a["Новое сообщение role: system<br/>в конце истории"]:::ok
+  e1["400 или выброшенные thinking,<br/>кеш пересчитан с начала"]:::warn
+  a1["Префикс цел: кеш читается,<br/>thinking валидны"]:::ok
+  h -- "так нельзя" --> e
+  e --> e1
+  h -- "так можно" --> a
+  a --> a1
+</script>
+<figcaption>Два способа поменять инструкции посреди сессии Claude. Правка уже отправленного ломает и кеш, и привязку рассуждений. Дописанное в конец системное сообщение не трогает ни то, ни другое.</figcaption>
+</figure>
+<div class="note key"><p>Цикл Anthropic в одном правиле: <code>response.content</code> целиком уходит в историю как ход ассистента, за ним одно сообщение <code>user</code>, которое начинается со всех блоков <code>tool_result</code>. Уже отправленное не редактируется никогда; изменения дописываются в конец.</p></div>
+
+<h3>Gemini: два API сразу</h3>
+<p>У Gemini роли называются <code>user</code> и <code>model</code>, системный промпт идёт отдельным полем <code>systemInstruction</code>, инструменты описываются в <code>functionDeclarations</code>. Модель отвечает частью <code>functionCall</code>, результат уходит частью <code>functionResponse</code> в сообщении <code>user</code>. Рядом с вызовом приходит <code>thoughtSignature</code> — непрозрачный токен непрерывности рассуждений, аналог <code>signature</code> у Anthropic и <code>encrypted_content</code> у OpenAI; официальные SDK возвращают его сами<a class="cite" href="#src-2">2</a>. Харнессу, который собирает историю своими руками, этого мало: документация Gemini 3 требует присылать блоки мыслей с подписями в следующих запросах, а потерянная подпись всплывает причиной остановки <code>MISSING_THOUGHT_SIGNATURE</code>.</p>
+<p>Ручки вызова у Gemini те же, что у остальных, только под другими именами. Режим задаёт <code>FunctionCallingConfig.mode</code>: <code>AUTO</code>, <code>ANY</code>, <code>NONE</code> и <code>VALIDATED</code>, который «will validate function calls with constrained decoding», то есть работает как strict. Набор сужает <code>allowedFunctionNames</code>. У <code>functionCall</code> есть необязательное поле <code>id</code>, и если оно пришло, клиент повторяет его в <code>functionResponse</code><a class="cite" href="#src-2">2</a>. Связь по одному имени функции сломается на двух параллельных вызовах <code>get_weather</code> для разных городов.</p>
+<p>Второй API у Google появился 11 декабря 2025 года и называется Interactions. С июня 2026 года он вышел из беты, и документация называет его «recommended for all new projects», а старый <code>generateContent</code> теперь зовёт legacy, оговариваясь, что он «remains fully supported». Новые агентные инструменты и модели вне основной линейки будут выходить только в Interactions. Форма у него откровенно похожа на Responses: поле <code>input</code>, плоский список <code>tools</code> с <code>"type": "function"</code>, ответ из типизированных шагов <code>steps</code>, продолжение через <code>previous_interaction_id</code>. 26 мая 2026 года он сломал обратную совместимость: поле <code>outputs</code> по умолчанию сменилось на <code>steps</code><a class="cite" href="#src-30">30</a>.</p>
+<script type="text/plain" class="code" data-lang="bash" data-title="Вызов Interactions API с инструментом (документация Gemini)">
+curl -X POST "https://generativelanguage.googleapis.com/v1beta/interactions" \
+  -H "x-goog-api-key: $GEMINI_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gemini-3.8-flash",
+    "input": "Schedule a meeting with Bob and Alice for 03/27/2025 at 10:00 AM about Q3 planning.",
+    "tools": [{
+      "type": "function",
+      "name": "schedule_meeting",
+      "description": "Schedules a meeting with specified attendees at a given time and date.",
+      "parameters": {"type":"object","properties":{"attendees":{"type":"array","items":{"type":"string"}},"date":{"type":"string"},"time":{"type":"string"},"topic":{"type":"string"}},"required":["attendees","date","time","topic"]}
+    }]
+  }'
+</script>
+<table class="wide">
+<thead><tr><th></th><th>Chat Completions</th><th>Responses</th><th>Anthropic</th><th>Gemini</th></tr></thead>
+<tbody>
+<tr><th>Инструкции</th><td><code>developer</code> или <code>system</code></td><td><code>instructions</code> или <code>developer</code></td><td><code>system</code> и <code>role: system</code> в истории</td><td><code>systemInstruction</code></td></tr>
+<tr><th>Схема инструмента</th><td><code>function.parameters</code></td><td><code>parameters</code></td><td><code>input_schema</code></td><td><code>parameters</code> в <code>functionDeclarations</code></td></tr>
+<tr><th>Вызов</th><td><code>tool_calls[]</code> в ассистенте</td><td>элемент <code>function_call</code></td><td>блок <code>tool_use</code></td><td>часть <code>functionCall</code></td></tr>
+<tr><th>Аргументы</th><td>строка JSON</td><td>строка JSON</td><td>объект</td><td>объект</td></tr>
+<tr><th>Результат</th><td><code>role: tool</code>, <code>tool_call_id</code></td><td><code>function_call_output</code>, <code>call_id</code></td><td><code>tool_result</code> в <code>user</code>, <code>tool_use_id</code></td><td><code>functionResponse</code> в <code>user</code></td></tr>
+<tr><th>Связь вызова и результата</th><td><code>tool_call_id</code></td><td><code>call_id</code></td><td><code>tool_use_id</code></td><td><code>id</code>, если пришёл в вызове</td></tr>
+<tr><th>Заставить вызвать</th><td><code>required</code> или функция по имени</td><td>то же</td><td><code>any</code> или <code>tool</code>, на новейших моделях 400</td><td>режим <code>ANY</code></td></tr>
+<tr><th>Сузить набор без правки списка</th><td><code>allowed_tools</code></td><td><code>allowed_tools</code></td><td><code>tool_removal</code> в системном сообщении (бета)</td><td><code>allowedFunctionNames</code> с <code>ANY</code> или <code>VALIDATED</code></td></tr>
+<tr><th>Строгая схема</th><td><code>strict: true</code>, по умолчанию выключен</td><td>попытка strict с откатом, если флага нет</td><td><code>strict: true</code></td><td>режим <code>VALIDATED</code></td></tr>
+<tr><th>Рассуждения между ходами</th><td>—</td><td><code>encrypted_content</code></td><td><code>signature</code></td><td><code>thoughtSignature</code></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="compat">
+<h2>OpenAI-совместимые серверы и где они текут</h2>
+<p>У Anthropic есть OpenAI-совместимый эндпоинт: меняешь <code>base_url</code> в SDK OpenAI на <code>https://api.anthropic.com/v1/</code> и разговариваешь с Claude как с GPT. Страница о нём сразу предупреждает, что это «not considered a long-term or production-ready solution», и перечисляет, чего слой не делает: <code>strict</code> в описании инструментов игнорируется, <code>response_format</code> игнорируется, кеширование промптов не поддерживается. Главная фраза стоит дальше: «Most unsupported fields are silently ignored rather than producing errors»<a class="cite" href="#src-31">31</a>. Код, рассчитанный на гарантию strict, получит через этот слой генерацию без ограничений и узнает об этом по сломанному JSON.</p>
+<p>Совместимость здесь значит «принимает те же поля», а не «ведёт себя так же». Chat Completions повторили все. Responses повторяют всё чаще, но без серверного состояния:</p>
+<table class="wide">
+<thead><tr><th>Сервер</th><th>Chat Completions</th><th>Responses</th><th>Состояние в Responses</th><th>Что учесть</th></tr></thead>
+<tbody>
+<tr><th>vLLM</th><td><span class="yes">да</span></td><td><span class="yes">да</span>, с retrieve и cancel</td><td>в документации не описано</td><td>Парсер вызовов под модель; есть и Anthropic-совместимый <code>/v1/messages</code><a class="cite" href="#src-23">23</a></td></tr>
+<tr><th>Ollama</th><td><span class="yes">да</span></td><td><span class="yes">да</span></td><td><span class="no">нет</span>: «Only the non-stateful flavor is supported»</td><td>Локальный сервер на <code>localhost:11434/v1</code><a class="cite" href="#src-32">32</a></td></tr>
+<tr><th>OpenRouter</th><td><span class="yes">да</span></td><td><span class="yes">да</span></td><td><span class="no">нет</span>: <code>store: true</code> или <code>previous_response_id</code> дают 400</td><td>Один ключ к моделям многих провайдеров<a class="cite" href="#src-33">33</a></td></tr>
+<tr><th>DeepSeek</th><td><span class="yes">да</span></td><td><span class="yes">да</span>, «To meet the demand for Codex»</td><td><span class="no">нет</span>: <code>store</code> и <code>previous_response_id</code> «Not supported (stateless API)»</td><td>Поток кончается <code>response.completed</code>, строки <code>[DONE]</code> нет<a class="cite" href="#src-34">34</a></td></tr>
+<tr><th>Gemini</th><td><span class="yes">да</span>, <code>/v1beta/openai/</code></td><td>—</td><td>—</td><td><code>reasoning_effort</code> переводится в <code>thinking_level</code><a class="cite" href="#src-2">2</a></td></tr>
+<tr><th>Anthropic</th><td><span class="part">для тестов</span></td><td>—</td><td>—</td><td><code>strict</code>, <code>response_format</code>, кеш молча игнорируются</td></tr>
+</tbody>
+</table>
+<p>Прочерк означает, что в документации сервера этого нет.</p>
+
+<figure class="fig wide" id="fig-gateway">
+<script type="text/x-mermaid">
+flowchart TD
+  app["Цикл на формате OpenAI"]:::plain
+  a["Gemini за LiteLLM"]
+  b["Anthropic через<br/>совместимый эндпоинт"]
+  c["OpenRouter, Ollama:<br/>/v1/responses"]
+  d["vLLM с открытой моделью"]
+  a1["Цикл выходит<br/>после первого вызова"]:::warn
+  b1["JSON без гарантии схемы"]:::warn
+  c1["400 или поле<br/>не поддержано"]:::warn
+  d1["Вызов сломан<br/>или ушёл в текст"]:::warn
+  app -- "finish_reason: stop" --> a
+  app -- "strict: true" --> b
+  app -- "previous_response_id" --> c
+  app -- "tool_calls" --> d
+  a --> a1
+  b --> b1
+  c --> c1
+  d --> d1
+</script>
+<figcaption>Четыре места, где совместимый слой теряет смысл запроса или ответа. Подпись на стрелке — поле, которое ведёт себя не так, как у OpenAI. Ни в одном случае сервер не обязан вернуть ошибку.</figcaption>
+</figure>
+
+<p>Есть и пятый случай, с кешем. <code>cache_control</code> нельзя ставить на блоки <code>thinking</code>, и в 2026 году сразу несколько прокси и обёрток (LiteLLM, amplifier от Microsoft, openclaw, zeroclaw) получали 400, потому что механически переносили точку кеша на последний блок сообщения, а им оказывался блок рассуждений<a class="cite" href="#src-35">35</a>.</p>
+
+<h3>Open Responses</h3>
+<p>Open Responses OpenAI опубликовала 15 января 2026 года: это открытая спецификация формы Responses API, которую может реализовать любой провайдер. В день анонса Саймон Уиллисон перечислил партнёров: OpenRouter, Hugging Face, LM Studio, vLLM, Ollama и Vercel<a class="cite" href="#src-36">36</a>. Anthropic и Google в списке нет. Иногда среди соавторов называют Nvidia, но ни в одном из прочитанных первоисточников это не подтверждается. У спецификации две датированные ревизии, 2026-01-15 и 2026-04-24, и устав с техническим комитетом из основных мейнтейнеров<a class="cite" href="#src-17">17</a>. Вторая ревизия добавила транспорт WebSocket с тем же лимитом в 60 минут, что у OpenAI, и правило для сбоев: при неудачном продолжении сервер «MUST evict the referenced previous_response_id from the connection-local cache» и отвечает кодом <code>previous_response_not_found</code>.</p>
+<p>Сильнее всего спецификацию продвигает Codex. Он работает с любым сервером, который «implements the Responses API», а с флагом <code>--oss</code> по умолчанию ходит на <code class="wrap">http://localhost:11434/v1/responses</code>: Ollama не ниже 0.13.4 или LM Studio не ниже 0.3.39<a class="cite" href="#src-4">4</a>. Раз почти все совместимые серверы работают без состояния, переносимый агент хранит историю сам и каждый раз присылает все элементы, как Codex.</p>
+
+<h3>Шлюз держит все ключи</h3>
+<p>24 марта 2026 года на PyPI вышли версии LiteLLM 1.82.7 и 1.82.8 со встроенным похитителем учётных данных<a class="cite" href="#src-37">37</a>. Файл <code>litellm_init.pth</code> размером 34 628 байт срабатывал при старте интерпретатора, без всякого <code>import litellm</code>: так устроен механизм <code>.pth</code>. Собранное шифровалось AES-256 и RSA-4096 и уходило на <code>https://models.litellm.cloud/</code>. Тред на Hacker News набрал 938 очков и 500 комментариев. Шлюз к моделям по определению держит ключи от всех провайдеров сразу, поэтому его зависимость закрепляй по версии и хешу, а не диапазоном; подробнее о цепочке поставок в <a href="../16-security/index.html">главе 16</a>.</p>
+<div class="note key"><p>Шлюз вроде LiteLLM или OpenRouter бери ради ключей, бюджетов и возможности быстро менять модели. Но вызов инструментов через него проверяй сквозным тестом для каждой модели отдельно: причина остановки, strict, параллельные вызовы. Если моделей две-три и меняются они редко, родной SDK каждого вендора дешевле в сопровождении, чем слой перевода с его молчаливыми потерями.</p></div>
+</section>
+
+<section id="loop-2026">
+<h2>Цикл 2026 года: сокет, асинхронные инструменты, steering</h2>
+<p>3 сентября 2026 года OpenAI добавила в описание инструмента поле <code>async: true</code>, и схема «модель вызвала, ход встал, харнесс выполнил и отправил заново» перестала быть единственной. Асинхронный вызов приходит с тем же флагом, но модель не ждёт результата и продолжает работать<a class="cite" href="#src-38">38</a>. Выполнять инструмент по-прежнему тебе: «Your application still executes the tool. Async tools don't move execution to OpenAI or manage your background jobs». Результат возвращается позже обычным <code>function_call_output</code> с исходным <code>call_id</code> в следующем запросе, а если соединение открыто по WebSocket, его можно вставить в ещё идущий ответ событием <code>response.inject</code>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="response.inject: результат асинхронного вызова в активный ответ (OpenAPI-спецификация)">
+{
+  "type": "response.inject",
+  "response_id": "resp_123",
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "call_123",
+      "output": "{\"temperature\":72}"
+    }
+  ]
+}
+</script>
+<figure class="fig wide" id="fig-async">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant A as Приложение
+  participant R as Responses API, WebSocket
+  participant J as Фоновая задача
+  A->>R: response.create, tools [run_tests async]
+  R-->>A: function_call run_tests, async true
+  A->>J: запустить тесты
+  R-->>A: модель продолжает, текст и другие вызовы
+  J-->>A: тесты завершились
+  A->>R: response.inject, function_call_output с call_id
+  R-->>A: модель учитывает результат
+  R-->>A: response.completed
+</script>
+<figcaption>Асинхронный вызов с условным инструментом <code>run_tests</code>. Ход не останавливается на вызове: модель продолжает работу, а результат приходит в тот же ответ, когда он готов. Харнессу приходится вести учёт незавершённых вызовов по <code>call_id</code>.</figcaption>
+</figure>
+<p>Цикл из первого раздела превращается в событийный. Вызовы и результаты больше не чередуются строго, харнесс держит таблицу незавершённых <code>call_id</code>, и результаты приходят в том порядке, в каком закончились задачи. С фоновым режимом это путать не стоит: там асинхронна генерация ответа, а не инструмент.</p>
+<p>У Gemini похожий механизм есть только в Live API. Функцию помечают <code>behavior: NON_BLOCKING</code>, что, по спецификации, «Currently only supported by the BidiGenerateContent method», а поле <code>scheduling</code> в ответе решает судьбу результата: <code>INTERRUPT</code> прерывает текущую генерацию, <code>WHEN_IDLE</code> (дефолт) ждёт паузы, <code>SILENT</code> молча кладёт результат в контекст<a class="cite" href="#src-2">2</a>. В <code>generateContent</code> и Interactions такого нет.</p>
+
+<h3>WebSocket mode</h3>
+<p>Квадратичный трафик из разбора Codex убирает WebSocket mode (23 февраля 2026)<a class="cite" href="#src-38">38</a>. Одно постоянное соединение с <code>/v1/responses</code>. Каждый ход — клиентское событие <code>response.create</code>, чей payload повторяет тело HTTP-запроса без <code>stream</code> и <code>background</code>. Продолжение отправляет только новые элементы и <code>previous_response_id</code>, а через <code>stream_id</code> по одному сокету ведут несколько бесед или ответвлений. Работает и с <code>store=false</code>, и с ZDR: состояние живёт в памяти соединения. OpenAI пишет: «For rollouts with 20+ tool calls, we have seen up to roughly 40% faster end-to-end execution», без описания замера. Соединение живёт не дольше часа, после чего приходит <code class="wrap">Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.</code> Модель при этом по-прежнему читает весь контекст на каждом ходе, и платишь ты за весь; экономится только передача по сети.</p>
+
+<h3>Steering и фоновый режим</h3>
+<p>В тот же день, что и асинхронные инструменты, появилось событие <code>response.steer</code>: клиент добавляет ввод, пока ответ ещё генерируется. Модель останавливается «at a safe output boundary», ответ получает <code class="wrap">incomplete_details.reason: "steered"</code>, и сервер, по спецификации, «can then create a successor response automatically with the queued input». Если steering пришёл, пока модель ждёт результата клиентского инструмента, после <code>response.completed</code> придёт <code>response.steer.pending</code>: харнесс подставляет сохранённый результат и сам делает <code>response.create</code>. Предупреждение из спецификации: «Do not resend accepted input while it is still queued»<a class="cite" href="#src-6">6</a>.</p>
+<p>Для долгих запросов, которые не укладываются в таймаут HTTP, есть фоновый режим: <code>background: true</code>, затем опрос, пока статус <code>queued</code> или <code>in_progress</code><a class="cite" href="#src-38">38</a>. Оборвавшийся поток продолжают параметром <code>starting_after</code> с последним увиденным <code>sequence_number</code>, отмена идемпотентна. Раньше фоновый режим требовал <code>store: true</code>; сейчас гайд разрешает и <code>store=false</code>, тогда данные ответа хранятся на диске около 10 минут, ровно чтобы их можно было забрать опросом.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Фоновый режим с опросом (документация OpenAI)">
+resp = client.responses.create(model="gpt-6-astra", input="Write a very long novel about otters in space.", background=True)
+while resp.status in {"queued", "in_progress"}:
+    print(f"Current status: {resp.status}")
+    sleep(2)
+    resp = client.responses.retrieve(resp.id)
+</script>
+<p>Следующий шаг в ту же сторону — отдать цикл целиком. 10 сентября 2026 года OpenAI открыла публичную бету Agents API: управляемый харнесс Codex с долгоживущими сессиями и песочницей на стороне OpenAI или своей; 29 сентября туда добавили computer use<a class="cite" href="#src-9">9</a>. Это уже хостинг агента, а не API модели, и его устройство разбирает <a href="../12-deep-agents/index.html">глава 12</a>.</p>
+<div class="note practice"><p>WebSocket окупается, когда агент делает десятки вызовов подряд и время на сеть заметно в сквозной задержке. Асинхронные инструменты нужны, когда инструмент долгий (сборка, тесты, выгрузка), а модели есть чем заняться в это время. Если в цикле три-пять быстрых вызовов, выигрыша не будет. Обычный HTTP к тому же проще отлаживать.</p></div>
+</section>
+
+<section id="production">
+<h2>Ретраи, лимиты и стоп-краны</h2>
+<p>С 22 июля 2026 года у OpenAI есть жёсткие лимиты расходов, и запрос, упёршийся в них, получает 429, тот же статус, что и при превышении частоты<a class="cite" href="#src-9">9</a>. Коды внутри другие: <code>credit_balance_exhausted</code>, <code>organization_spend_limit_exceeded</code>, <code>project_spend_limit_exceeded</code>, <code>organization_usage_limit_exceeded</code><a class="cite" href="#src-39">39</a>. Ожиданием не лечится ни один из них, нужен человек с доступом к биллингу. А openai-python по умолчанию повторяет каждый 429 дважды, с нарастающей паузой, при условии, что тело запроса можно безопасно отправить ещё раз<a class="cite" href="#src-40">40</a>. Если цикл агента оборачивает вызов ещё и своими ретраями, безнадёжный запрос уйдёт десяток раз, прежде чем кто-то увидит ошибку.</p>
+<table class="wide">
+<thead><tr><th>Провайдер</th><th class="num">Статус</th><th>Код или тип</th><th>Повторять?</th></tr></thead>
+<tbody>
+<tr><td>OpenAI</td><td class="num">429</td><td><code>slow_down</code>: трафик растёт слишком резко, даже в пределах RPM и TPM</td><td><span class="yes">да</span>, после <code>Retry-After</code>, нагрузку наращивать плавно</td></tr>
+<tr><td>OpenAI</td><td class="num">429</td><td><code>credit_balance_exhausted</code>, <code>*_spend_limit_exceeded</code>, <code>organization_usage_limit_exceeded</code></td><td><span class="no">нет</span>, нужен человек</td></tr>
+<tr><td>OpenAI</td><td class="num">503</td><td><code>server_is_overloaded</code></td><td><span class="yes">да</span>, после <code>Retry-After</code></td></tr>
+<tr><td>Anthropic</td><td class="num">429</td><td><code>rate_limit_error</code></td><td><span class="part">смотря какой</span>: у варианта с лимитом расходов нет <code>retry-after</code></td></tr>
+<tr><td>Anthropic</td><td class="num">529</td><td><code>overloaded_error</code>, в том числе событием внутри потока</td><td><span class="yes">да</span></td></tr>
+</tbody>
+</table>
+<p>Правило OpenAI для заголовка: «When the header is present, wait at least as long as it specifies before retrying. If it's missing, use exponential backoff». К экспоненте добавляют случайный разброс (jitter), чтобы сотня клиентов не пришла обратно в одну и ту же секунду. Коды <code>slow_down</code> и <code>server_is_overloaded</code> появились 2 сентября 2026 года. Остаток лимитов OpenAI показывает в заголовках <code>x-ratelimit-remaining-requests</code> и <code>x-ratelimit-remaining-tokens</code>, рядом лежат парные <code>x-ratelimit-limit-*</code> и <code>x-ratelimit-reset-*</code><a class="cite" href="#src-39">39</a>. У Anthropic лимиты считаются как ведро токенов, которое наполняется непрерывно, а не сбрасывается раз в минуту; состояние видно в заголовках <code>anthropic-ratelimit-*</code>, время сброса в формате RFC 3339. SDK Anthropic тоже повторяет дважды и учитывает <code>retry-after</code>, если он есть. У большинства моделей <code>cache_read_input_tokens</code> не входят в лимит входных токенов в минуту<a class="cite" href="#src-12">12</a>, так что кеш поднимает ещё и пропускную способность.</p>
+<figure class="fig" id="fig-errors">
+<script type="text/x-mermaid">
+flowchart TD
+  e["Ошибка от API"]:::plain
+  s{"HTTP-статус"}
+  c{"error.code"}
+  w["Ждать Retry-After,<br/>потом backoff с jitter"]:::ok
+  h["Остановить цикл,<br/>позвать человека"]:::warn
+  f["Не повторять,<br/>чинить запрос"]:::warn
+  e --> s
+  s -- "429" --> c
+  s -- "503, 529, 5xx" --> w
+  s -- "400" --> f
+  c -- "slow_down, лимит частоты" --> w
+  c -- "spend_limit, credit_balance" --> h
+</script>
+<figcaption>Решение о повторе принимается по двум полям. Статуса мало: под 429 прячутся и временный лимит частоты, и исчерпанный бюджет, которому никакая пауза не поможет.</figcaption>
+</figure>
+<p>Второй тип стоп-крана касается самого цикла. Лимит шагов (<code>MAX_STEPS</code>) есть в любом примере, и не зря: модель может вызывать один и тот же инструмент без конца. Дефолты у SDK противоположные. В OpenAI Agents SDK константа <code>DEFAULT_MAX_TURNS = 10</code>, и после десятого хода летит <code>MaxTurnsExceeded</code><a class="cite" href="#src-41">41</a>. В Claude Agent SDK и <code>max_turns</code>, и <code>max_budget_usd</code> по умолчанию «No limit»<a class="cite" href="#src-42">42</a>. Первый остановит длинную законную задачу, второй не остановит зациклившуюся. Выставляй оба лимита явно. И помни про <code>max_tokens</code> из раздела о причинах остановки: он ограничивает один запрос, а не задачу. Бюджет задачи считает только твой цикл, складывая <code>usage</code> каждого ответа. Сколько займёт запрос до отправки, можно узнать заранее: у OpenAI есть <code>POST /v1/responses/input_tokens</code>, у Anthropic <code>/v1/messages/count_tokens</code>.</p>
+<div class="note warn"><p>Отключи или ограничь встроенные ретраи SDK (<code>max_retries</code>), если у тебя свой слой повторов, и ветвись по коду ошибки из тела ответа, а не по статусу. Иначе 429 от исчерпанного бюджета повторят сначала SDK, потом твой код, потом внешний цикл, который перезапустит всю задачу.</p></div>
+
+<h3>Как складывать <code>usage</code></h3>
+<p>Счётчик бюджета, написанный под один API, на другом ошибётся в разы, хотя поля называются почти одинаково. У OpenAI кешированные токены входят во вход: <code>cached_tokens</code> лежит в <code>input_tokens_details</code> (в Chat Completions — в <code>prompt_tokens_details</code>) как разбивка того, что уже посчитано в <code>input_tokens</code><a class="cite" href="#src-6">6</a>. У Anthropic наоборот. <code>input_tokens</code> — только хвост после последней точки кеша, и весь вход равен сумме трёх полей: <code class="wrap">cache_read_input_tokens + cache_creation_input_tokens + input_tokens</code><a class="cite" href="#src-43">43</a>. Документация приводит пример: 100 000 токенов прочитано из кеша, 50 токенов нового сообщения, и <code>input_tokens</code> равен 50.</p>
+<table class="wide">
+<thead><tr><th></th><th>Chat Completions</th><th>Responses</th><th>Anthropic</th><th>Gemini</th></tr></thead>
+<tbody>
+<tr><th>Весь вход</th><td><code>prompt_tokens</code></td><td><code>input_tokens</code></td><td>сумма трёх полей</td><td><code>promptTokenCount</code></td></tr>
+<tr><th>Из них из кеша</th><td><code>prompt_tokens_details.cached_tokens</code></td><td><code>input_tokens_details.cached_tokens</code></td><td><code>cache_read_input_tokens</code></td><td><code>cachedContentTokenCount</code></td></tr>
+<tr><th>Запись в кеш</th><td><code>prompt_tokens_details.cache_write_tokens</code></td><td><code>input_tokens_details.cache_write_tokens</code></td><td><code>cache_creation_input_tokens</code></td><td>—</td></tr>
+<tr><th>Рассуждения</th><td><code>completion_tokens_details.reasoning_tokens</code>, внутри вывода</td><td><code>output_tokens_details.reasoning_tokens</code>, внутри вывода</td><td><code>output_tokens_details.thinking_tokens</code>, внутри вывода</td><td><code>thoughtsTokenCount</code>, отдельно от <code>candidatesTokenCount</code></td></tr>
+</tbody>
+</table>
+<p>Рассуждения везде оплачиваются как вывод, даже когда их текста ты не видишь. У Gemini они вынесены из <code>candidatesTokenCount</code>, и полный итог по документации — «prompt + thoughts + response candidates»<a class="cite" href="#src-2">2</a>; счётчик, который берёт только кандидатов, недосчитает дорогую часть. Запись в кеш у OpenAI оплачивается отдельно только на GPT-5.6 и новее<a class="cite" href="#src-44">44</a>. О ценах и о том, как чаще читать из кеша, — <a href="../02-context-engineering/index.html">глава 2</a>.</p>
+</section>
+
+<section id="minimal">
+<h2>Агент на пятьдесят строк</h2>
+<div class="tabs">
+  <section data-tab="OpenAI Responses">
+  <script type="text/plain" class="code" data-lang="python" data-title="Набросок: agent_responses.py (собран по документации, не запускался)" data-hl="24,28-33,40">
+  import json
+  from openai import OpenAI
+
+  client = OpenAI(max_retries=4)          # SDK сам повторяет 408/409/429/5xx
+  MODEL = "gpt-6.1-sol"                   # инструменты GPT-6 только через Responses
+  MAX_STEPS = 20
+
+  TOOLS = [{
+      "type": "function", "name": "get_weather", "strict": True,
+      "description": "Current weather for a city.",
+      "parameters": {"type": "object",
+                     "properties": {"city": {"type": "string"}},
+                     "required": ["city"], "additionalProperties": False},
+  }]
+  IMPLS = {"get_weather": lambda city: {"city": city, "temp_c": 22}}
+
+  def run(task: str) -> str:
+      items: list = [{"role": "user", "content": task}]
+      for _ in range(MAX_STEPS):
+          resp = client.responses.create(
+              model=MODEL,
+              instructions="You are a careful assistant.",  # присылать каждый раз
+              input=items, tools=TOOLS,
+              store=False,                                  # историю держим сами
+              reasoning={"effort": "medium"},
+              max_output_tokens=25_000,                     # место для рассуждений
+          )
+          if resp.status != "completed":
+              raise RuntimeError(f"{resp.status}: {resp.incomplete_details}")
+          items += resp.output                              # reasoning, phase, вызовы как есть
+          calls = [it for it in resp.output if it.type == "function_call"]
+          if not calls:                                     # вызовов нет: это ответ
+              return resp.output_text
+          for call in calls:
+              try:
+                  result = IMPLS[call.name](**json.loads(call.arguments))
+              except Exception as exc:                      # ошибка инструмента уходит модели
+                  result = {"error": f"{type(exc).__name__}: {exc}"}
+              items.append({"type": "function_call_output",
+                            "call_id": call.call_id,
+                            "output": json.dumps(result)})
+      raise RuntimeError("max steps exceeded")
+  </script>
+  </section>
+  <section data-tab="Anthropic Messages">
+  <script type="text/plain" class="code" data-lang="python" data-title="Набросок: agent_messages.py (собран по документации, не запускался)" data-hl="25-26,37-39,42-43">
+  import json
+  import anthropic
+
+  client = anthropic.Anthropic(max_retries=4)
+  MODEL = "claude-opus-5-5"
+  MAX_STEPS = 20
+
+  TOOLS = [{
+      "name": "get_weather", "strict": True,
+      "description": "Current weather for a city.",
+      "input_schema": {"type": "object",
+                       "properties": {"city": {"type": "string"}},
+                       "required": ["city"], "additionalProperties": False},
+  }]
+  IMPLS = {"get_weather": lambda city: {"city": city, "temp_c": 22}}
+
+  def run(task: str) -> str:
+      messages = [{"role": "user", "content": task}]
+      for _ in range(MAX_STEPS):
+          resp = client.messages.create(
+              model=MODEL, max_tokens=16_000, tools=TOOLS,
+              system="You are a careful assistant.",
+              messages=messages,
+          )
+          messages.append({"role": "assistant", "content": resp.content})  # целиком, с thinking
+          if resp.stop_reason == "tool_use":
+              results = []
+              for block in resp.content:
+                  if block.type != "tool_use":
+                      continue
+                  try:
+                      out, err = json.dumps(IMPLS[block.name](**block.input)), False
+                  except Exception as exc:
+                      out, err = f"{type(exc).__name__}: {exc}", True
+                  results.append({"type": "tool_result", "tool_use_id": block.id,
+                                  "content": out, "is_error": err})
+              messages.append({"role": "user", "content": results})  # все результаты одним сообщением
+          elif resp.stop_reason == "pause_turn":
+              continue                    # серверный инструмент на паузе: отправить как есть
+          elif resp.stop_reason == "end_turn":
+              return "".join(b.text for b in resp.content if b.type == "text")
+          else:                           # max_tokens, refusal, окно контекста, stop_sequence
+              raise RuntimeError(f"{resp.stop_reason}: {resp.stop_details}")
+      raise RuntimeError("max steps exceeded")
+  </script>
+  </section>
+</div>
+<p>Весь механизм главы помещается в сорок с небольшим строк на каждого вендора. Оба варианта собраны из фактов, проверенных по документации, но не запускались, так что прогони их у себя, прежде чем на них опираться. Рассчитаны они на ветки SDK <code>openai</code> 3.x и <code>anthropic</code> 1.x; на 30 сентября 2026 года последние версии — 3.22.1 и 1.9.0<a class="cite" href="#src-45">45</a>.</p>
+<p>В варианте для Responses почти каждая строка закрывает одну из ловушек, разобранных выше. <code>store=False</code> и <code>items += resp.output</code> держат историю на твоей стороне и возвращают модели её рассуждения с <code>encrypted_content</code> и сообщения с <code>phase</code> такими, какими они пришли; так код заработает и на серверах, которые Responses поддерживают только без состояния. <code>instructions</code> уходят в каждом запросе, потому что сами они не переносятся. Проверка <code>status</code> ловит обрезанный ответ до того, как его выдадут за готовый. Условие выхода — отсутствие вызовов, а не поле причины. Результат ссылается на <code>call_id</code>, а не на <code>id</code>. Набросок знает только функции: если подключишь <code>shell</code> с локальным окружением, <code>apply_patch</code> или <code>computer</code>, условие выхода станет «в <code>output</code> нет ни одного элемента, который ждёт ответа клиента». Ошибка инструмента, включая вызов несуществующего, уходит модели обычным результатом: так модель может поправить аргументы, а исключение просто уронило бы цикл.</p>
+<p>Вариант для Anthropic отличается там, где отличается API. Решение принимается по <code>stop_reason</code>, и все семь значений куда-то ведут. Ответ модели уходит в историю целиком, вместе с блоками <code>thinking</code>: на Opus 5.5 мышление не выключается, и ни один блок нельзя трогать. Все результаты ложатся в одно сообщение <code>user</code>, без текста перед ними, упавший инструмент помечен <code>is_error</code>. <code>pause_turn</code> просто отправляет историю снова, потому что ответ уже дописан. <code>tool_choice</code> не указан: принудительный выбор на этой модели вернул бы 400. И <code>max_tokens=16_000</code> выбран с умыслом. Для запроса без стрима SDK Anthropic оценивает время как час на 128 тыс. токенов вывода и, если выходит больше десяти минут, ещё до отправки бросает <code>ValueError</code> «Streaming is required for operations that may take longer than 10 minutes»<a class="cite" href="#src-40">40</a>. Порог — около 21 тыс. токенов. Запас в 25 тыс., который OpenAI советует под рассуждения, здесь уже потребует <code>stream=True</code> или <code>client.messages.stream(...)</code>.</p>
+<p>Повторы в набросках отданы SDK, поэтому 429 от исчерпанного бюджета будет повторён четыре раза впустую. Бюджета задачи нет, только лимит шагов. Вызовы выполняются по очереди. Нет компакции, когда история перерастёт окно (<a href="../02-context-engineering/index.html">глава 2</a>), и нет проверки прав перед запуском инструмента (<a href="../16-security/index.html">глава 16</a>). Для игрушечного инструмента погоды это неважно, для инструмента, который пишет в базу, критично.</p>
+<p>Есть и совсем другой способ, без JSON-вызовов. На minimal-agent.com цикл строится на тексте: системный промпт просит модель заворачивать команду в блок кода с меткой <code>bash-action</code>, харнесс вытаскивает её регулярным выражением и выполняет<a class="cite" href="#src-46">46</a>. Автор формулирует идею так: «an AI agent is just a big loop: You start with a prompt, the agent proposes an action, you execute the action, tell the LM the output, and then repeat».</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Цикл на текстовых действиях, фрагмент (minimal-agent.com)">
+messages = [{"role": "system", "content": "You are a helpful assistant. When you want to run a command, wrap it in ```bash-action\n<command>\n```. To finish, run the exit command."},
+            {"role": "user", "content": "List the files in the current directory"}]
+while True:
+    lm_output = query_lm(messages)
+    messages.append({"role": "assistant", "content": lm_output})
+    action = parse_action(lm_output)
+    if action == "exit":
+        break
+    output = execute_action(action)
+    messages.append({"role": "user", "content": output})
+</script>
+<p>Такой цикл работает с любой моделью, которая умеет следовать формату, и ему не нужен ни <code>tools</code>, ни парсер движка. Платишь за это всем, что дают схемы: нет strict, нет проверки аргументов, нет параллельных вызовов, а ошибка формата видна только по тому, что регулярка ничего не нашла. Для учебного агента или модели без поддержки инструментов это разумный выбор. Для всего остального бери JSON-вызовы.</p>
+<ol class="steps">
+  <li><b>Запусти набросок и напечатай <code>resp.usage</code> на каждом витке.</b> Смотри, как растёт вход, и какую часть из него составляют кешированные токены.</li>
+  <li><b>Направь клиент на локальный сервер.</b> Для Ollama это <code class="wrap">base_url="http://localhost:11434/v1"</code>. Выясни, какие поля сервер принимает, а какие пропускает без ошибки: <code>reasoning</code>, <code>strict</code>, <code>max_output_tokens</code>.</li>
+  <li><b>Сломай нарочно.</b> В варианте Anthropic поставь текстовый блок перед <code>tool_result</code> и поймай 400. В варианте OpenAI выбрасывай элементы <code>reasoning</code> из истории и сравни ответы на многошаговой задаче.</li>
+  <li><b>Посмотри на сырой поток</b> той же задачи через <code>curl -N</code> и найди момент, когда аргументы вызова закрываются.</li>
+</ol>
+</section>
+
+<section id="sdk">
+<h2>Слои поверх цикла: SDK и хостинг</h2>
+<div class="note field">
+<blockquote>After being burned by the rug-pull of OpenAI retiring the Assistants API in favor of Responses last year, I swore off using heavily stateful APIs for language model access. I could be totally wrong, but at this point I'm more willing to use a proprietary harness headless than to abstract it into an API.
+<footer>— z2, <a href="https://news.ycombinator.com/item?id=49649213">Hacker News, 10 сентября 2026</a></footer></blockquote>
+<p>Комментарий из обсуждения запуска Agents API. На следующий день появился отдельный тред с заголовком «OpenAI Agents API, here we go, the assistant API again?»<a class="cite" href="#src-28">28</a></p>
+</div>
+<p>Цикл из предыдущего раздела можно не писать самому. Над API модели за полтора года выросло три этажа, и путают их постоянно, потому что на каждом есть что-то под названием «агент».</p>
+<figure class="fig" id="fig-layers">
+<div class="layers">
+  <div class="layer" data-tone="mute"><b>Хостинг агента</b><span>OpenAI Agents API, Anthropic Managed Agents: цикл, сессии и песочница у вендора</span></div>
+  <div class="layer" data-tone="soft"><b>Харнесс</b><span>Claude Code, Codex, opencode: цикл плюс инструменты, права, компакция, интерфейс</span></div>
+  <div class="layer" data-tone="accent"><b>SDK агента</b><span>OpenAI Agents SDK, Claude Agent SDK, Tool Runner: цикл как библиотека в твоём процессе</span></div>
+  <div class="layer"><b>API модели</b><span>Responses, Chat Completions, Messages, Interactions: один запрос, один ответ</span></div>
+  <div class="layer" data-tone="violet"><b>Модель</b><span>токены через шаблон чата</span></div>
+</div>
+<figcaption>Что добавляет каждый этаж. Всё, что выше API модели, крутит один и тот же цикл из первого раздела; этажи отличаются тем, кто его запускает, где выполняются инструменты и где хранится история.</figcaption>
+</figure>
+<p>OpenAI Agents SDK вышел 11 марта 2025 года вместе с Responses API, а не в 2026-м, как пишут некоторые обзоры<a class="cite" href="#src-9">9</a>. Его примитивы: <code>Agent</code>, <code>Runner</code>, инструменты, handoffs (передача управления другому агенту как отдельное поле, а не инструмент-обёртка), guardrails, сессии и трассировка. 15 апреля 2026 года добавились агенты с песочницей для долгой работы в контейнере, 6 мая — полный паритет версии для TypeScript. Цикл раннера описан явно: вызвать модель; если получен финальный вывод нужного типа без вызовов инструментов — вернуть; если handoff — сменить агента; если вызовы — выполнить и повторить. Лимит <code>DEFAULT_MAX_TURNS = 10</code>, отключается через <code>max_turns=None</code>; для превышения лимита, отказа модели и невалидного финального вывода есть отдельные обработчики<a class="cite" href="#src-41">41</a>. SDK работает и с Responses, и с Chat Completions, и с моделями других провайдеров. Последняя версия пакета <code>openai-agents</code> на PyPI — 0.22.3 от 17 сентября 2026<a class="cite" href="#src-45">45</a>.</p>
+<p>Claude Agent SDK — это Claude Code в виде библиотеки: пакет несёт с собой бинарник Claude Code и тот же цикл, те же инструменты (<code>Read</code>, <code>Edit</code>, <code>Write</code>, <code>Glob</code>, <code>Grep</code>, <code>Bash</code>, <code>WebSearch</code>, <code>WebFetch</code> и другие), те же режимы разрешений и ту же автоматическую компакцию<a class="cite" href="#src-42">42</a>. Документация определяет ход так: «a turn is one round trip: Claude produces tool calls, the SDK executes them, and results feed back automatically … turns continue until Claude produces output with no tool calls». Лимиты <code>max_turns</code> (считает только ходы с инструментами) и <code>max_budget_usd</code> по умолчанию отсутствуют, а причину конца видно по <code>ResultMessage.subtype</code>: <code>success</code>, <code>error_max_turns</code>, <code>error_max_budget_usd</code>, <code>error_during_execution</code>, <code class="wrap">error_max_structured_output_retries</code>. Свои инструменты выполняются по очереди, если не помечены <code>readOnlyHint</code>; компакция отмечается событием <code>compact_boundary</code>. С 15 июня 2026 года на подписочных планах использование Agent SDK списывается из отдельного месячного кредита. Последняя версия пакета <code>claude-agent-sdk</code> — 0.2.162 от 29 сентября 2026<a class="cite" href="#src-45">45</a>. Цикл, в котором ты работаешь каждый день в Claude Code, — ровно этот.</p>
+<p>У Anthropic есть и этаж пониже, который с Agent SDK часто путают: бета-хелпер Tool Runner в обычном SDK (<code>client.beta.messages.tool_runner</code>). Он крутит цикл только по твоим инструментам, без файловой системы и оболочки<a class="cite" href="#src-19">19</a>. По сути это автоматизированный набросок из прошлого раздела.</p>
+<p>Верхний этаж — хостинг агента: у OpenAI это Agents API, у Anthropic — бета Managed Agents. Тред о запуске Agents API на Hacker News за сутки набрал 350 очков и 187 комментариев и разделился почти поровну<a class="cite" href="#src-28">28</a>. Саймон Уиллисон разобрал в нём три уровня сетевого доступа песочницы и показал, как модель уважает запрет домена и рассуждает о том, чтобы не обходить его через <code>/etc/hosts</code>. Ответ chairhairair уместился в строку: «Perfect for when you want your data to be stolen programmatically». Многие в том же треде пишут свой харнесс поверх сырого API именно потому, что продукты вендоров слишком часто меняют форму.</p>
+<div class="note debate"><p>Армин Ронахер, тот самый, что предложил различать внутренний и внешний цикл, скептичен к циклам без присмотра: модели, по его словам, «avoid strong invariants… add fallbacks instead of making bad states impossible», и в долгих автономных прогонах это усиливается<a class="cite" href="#src-5">5</a>. Он оставляет такие циклы для кода, который переносят, а не пишут заново, и для короткоживущего: прототипов, разовых проверок. Хостинг агента делает такие прогоны дешёвыми в запуске, и спор этим только обостряется. Что делать на сентябрь 2026 года: напиши сырой цикл один раз, чтобы знать, что делает любой SDK. Для продукта со своими инструментами бери SDK вендора и выставь лимиты ходов и бюджета явно. Хостинг бери, когда песочница и долгие сессии — не твоя специализация, но историю держи так, чтобы её можно было выгрузить: Assistants API дал на переезд ровно год.</p></div>
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>Агент на OpenAI работает, а через LiteLLM к Gemini останавливается сразу после первого вызова инструмента. Где искать причину и как переписать условие?</summary><p>Скорее всего, цикл выходит по полю причины остановки: провайдер вернул <code>finish_reason: "stop"</code> при непустом <code>tool_calls</code>, как в opencode #14972. Продолжать цикл или нет, решай по наличию вызовов в ответе; причину остановки смотри, только когда вызовов нет.</p></details>
+<details><summary>Харнесс перевели на <code>previous_response_id</code>, а счёт не уменьшился. Почему и что его на самом деле снижает?</summary><p>Все input-токены цепочки оплачиваются на каждом ходе заново: модель читает весь контекст, параметр только избавляет от пересылки по сети. Снижает счёт кеш префикса, а он работает, пока новый запрос точно продолжает старый. Заодно проверь, что <code>instructions</code> присылаются каждый раз: через цепочку они не переносятся.</p></details>
+<details><summary>Цикл на Chat Completions, работавший на GPT-5.x, переключили на <code>gpt-6-astra</code>. Что произойдёт и какие есть выходы?</summary><p>Chat Completions не поддерживает вызов функций на GPT-6 Astra и GPT-6.1 Sol. Выходы: перевести цикл на Responses API или взять GPT-6 Sol или Luna с <code>reasoning_effort: "none"</code>, где вызов через Chat Completions ещё разрешён.</p></details>
+<details><summary>В потоке Chat Completions пришёл кусок вызова без <code>id</code> и <code>name</code>. Как понять, чей он, и когда можно разбирать аргументы?</summary><p>По обязательному полю <code>index</code>: <code>id</code> и имя есть только в первом куске каждого вызова. Аргументы — фрагменты строки, разбирать их можно после того, как вызов закрыт, то есть после чанка с <code>finish_reason</code>.</p></details>
+<details><summary>Claude вернул <code>stop_reason: "refusal"</code> и пустой <code>content</code>. Что отдаст цикл, который проверяет только «нет <code>tool_use</code> — вернуть текст», и что должно быть вместо этого?</summary><p>Пустую строку в роли ответа, причём с 24 сентября 2026 года такой отказ в ряде категорий ещё и оплачен. Нужна отдельная ветка: прочитать <code>stop_details</code> (категорию и объяснение), затем запасная модель, в том числе серверная через <code>fallbacks: "default"</code>, или честное сообщение пользователю.</p></details>
+<details><summary>Почему плохо убирать инструмент из <code>tools</code> посреди разговора и что предлагают вместо этого OpenAI и Anthropic?</summary><p>Массив <code>tools</code> стоит в самом начале префикса, любая правка сбрасывает кеш всего разговора. У OpenAI есть <code>tool_choice</code> с типом <code>allowed_tools</code>, который сужает выбор без правки списка. У Anthropic — системное сообщение в конце истории с блоком <code>tool_removal</code> (бета <code>inline-tools-2026-09-15</code>).</p></details>
+<details><summary>В истории разговора с Sonnet 5.5 исправили опечатку в первом сообщении пользователя и отправили запрос снова. Что будет?</summary><p>Блоки <code>thinking</code> привязаны к неизменному префиксу: аккаунт, созданный 31 августа 2026 года или позже, получит 400, а с заголовком <code class="wrap">thinking-binding-controls-2026-08-01</code> рассуждения молча выбросятся. Кеш в любом случае пересчитается с начала. Исправление нужно дописать в конец, например системным сообщением.</p></details>
+<details><summary>В описаниях инструментов стоит <code>strict: true</code>, а с Claude ты общаешься через его OpenAI-совместимый эндпоинт. Какую гарантию схемы ты получаешь?</summary><p>Никакой. Этот слой молча игнорирует <code>strict</code> и <code>response_format</code>, генерация идёт без ограничений. Нужна гарантия — работай с родным Messages API и его strict-инструментами или <code>output_config.format</code>.</p></details>
+<details><summary>Пришёл 429 с кодом <code>project_spend_limit_exceeded</code>. Что сделает openai-python по умолчанию и что должен сделать твой цикл?</summary><p>SDK повторит запрос дважды, впустую: бюджет от ожидания не вырастет. Цикл должен ветвиться по коду ошибки, остановиться и позвать человека, а не передавать ошибку своим ретраям или внешнему циклу.</p></details>
+<details><summary>Почему vLLM просит <code>--tool-call-parser</code> под конкретную модель, а у API OpenAI такого параметра нет?</summary><p>Формат вызова задаётся при обучении модели: Harmony, DeepSeek и GLM пишут один и тот же вызов разными токенами. У хостинга вендора и шаблон, и парсер спрятаны внутри API. Открытый движок вынужден держать парсер под каждое семейство моделей, отсюда проблема M×N и регулярные поломки парсеров.</p></details>
+<details><summary>Рассуждающая модель вернула <code>status: "incomplete"</code> с причиной <code>max_output_tokens</code> и без текста. Что случилось?</summary><p>Лимит вывода общий для рассуждений и ответа, и рассуждения съели его весь раньше, чем модель дошла до текста. Подними <code>max_output_tokens</code>; OpenAI советует начинать с резерва не меньше 25 тыс. токенов.</p></details>
+<details><summary>Агент на OpenAI Agents SDK падает с <code>MaxTurnsExceeded</code> на задаче из 15 шагов, а похожий на Claude Agent SDK однажды крутился всю ночь. Какие дефолты виноваты?</summary><p>В OpenAI Agents SDK <code>DEFAULT_MAX_TURNS = 10</code>. В Claude Agent SDK у <code>max_turns</code> и <code>max_budget_usd</code> лимита по умолчанию нет. Оба значения надо выставлять явно под задачу.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу написать цикл агента на Responses API и на Messages API без фреймворков, с выходом по наличию вызовов и лимитом шагов</li>
+  <li>Разбираю все причины остановки: <code>finish_reason</code>, <code>status</code> с <code>incomplete_details</code>, семь <code>stop_reason</code> Anthropic, и у каждой есть своя ветка в коде</li>
+  <li>Смотрел сырой поток через <code>curl -N</code> для Chat Completions, Responses и Messages и знаю, где закрываются аргументы вызова</li>
+  <li>Склеиваю аргументы стримингового вызова по <code>index</code> или <code>item_id</code> и разбираю их только после закрывающего события</li>
+  <li>Пишу strict-схемы (все поля в <code>required</code>, <code>null</code> для необязательных, <code>additionalProperties: false</code>) и знаю, какой strict по умолчанию в каждом API</li>
+  <li>Храню историю Responses сам: <code>store: false</code> и replay элементов <code>output</code> без пересборки сообщений</li>
+  <li>Меняю инструкции и инструменты посреди сессии новым сообщением в конце истории, а не правкой отправленного</li>
+  <li>Отличаю 429, который лечится ожиданием, от 429 исчерпанного бюджета, и мой код ветвится по <code>error.code</code></li>
+  <li>Указываю уровень рассуждений явно и знаю допустимые значения и дефолты для моделей, с которыми работаю</li>
+  <li>Рендерил сообщения с инструментами через <code>apply_chat_template</code> и видел, во что превращается JSON</li>
+  <li>Запускал цикл против локального OpenAI-совместимого сервера и выяснил, какие поля он игнорирует</li>
+  <li>Находил пары <code>tool_use</code> и <code>tool_result</code> и поле <code>stop_reason</code> в транскрипте своей сессии Claude Code</li>
+  <li>Выставляю лимиты ходов и бюджета явно в любом SDK агента, которым пользуюсь</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://github.com/anomalyco/opencode/issues/14972">Agent stops after tool execution with OpenAI-compatible providers (Gemini, LiteLLM)</a>. anomalyco/opencode, issue #14972, 25 февраля 2026; закрыт PR #14973.</li>
+  <li id="src-2"><a href="https://ai.google.dev/gemini-api/docs/function-calling">Function calling</a>, <a href="https://ai.google.dev/gemini-api/docs/thinking">Gemini thinking</a>, <a href="https://ai.google.dev/gemini-api/docs/openai">OpenAI compatibility</a>, <a href="https://ai.google.dev/gemini-api/docs/gemini-3">Gemini 3</a>. Google, Gemini API docs, сентябрь 2026; <a href="https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta">discovery-документ Gemini API v1beta</a>, ревизия 20260928 (схемы <code>Candidate</code>, <code>FunctionCallingConfig</code>, <code>FunctionCall</code>, <code>FunctionDeclaration</code>, <code>UsageMetadata</code>).</li>
+  <li id="src-3"><a href="https://simonwillison.net/guides/agentic-engineering-patterns/how-coding-agents-work/">How coding agents work</a>. Simon Willison, Agentic Engineering Patterns.</li>
+  <li id="src-4"><a href="https://openai.com/index/unrolling-the-codex-agent-loop/">Unrolling the Codex agent loop</a>. OpenAI, 23 января 2026; <a href="https://news.ycombinator.com/item?id=46737630">обсуждение на Hacker News</a>, item 46737630.</li>
+  <li id="src-5"><a href="https://lucumr.pocoo.org/2026/6/23/the-coming-loop/">The Coming Loop</a>. Armin Ronacher, 23 июня 2026.</li>
+  <li id="src-6"><a href="https://github.com/openai/openai-openapi">openai/openai-openapi, openapi.yaml</a>. OpenAI, ветка master, состояние на 30 сентября 2026.</li>
+  <li id="src-7"><a href="https://developers.openai.com/api/docs/guides/latest-model">Using GPT-6</a>. OpenAI, гайд по последней модели, сентябрь 2026.</li>
+  <li id="src-8"><a href="https://developers.openai.com/api/docs/guides/migrate-to-responses">Migrate to the Responses API</a>. OpenAI.</li>
+  <li id="src-9"><a href="https://developers.openai.com/api/docs/changelog">API Changelog</a>. OpenAI, записи с 17 декабря 2024 по 29 сентября 2026.</li>
+  <li id="src-10"><a href="https://developers.openai.com/api/docs/guides/function-calling">Function calling</a>. OpenAI.</li>
+  <li id="src-11"><a href="https://news.ycombinator.com/item?id=44052947">Обсуждение разницы Chat Completions и Responses</a>, с комментариями сотрудника OpenAI nknj. Hacker News, 21 мая 2025.</li>
+  <li id="src-12"><a href="https://platform.claude.com/docs/en/build-with-claude/streaming">Streaming Messages</a>, <a href="https://platform.claude.com/docs/en/api/errors">Errors</a>, <a href="https://platform.claude.com/docs/en/api/rate-limits">Rate limits</a>. Anthropic.</li>
+  <li id="src-13"><a href="https://benchlm.ai/blog/posts/chat-completions-to-responses-api">OpenAI Responses API vs Chat Completions: Migrate and Test</a>. benchlm.ai, 2026.</li>
+  <li id="src-14"><a href="https://community.openai.com/t/assistants-api-beta-deprecation-august-26-2026-sunset/1354666">Assistants API beta deprecation — August 26, 2026 sunset</a>. OpenAI Developer Community, 26 августа 2025.</li>
+  <li id="src-15"><a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs">Structured outputs</a>. Anthropic.</li>
+  <li id="src-16"><a href="https://developers.openai.com/api/docs/guides/structured-outputs">Structured model outputs</a>. OpenAI.</li>
+  <li id="src-17"><a href="https://www.openresponses.org/specification/2026-04-24">Open Responses Specification 2026-04-24</a> и <a href="https://www.openresponses.org/governance">устав проекта</a>. Open Responses, 24 апреля 2026.</li>
+  <li id="src-18"><a href="https://platform.claude.com/docs/en/release-notes/overview">Claude Platform release notes</a>. Anthropic, записи с 26 июня по 28 сентября 2026.</li>
+  <li id="src-19"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Tool use overview</a>, <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use">Implement tool use</a>, <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls">Handle tool calls</a>. Anthropic.</li>
+  <li id="src-20"><a href="https://huggingface.co/docs/transformers/en/chat_templating">Chat templates</a> и <a href="https://github.com/huggingface/transformers/blob/main/docs/source/en/chat_extras.md">Tool use</a>. Hugging Face Transformers docs.</li>
+  <li id="src-21"><a href="https://developers.openai.com/cookbook/articles/openai-harmony">OpenAI Harmony Response Format</a>, OpenAI Cookbook; <a href="https://github.com/openai/harmony">openai/harmony</a>, README.</li>
+  <li id="src-22"><a href="https://www.thetypicalset.com/blog/grammar-parser-maintenance-contract">Tool calling, open source, and the M×N problem</a>. Rémi Louf, апрель 2026.</li>
+  <li id="src-23"><a href="https://docs.vllm.ai/en/latest/features/tool_calling/">Tool Calling</a> и <a href="https://docs.vllm.ai/en/latest/serving/online_serving/">Online serving</a>. vLLM docs, ветка latest.</li>
+  <li id="src-24"><a href="https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5">What's new in Claude Sonnet 5.5</a>. Anthropic, 28 сентября 2026.</li>
+  <li id="src-25"><a href="https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons">Handling stop reasons</a> и <a href="https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback">Refusals and fallback</a>. Anthropic, сентябрь 2026.</li>
+  <li id="src-26"><a href="https://platform.claude.com/docs/en/build-with-claude/effort">Effort</a>, <a href="https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking">Adaptive thinking</a>, <a href="https://platform.claude.com/docs/en/build-with-claude/extended-thinking">Extended thinking</a>. Anthropic.</li>
+  <li id="src-27"><a href="https://developers.openai.com/api/docs/guides/reasoning">Reasoning models</a>. OpenAI.</li>
+  <li id="src-28"><a href="https://news.ycombinator.com/item?id=49649213">OpenAI Agents API</a>, Hacker News, 10 сентября 2026; <a href="https://news.ycombinator.com/item?id=49657480">OpenAI Agents API, here we go, the assistant API again?</a>, Hacker News, 11 сентября 2026.</li>
+  <li id="src-29"><a href="https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages">Mid-conversation system messages and tool changes</a>. Anthropic.</li>
+  <li id="src-30"><a href="https://ai.google.dev/gemini-api/docs/changelog">Gemini API changelog</a> и <a href="https://ai.google.dev/gemini-api/docs/interactions">Interactions API</a>. Google, записи с 11 декабря 2025 по сентябрь 2026.</li>
+  <li id="src-31"><a href="https://platform.claude.com/docs/en/api/openai-sdk">OpenAI SDK compatibility</a>. Anthropic.</li>
+  <li id="src-32"><a href="https://docs.ollama.com/api/openai-compatibility">OpenAI compatibility</a>. Ollama docs.</li>
+  <li id="src-33"><a href="https://openrouter.ai/docs/api_reference/responses/overview">Responses API overview</a>. OpenRouter docs.</li>
+  <li id="src-34"><a href="https://api-docs.deepseek.com/guides/responses_api/">Using the Responses API</a>. DeepSeek API Docs, август 2026.</li>
+  <li id="src-35">Отчёты о 400 из-за <code>cache_control</code> на блоках рассуждений: <a href="https://github.com/microsoft/amplifier-module-provider-anthropic/pull/99">microsoft/amplifier-module-provider-anthropic PR #99</a>, <a href="https://github.com/BerriAI/litellm/pull/39815">BerriAI/litellm PR #39815</a>, <a href="https://github.com/openclaw/openclaw/issues/140607">openclaw/openclaw #140607</a>, <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/10889">zeroclaw-labs/zeroclaw #10889</a>. GitHub, 2026.</li>
+  <li id="src-36"><a href="https://simonwillison.net/2026/Jan/15/open-responses/">Open Responses</a>. Simon Willison, 15 января 2026.</li>
+  <li id="src-37"><a href="https://github.com/BerriAI/litellm/issues/24512">CRITICAL: Malicious litellm_init.pth in litellm 1.82.8 — credential stealer</a>, BerriAI/litellm issue #24512; <a href="https://news.ycombinator.com/item?id=47501426">Tell HN: Litellm 1.82.7 and 1.82.8 on PyPI are compromised</a>, Hacker News. 24 марта 2026.</li>
+  <li id="src-38"><a href="https://developers.openai.com/api/docs/guides/websocket-mode">WebSocket Mode</a>, <a href="https://developers.openai.com/api/docs/guides/async-tool-calling">Async tool calling</a>, <a href="https://developers.openai.com/api/docs/guides/background">Background mode</a>. OpenAI, 2026.</li>
+  <li id="src-39"><a href="https://developers.openai.com/api/docs/guides/error-codes">Error codes</a> и <a href="https://developers.openai.com/api/docs/guides/rate-limits">Rate limits</a>. OpenAI.</li>
+  <li id="src-40"><a href="https://github.com/openai/openai-python">openai/openai-python</a>, README, раздел Retries. OpenAI. <a href="https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/_base_client.py">anthropics/anthropic-sdk-python</a>: <code>src/anthropic/_base_client.py</code> (<code>_calculate_nonstreaming_timeout</code>) и <code>src/anthropic/_constants.py</code>, ветка main, 30 сентября 2026.</li>
+  <li id="src-41"><a href="https://github.com/openai/openai-agents-python">openai/openai-agents-python</a>: <code>docs/running_agents.md</code>, <code>src/agents/run_config.py</code>. OpenAI.</li>
+  <li id="src-42"><a href="https://code.claude.com/docs/en/agent-sdk/agent-loop">How the agent loop works</a>. Anthropic, документация Claude Agent SDK.</li>
+  <li id="src-43"><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Prompt caching</a>. Anthropic, раздел о разбивке токенов на вход.</li>
+  <li id="src-44"><a href="https://developers.openai.com/api/docs/guides/prompt-caching">Prompt caching</a>. OpenAI, сентябрь 2026.</li>
+  <li id="src-45">PyPI: <a href="https://pypi.org/project/openai/">openai</a>, <a href="https://pypi.org/project/anthropic/">anthropic</a>, <a href="https://pypi.org/project/openai-agents/">openai-agents</a>, <a href="https://pypi.org/project/claude-agent-sdk/">claude-agent-sdk</a>; версии на 30 сентября 2026.</li>
+  <li id="src-46"><a href="https://minimal-agent.com/">Minimal Agent Loop</a>. minimal-agent.com.</li>
+  <li id="src-47"><a href="https://arxiv.org/abs/2408.02442">Let Me Speak Freely? A Study on the Impact of Format Restrictions on Performance of Large Language Models</a>. Zhi Rui Tam, Cheng-Kuang Wu, Yi-Lin Tsai, Chieh-Yen Lin, Hung-yi Lee, Yun-Nung Chen. arXiv:2408.02442, август 2024 (v3 — 14 октября 2024).</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>

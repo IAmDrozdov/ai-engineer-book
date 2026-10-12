@@ -1,0 +1,1104 @@
+<!doctype html>
+<html lang="ru" data-chapter="09">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A2UI и Generative UI — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 9</b> из 17, часть «Протоколы»</p>
+  <h1>A2UI и Generative UI</h1>
+  <p class="lead">Агент присылает в чат кнопку «Подтвердить». В ней нет ни строчки JavaScript, только JSON: компонент <code>Button</code> из базового каталога A2UI и действие <code>openUrl</code> с аргументом <code class="wrap">javascript:alert(document.cookie)</code>. Валидатор из официального Python SDK проверяет эту кнопку по каталогу и не находит ошибок, а рендереры на <code>@a2ui/web_core</code> версий 0.9.0–0.10.1 по клику выполняли этот код в origin твоего приложения<a class="cite" href="#src-1">1</a>. Протокол, который обещает, что агент никогда не присылает код, споткнулся о простую вещь: код всё равно есть, его пишет тот, кто рисует.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="taxonomy">
+<h2>Данные, структура или код</h2>
+<p>Возьми одну задачу. Пользователь пишет агенту «забронируй столик на четверых в пятницу», и в ответ в чате должна появиться форма: дата, время, число гостей, кнопка. Сделать это можно тремя способами, и различаются они не библиотеками, а тем, что именно агент отправляет по сети.</p>
+<p>В первом способе модель вызывает инструмент <code>book_table</code> с аргументами <code class="wrap">{"date": "2026-10-02", "guests": 4}</code>, а фронтенд по имени инструмента выбирает заранее написанный компонент <code>BookingForm</code> и отдаёт ему аргументы как props. По сети едут данные. Код, который рисует, написан тобой до того, как модель что-то сказала, и модель решает только две вещи: какой компонент показать и чем его заполнить. Так устроены типизированные части сообщений <code>tool-${toolName}</code> в Vercel AI SDK<a class="cite" href="#src-2">2</a> и хук <code>useFrontendTool</code> в CopilotKit<a class="cite" href="#src-3">3</a>. CopilotKit называет этот класс <dfn>controlled</dfn>.</p>
+<p>Во втором способе модель присылает описание интерфейса: плоский список компонентов вида «<code>Column</code> с детьми <code>title</code>, <code>date</code>, <code>submit</code>; <code>DateTimeInput</code>, привязанный к <code>/booking/date</code>». Типы компонентов берутся из <dfn>каталога</dfn>, который ты заранее отдал агенту, а рисует их твой рендерер своими нативными виджетами. По сети едет структура. Модель уже решает, из чего собрать экран, но собрать может только из того, что есть в каталоге. Это <dfn>declarative</dfn>-класс: A2UI<a class="cite" href="#src-4">4</a>, json-render от Vercel Labs<a class="cite" href="#src-5">5</a>, виджеты ChatKit, JSON-дерево, в которое FastMCP сериализует Python-компоненты Prefab. Внутри класса есть второй раскол. Схема бывает фиксированной, когда разметку пишешь ты, а агент подставляет данные, и динамической, когда дерево целиком придумывает модель на каждом ходе. CopilotKit поставляет оба варианта A2UI под этими именами, и выбор между ними сводится к цене: лишний проход генерации по всему дереву на каждом ходе против невозможности показать макет, которого ты не предусмотрел<a class="cite" href="#src-3">3</a>.</p>
+<p>В третьем способе по сети едет код. Сервер или модель присылает HTML с JavaScript, хост запускает его в песочнице — iframe с урезанными правами — и дальше разговаривает с ним сообщениями. В MCP Apps этот HTML заранее написал разработчик MCP-сервера<a class="cite" href="#src-6">6</a>. В исследовательском Generative UI от Google страницу целиком пишет модель, Gemini 3 с доступом к поиску и генерации картинок<a class="cite" href="#src-7">7</a>. Между ними гибриды: в FastMCP модель пишет Python-код на Prefab, и он исполняется в Pyodide прямо в браузере<a class="cite" href="#src-8">8</a>, а режим, который CopilotKit называет Open Generative UI, стримит сгенерированные HTML, CSS и JS в изолированный iframe<a class="cite" href="#src-3">3</a>. Это <dfn>open-ended</dfn>-класс.</p>
+<figure class="fig wide" id="fig-taxonomy">
+<div class="versus">
+  <div data-tone="soft"><h4>Controlled</h4><ul><li>По сети: аргументы тула, то есть данные</li><li>Рисует: твой компонент, написанный заранее</li><li>Модель решает: какой компонент и с какими props</li><li>Примеры: tool parts в AI SDK, <code>useFrontendTool</code></li></ul></div>
+  <div data-tone="accent"><h4>Declarative</h4><ul><li>По сети: дерево компонентов из каталога</li><li>Рисует: рендерер хоста нативными виджетами</li><li>Модель решает: композицию в пределах каталога</li><li>Примеры: A2UI, json-render, ChatKit widgets, Prefab</li></ul></div>
+  <div data-tone="warn"><h4>Open-ended</h4><ul><li>По сети: HTML и JavaScript</li><li>Рисует: присланный код внутри песочницы</li><li>Решает: сервер или модель, вплоть до пикселя</li><li>Примеры: MCP Apps, Google GenUI, Open Generative UI</li></ul></div>
+</div>
+<figcaption>Три класса generative UI различаются тем, что пересекает сеть. Слева направо растёт свобода модели и сужается то, что хост может гарантировать про результат: от «это мой компонент» до «это чужой код, но он не выйдет из клетки».</figcaption>
+</figure>
+<p>Названия у вендоров плывут, поэтому смотреть надо на payload, а не на вывеску. Open Generative UI у CopilotKit в README подключается хуком <code>useComponent</code>, как будто речь о компонентах, но зарегистрированный так <code>widgetRenderer</code> получает строку <code>html</code><a class="cite" href="#src-3">3</a>. По payload это open-ended-класс.</p>
+<p>Есть архитектура, которая в тройку не ложится. Thesys C1 был OpenAI-совместимым API: ты менял <code>base_url</code> на <code class="wrap">https://api.thesys.dev/v1/embed</code> и вместо текста получал UI-спецификацию на собственном DSL, которую рисовал компонент <code>&lt;C1Component /&gt;</code><a class="cite" href="#src-9">9</a>. Генерация интерфейса переезжала внутрь модельного API, а твой бэкенд даже не знал, что отдаёт интерфейс. На сентябрь 2026 года документация C1 помечена как архив, и новым проектам Thesys советует свой следующий продукт, OpenUI<a class="cite" href="#src-9">9</a>.</p>
+<p>Сама идея старая. Server-driven UI, когда бэкенд присылает описание экрана, а нативный клиент его рисует, давно живёт в мобильных приложениях, и в обсуждении запуска A2UI на Hacker News его так и назвали: тот же SDUI, только шаблонизатор теперь модель<a class="cite" href="#src-10">10</a>. Новое здесь — автор описания. Он ошибается, выдумывает несуществующие компоненты и может выполнять чужие инструкции, пришедшие через промпт-инъекцию.</p>
+<div class="note key"><p>Сравнивай подходы по одному вопросу: чей код превращает ответ модели в пиксели и кто отвечает, когда модель ошиблась. В controlled ошибка модели — неправильные props у твоего компонента. В declarative — неправильная композиция из правильных деталей. В open-ended — любая страница, и хост гарантирует только прочность клетки.</p></div>
+</section>
+
+<section id="a2ui-surface">
+<h2>A2UI изнутри: поверхность, список, данные</h2>
+<p>Вот та самая форма бронирования в текущей production-версии A2UI, v0.9.1. Поток идёт в формате JSON Lines: каждая строка — отдельное сообщение от агента к рендереру.</p>
+<script type="text/plain" class="code wide" data-lang="json" data-title="Набросок по примеру из What is A2UI, v0.9.1: добавлен корень root" data-hl="3,5">
+{"version":"v0.9.1","createSurface":{"surfaceId":"booking","catalogId":"https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json"}}
+{"version":"v0.9.1","updateComponents":{"surfaceId":"booking","components":[
+  {"id":"root","component":"Column","children":["title","datetime","submit-btn"]},
+  {"id":"title","component":"Text","text":"Book Your Table","variant":"h1"},
+  {"id":"datetime","component":"DateTimeInput","value":{"path":"/booking/date"},"enableDate":true},
+  {"id":"submit-text","component":"Text","text":"Confirm"},
+  {"id":"submit-btn","component":"Button","child":"submit-text","variant":"primary",
+   "action":{"event":{"name":"confirm_booking"}}}
+]}}
+{"version":"v0.9.1","updateDataModel":{"surfaceId":"booking","path":"/booking","value":{"date":"2025-12-16T19:00:00Z"}}}
+</script>
+<p>Три сообщения — три части любого обмена. <code>createSurface</code> открывает <dfn>поверхность</dfn> (surface): область интерфейса со своим деревом компонентов и своей моделью данных, адресуемую по <code>surfaceId</code>. Поверхности не вкладываются друг в друга, и у каждого сообщения v0.9 есть поле <code>version</code><a class="cite" href="#src-11">11</a>. <code>updateComponents</code> присылает компоненты, <code>updateDataModel</code> — данные.</p>
+<p>В оригинальном примере на странице What is A2UI компонента с <code>"id": "root"</code> нет. А в v0.9 корень задаётся только соглашением: один компонент обязан называться <code>root</code>, отдельного поля для этого нет<a class="cite" href="#src-11">11</a>. В v0.8 корень указывался явно, полем <code>root</code> в сообщении <code>beginRendering</code>, и при переводе примера на новую версию его потеряли. Схема такую ошибку не ловит, потому что каждый компонент по отдельности валиден, и рендереру просто не с чего начать дерево. В примере выше корень добавлен третьей строкой.</p>
+<h3>Плоский список вместо дерева</h3>
+<p>Компоненты лежат не вложенным деревом, а плоским списком. У каждой записи есть <code>id</code>, связи задаются ссылками на чужие id в полях <code>children</code> и <code>child</code>. Это <dfn>список смежности</dfn> (adjacency list), и выбран он ради стриминга. Модель генерирует ответ токен за токеном, а вложенный JSON становится валидным только в конце, когда закрыты все скобки. Список самостоятельных записей можно разбирать по мере прихода, но делает это обычно не рендерер: модель пишет один <code>updateComponents</code> со всем массивом, и рендерер получает его целиком. Постепенность даёт потоковый парсер агента. <code>DirectJsonStreamParser</code> из Python SDK достраивает недописанный JSON, шлёт частичные <code>updateComponents</code> с поддеревом, уже достижимым от <code>root</code>, а на место ещё не пришедших детей ставит заглушку, пустой <code>Row</code><a class="cite" href="#src-12">12</a>. Поэтому промпт SDK требует от модели писать <code>root</code> первым, а родителей раньше детей. Рендерер буферизует обновления до появления <code>root</code>, а потом рисует то, что есть, пропуская битые ссылки<a class="cite" href="#src-11">11</a>.</p>
+<p>Чтобы поменять один узел, агент присылает ещё один <code>updateComponents</code> с единственной записью под тем же id, не пересылая остальное дерево.</p>
+<figure class="fig wide" id="fig-adjacency">
+<svg class="diagram" viewBox="0 0 1000 340" role="img" aria-label="Плоский список компонентов A2UI и дерево, которое из него собирает рендерер">
+  <text class="t-sub" x="20" y="26">Что присылает агент: плоский список</text>
+  <rect class="box" x="20" y="40" width="440" height="36" rx="6"/>
+  <text class="t-mono" x="34" y="63">root  Column  children: [title, datetime, submit-btn]</text>
+  <rect class="box" x="20" y="88" width="440" height="36" rx="6"/>
+  <text class="t-mono" x="34" y="111">title  Text  "Book Your Table"</text>
+  <rect class="box" x="20" y="136" width="440" height="36" rx="6"/>
+  <text class="t-mono" x="34" y="159">datetime  DateTimeInput  {path: /booking/date}</text>
+  <rect class="box" x="20" y="184" width="440" height="36" rx="6"/>
+  <text class="t-mono" x="34" y="207">submit-text  Text  "Confirm"</text>
+  <rect class="box" x="20" y="232" width="440" height="36" rx="6"/>
+  <text class="t-mono" x="34" y="255">submit-btn  Button  child: submit-text</text>
+  <rect class="box--accent" x="20" y="288" width="440" height="36" rx="6"/>
+  <text class="t-mono" x="34" y="311">title  Text  "Table for four"</text>
+  <text class="t-sub" x="540" y="26">Что собирает рендерер</text>
+  <rect class="box--soft" x="690" y="40" width="140" height="46" rx="6"/>
+  <text class="t-mono" x="760" y="59" text-anchor="middle">root</text>
+  <text class="t-sub" x="760" y="77" text-anchor="middle">Column</text>
+  <rect class="box--accent" x="540" y="128" width="130" height="46" rx="6"/>
+  <text class="t-mono" x="605" y="147" text-anchor="middle">title</text>
+  <text class="t-sub" x="605" y="165" text-anchor="middle">Text</text>
+  <rect class="box--soft" x="695" y="128" width="130" height="46" rx="6"/>
+  <text class="t-mono" x="760" y="147" text-anchor="middle">datetime</text>
+  <text class="t-sub" x="760" y="165" text-anchor="middle">DateTimeInput</text>
+  <rect class="box--soft" x="850" y="128" width="130" height="46" rx="6"/>
+  <text class="t-mono" x="915" y="147" text-anchor="middle">submit-btn</text>
+  <text class="t-sub" x="915" y="165" text-anchor="middle">Button</text>
+  <rect class="box--soft" x="850" y="216" width="130" height="46" rx="6"/>
+  <text class="t-mono" x="915" y="235" text-anchor="middle">submit-text</text>
+  <text class="t-sub" x="915" y="253" text-anchor="middle">Text</text>
+  <rect class="box--ghost" x="665" y="216" width="170" height="46" rx="6"/>
+  <text class="t-mono" x="750" y="235" text-anchor="middle">/booking/date</text>
+  <text class="t-sub" x="750" y="253" text-anchor="middle">модель данных</text>
+  <path class="arrow" d="M740,86 L620,126"/>
+  <path class="arrow" d="M760,86 L760,126"/>
+  <path class="arrow" d="M780,86 L900,126"/>
+  <path class="arrow" d="M915,174 L915,214"/>
+  <path class="arrow arrow--dash" d="M755,174 L752,214"/>
+  <path class="arrow arrow--pen" d="M460,300 L560,176"/>
+  <text class="t-pen" x="540" y="316">патч: одна запись с тем же id заменяет один узел</text>
+</svg>
+<figcaption>Слева то, что едет по сети: независимые записи, каждая валидна сама по себе, связи — ссылки на id. Справа дерево, которое из них собирает рендерер. Нижняя жёлтая запись приходит позже отдельным <code>updateComponents</code> и заменяет только узел <code>title</code>; пунктир — привязка поля к модели данных, а не связь в дереве.</figcaption>
+</figure>
+<p>Данные отделены от структуры. <code>{"path": "/booking/date"}</code> вместо строки означает привязку: значение берётся из модели данных поверхности по JSON Pointer (RFC 6901). Агент может обновить данные, не трогая компоненты, и наоборот. В v0.9 у <code>updateDataModel</code> поле <code>path</code> по умолчанию равно <code>/</code>, а сообщение без <code>value</code> удаляет ключ<a class="cite" href="#src-11">11</a>. В v1.0 это правило перевернули.</p>
+<p>У <code>children</code> есть вторая форма — шаблон. Вместо списка id контейнер получает <code>componentId</code> и путь к массиву, и рендерер создаёт экземпляр шаблона на каждый элемент<a class="cite" href="#src-11">11</a>:</p>
+<script type="text/plain" class="code wide" data-lang="jsonc" data-title="Шаблон списка, v0.9.1 (из спецификации протокола, сокращено)" data-hl="2,4">
+{"id": "employee_list", "component": "List",
+ "children": {"path": "/employees", "componentId": "employee_card_template"}},
+{"id": "employee_card_template", "component": "Column", "children": ["name_text", "company_text"]},
+{"id": "name_text", "component": "Text", "text": {"path": "name"}},
+  // относительный путь: /employees/N/name
+{"id": "company_text", "component": "Text", "text": {"path": "/company"}}
+  // абсолютный путь: общий для всех карточек
+</script>
+<p>Путь без ведущего <code>/</code> внутри шаблона относителен, и спецификация называет это отступлением от RFC 6901. Строки можно собирать функцией <code>formatString</code> с интерполяцией <code>${/user/name}</code> или <code>${name}</code>, а в v1.0 появилась встроенная <code>@index</code> с номером итерации<a class="cite" href="#src-13">13</a>. На шаблонах держится экономия: двадцать ресторанов — это один шаблон и один <code>updateDataModel</code>, а не двадцать карточек, которые модель генерирует токен за токеном.</p>
+<p>Прежде чем открыть поверхность, агент выбирает каталог. Рендерер в метаданных каждого сообщения передаёт <code>a2uiClientCapabilities</code> со списком <code>supportedCatalogIds</code>, упорядоченным по предпочтению. Агент может заранее объявить свои каталоги в AgentCard. Выбор делается при <code>createSurface</code> и не меняется до конца жизни поверхности, а если общих каталогов нет, агент не присылает интерфейс вовсе<a class="cite" href="#src-14">14</a>. Совпадение проверяется по строке <code>catalogId</code>.</p>
+<h3>Что происходит, пока пользователь печатает</h3>
+<p>Ничего сетевого. Каждое нажатие в <code>TextField</code> синхронно пишет значение в локальную модель данных, и по сети не уходит ни байта. Документация A2UI отдельно подчёркивает следствие: debounce на клиенте не нужен, сеть видит только намеренные действия пользователя<a class="cite" href="#src-14">14</a>.</p>
+<p>Намеренные действия бывают двух видов. <dfn>Функция</dfn> (<code>functionCall</code>) выполняется локально в рендерере, например <code>openUrl</code> или проверка формата email, и агенту о ней не сообщают. <dfn>Событие</dfn> (<code>event</code>) уходит агенту: у него есть стабильное имя, по которому агент делает <code>switch</code>, и контекст — словарь значений, которые могут ссылаться на модель данных и разрешаются в момент клика.</p>
+<div class="tabs">
+  <section data-tab="Кнопка с событием">
+  <script type="text/plain" class="code" data-lang="json" data-title="Компонент v0.9 (из документации A2UI)" data-hl="7-10">
+  {
+    "id": "submit-btn",
+    "component": "Button",
+    "child": "btn-text",
+    "action": {
+      "event": {
+        "name": "submit_reservation",
+        "context": { "time": {"path": "/reservationTime"}, "size": {"path": "/partySize"} }
+      }
+    }
+  }
+  </script>
+  </section>
+  <section data-tab="Что получает агент">
+  <script type="text/plain" class="code" data-lang="json" data-title="Сообщение action, v0.9 (из документации A2UI)" data-hl="8">
+  {
+    "version": "v0.9",
+    "action": {
+      "name": "submit_reservation",
+      "surfaceId": "booking-surface",
+      "sourceComponentId": "submit-btn",
+      "timestamp": "2026-02-25T10:40:00Z",
+      "context": { "time": "7:00 PM", "size": 4 }
+    }
+  }
+  </script>
+  </section>
+</div>
+<p>Агент получает не форму, а только то, что автор кнопки положил в <code>context</code>, уже с подставленными значениями. Отвечает он теми же тремя сообщениями: дополняет компоненты, меняет данные или закрывает поверхность через <code>deleteSurface</code>.</p>
+<figure class="fig wide" id="fig-a2ui-seq">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant A as Агент
+  participant R as Рендерер
+  participant U as Пользователь
+  A->>R: createSurface {surfaceId, catalogId}
+  A->>R: updateComponents (по мере генерации)
+  A->>R: updateDataModel {path, value}
+  R-->>U: нативные виджеты из каталога
+  U->>R: ввод в TextField
+  Note over R,U: запись в локальную модель, сеть молчит
+  U->>R: клик по кнопке
+  R->>R: functionCall выполняется на месте
+  R->>A: action {name, context из модели}
+  A->>R: updateDataModel или deleteSurface
+</script>
+<figcaption>Жизнь поверхности A2UI. Между отрисовкой и кликом рендерер работает сам: ввод пишется в локальную модель данных, функции каталога выполняются без агента. Агент узнаёт о действиях пользователя только из сообщения <code>action</code>.</figcaption>
+</figure>
+<p>Иногда агенту нужна вся форма без кнопки: пользователь говорит голосом «ну, отправляй». Для этого агент ставит <code>sendDataModel: true</code> в <code>createSurface</code>, и рендерер прикладывает всю модель данных поверхности к каждому исходящему сообщению как метаданные транспорта<a class="cite" href="#src-14">14</a>. Поверх A2A это выглядит так:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Сообщение A2A с моделью данных (из документации A2UI)" data-hl="4-5">
+{
+  "parts": [{"text": "Submit the reservation"}],
+  "metadata": {
+    "a2uiClientDataModel": {
+      "version": "v0.9",
+      "surfaces": { "booking-surface": { "reservationTime": "7:00 PM", "partySize": 4, "notes": "Window seat preferred" } }
+    }
+  }
+}
+</script>
+<div class="note warn"><p>В мультиагентной схеме <code>a2uiClientDataModel</code> несёт данные <em>всех</em> поверхностей. Если оркестратор пересылает сообщение сабагенту как есть, агент погоды прочитает форму банковского перевода, которую открыл другой агент. Документация A2UI помечает очистку как обязательное требование безопасности, а в Python SDK для неё есть <code class="wrap">A2uiSubagentMap.strip_unowned_surfaces_from_data_model</code>, подключаемый как <code>ClientCallInterceptor</code><a class="cite" href="#src-14">14</a>. Протокол эту очистку не навязывает: оркестратор, написанный в лоб, утекает по умолчанию. Про устройство оркестраторов — <a href="../13-multi-agent/index.html">глава 13</a>.</p></div>
+<h3>По какому проводу это едет</h3>
+<p>A2UI не привязан к транспорту. Стабильных привязок две<a class="cite" href="#src-14">14</a>. Поверх A2A сообщения лежат в <code>DataPart</code> с MIME-типом <code>application/a2ui+json</code>, и поле <code>data</code> может содержать список сообщений, чтобы отправить несколько обновлений за один запрос; список понимает только A2A v1.0 и новее, более ранние версии ждут один объект<a class="cite" href="#src-14">14</a>. Про сами части сообщений A2A — <a href="../07-a2a/index.html">глава 7</a>. Поверх AG-UI сообщения A2UI транслируются в события AG-UI, этим занимается CopilotKit, автор AG-UI; события разобраны в <a href="../08-ag-ui/index.html">главе 8</a>. REST, WebSocket и SSE пока в планах, на месте их примеров стоит <code>// TODO: Add an example</code><a class="cite" href="#src-14">14</a>.</p>
+<p>Третий путь, поверх MCP, описан в отдельном руководстве. Шаблон экрана с привязками и без данных сервер отдаёт как MCP-ресурс под своей схемой URI, например <code>a2ui://recipe-card</code>, с типом <code>application/a2ui+json</code>. Вызов инструмента возвращает только <code>updateDataModel</code> внутри <code>EmbeddedResource</code> плюс текстовый фолбэк, а связь между ними задаётся тем же полем <code>_meta.ui.resourceUri</code>, что и в MCP Apps. Клиент один раз скачивает шаблон и дальше получает только данные<a class="cite" href="#src-15">15</a>. Каталоги согласуются один раз в <code>initialize</code> или в <code>_meta</code> каждого <code>tools/call</code>. Руководство рекомендует первый, потому что «MCP is a stateful session protocol», но в ревизии MCP 2026-07-28 рукопожатия <code>initialize</code> нет, и новым серверам остаётся второй.</p>
+</section>
+
+<section id="catalog">
+<h2>Каталог: граница доверия, написанная кодом</h2>
+<p>Проверить, что агент прислал только разрешённое, можно в два десятка строк на Python. В <code>a2ui-agent-sdk</code> 0.7.0 от 28 сентября 2026 года есть базовый каталог и валидатор, который сверяет компоненты с его JSON Schema<a class="cite" href="#src-12">12</a>. Ниже две проверки: в первой модель выдумала компонент и вариант кнопки, во второй — кнопка из начала главы.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="validate_a2ui.py — запускался: a2ui-agent-sdk 0.7.0, a2ui-core 0.2.0, Python 3.11" data-hl="4,10">
+from a2ui.basic_catalog.provider import BasicCatalog
+from a2ui.schema.catalog import A2uiCatalog
+
+catalog = A2uiCatalog.from_config(BasicCatalog.get_config("0.9.1"), version="0.9.1")
+
+
+def check(components):
+    msg = {"version": "v0.9.1",
+           "updateComponents": {"surfaceId": "booking", "components": components}}
+    for err in catalog.validate_components(msg):
+        print(err.code, err.path, "-", err.message)
+    print("---")
+
+
+# модель выдумала компонент и вариант кнопки
+check([
+    {"id": "datetime", "component": "DatePicker", "value": {"path": "/booking/date"}},
+    {"id": "t", "component": "Text", "text": "OK"},
+    {"id": "b", "component": "Button", "child": "t", "variant": "danger",
+     "action": {"event": {"name": "confirm_booking"}}},
+])
+
+# кнопка из начала главы
+check([
+    {"id": "t", "component": "Text", "text": "Подтвердить"},
+    {"id": "b", "component": "Button", "child": "t",
+     "action": {"functionCall": {"call": "openUrl",
+                                 "args": {"url": "javascript:alert(document.cookie)"}}}},
+])
+</script>
+<script type="text/plain" class="code" data-lang="output" data-title="Вывод" data-hl="5">
+unrecognized_component components.datetime.component - Unrecognized component type 'DatePicker'
+extra_field components.b - Unevaluated properties are not allowed ('action', 'child', 'component', 'variant' were unexpected)
+type_mismatch components.b.variant - 'danger' is not one of ['default', 'primary', 'borderless']
+---
+---
+</script>
+<p>Выдуманный <code>DatePicker</code> пойман: в базовом каталоге v0.9.1 восемнадцать компонентов, и такого среди них нет, есть <code>DateTimeInput</code>. Вариант <code>danger</code> тоже пойман, и в сообщении перечислены допустимые значения — ровно то, что нужно модели, чтобы исправиться. Вторая строка вывода — каскад от третьей: не сойдясь с перечислением, валидатор перестаёт узнавать и остальные поля кнопки. А кнопка с <code>javascript:</code> прошла молча. Для схемы <code>url</code> — строка, и строка на месте.</p>
+<h3>Как агент получает A2UI от модели</h3>
+<p>Валидатор — последний шаг конвейера, который в SDK 0.7.0 собран почти целиком. <code>DirectJsonFormat</code> строит системный промпт из каталога, модель вставляет интерфейс в теги <code>&lt;a2ui-json&gt;</code> посреди текста, парсер вынимает блоки и чинит висячие запятые и «умные» кавычки<a class="cite" href="#src-12">12</a>. Повторную генерацию SDK не делает, хотя спецификация её предусматривает: «the errors can be reported back to the LLM in a subsequent prompt, allowing it to self-correct»<a class="cite" href="#src-11">11</a>.</p>
+<script type="text/plain" class="code wide" data-lang="python" data-title="agent_a2ui.py — запускался с подставленными ответами модели: a2ui-agent-sdk 0.7.0" data-hl="4-8,25-28">
+from a2ui.basic_catalog.provider import BasicCatalog
+from a2ui.inference_formats.direct_json.format import DirectJsonFormat
+
+fmt = DirectJsonFormat("0.9.1", catalogs=[BasicCatalog.get_config("0.9.1")])
+system = fmt.prompt_generator.generate(
+    role_description="You are a restaurant booking assistant.",
+    allowed_components=["Column", "Text", "DateTimeInput", "Button"],
+    include_schema=True)
+catalog = fmt.prompt_generator.selected_catalog
+
+
+def extract(reply: str):
+    text, messages, errors = "", [], []
+    for part in fmt.parser.unwrap(reply):             # текст и блоки <a2ui-json>
+        text += part.text or ""
+        if part.a2ui_raw:
+            for msg in fmt.parser.compile(part.a2ui_raw):  # JSON с автопочинкой
+                messages.append(msg)
+                errors += [f"{e.code} {e.path}: {e.message}"
+                           for e in catalog.validate_components(msg)]
+    return text, messages, errors
+
+
+def generate_ui(history: list[dict], attempts: int = 3):
+    for _ in range(attempts):
+        reply = call_llm(system, history)             # твой клиент модели
+        text, messages, errors = extract(reply)
+        if not errors:
+            return text, messages
+        history += [{"role": "assistant", "content": reply},
+                    {"role": "user", "content": "Fix the A2UI errors:\n" + "\n".join(errors)}]
+    return text, []                                   # сдаёмся: только текст
+</script>
+<p><code>allowed_components</code> урезает каталог, и валидация идёт по урезанному. С четырьмя компонентами вместо восемнадцати промпт в этом запуске занял 27 тыс. символов против 40 тыс. Ответ без тегов <code>parser.unwrap</code> не пропускает, а бросает <code>A2uiParseError</code>, так что чисто текстовый ответ ловят отдельно. Для ADK вместо тегов есть инструмент <code>SendA2uiToClientToolset</code>. README пакета до сих пор называет входной точкой <code>A2uiSchemaManager</code>, но в 0.7.0 это обёртка с <code>DeprecationWarning</code><a class="cite" href="#src-12">12</a>.</p>
+<p>Рендерер агенту не доверяет и проверяет всё повторно, а о находке сообщает стандартным сообщением<a class="cite" href="#src-11">11</a>:</p>
+<script type="text/plain" class="code wide" data-lang="json" data-title="Ошибка валидации от рендерера, v0.9.1 (из спецификации протокола)">
+{"error": {"code": "VALIDATION_FAILED", "surfaceId": "user_profile_card",
+           "path": "/components/0/text", "message": "Expected stringOrPath, got integer"}}
+</script>
+<p>Это тот же вывод валидатора на другом конце провода, и его тоже стоит вернуть модели. В v1.0 у ошибок валидации три кода — <code>VALIDATION_FAILED</code>, <code>UNALLOWED_PARENT</code>, <code>UNALLOWED_CHILD</code> — с обязательными <code>surfaceId</code> и <code>path</code>, а прочие ошибки несут либо <code>surfaceId</code>, либо <code>functionCallId</code>, но не оба<a class="cite" href="#src-16">16</a>.</p>
+<h3>Что лежит в каталоге</h3>
+<p><dfn>Каталог</dfn> — это документ JSON Schema с полем <code>catalogId</code>, словарём <code>components</code>, где каждому имени компонента сопоставлена схема его свойств, списком функций и, до v1.0, блоком <code>theme</code>. Агент может ссылаться только на компоненты из согласованного каталога, всё остальное — ошибка валидации<a class="cite" href="#src-14">14</a>.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Минимальный каталог (из документации A2UI)">
+{
+  "$id": "https://github.com/.../hello_world/v1/catalog.json",
+  "catalogId": "https://github.com/.../hello_world/v1/catalog.json",
+  "components": {
+    "HelloWorldBanner": {
+      "type": "object",
+      "description": "A simple banner greeting.",
+      "properties": {
+        "message": { "type": "string", "description": "The banner text." },
+        "backgroundColor": { "type": "string", "default": "#f0f0f0" }
+      },
+      "required": ["message"]
+    }
+  }
+}
+</script>
+<p>В базовом каталоге v0.9 и v0.9.1 восемнадцать компонентов (от <code>Text</code> и <code>Button</code> до <code>Modal</code>, <code>Tabs</code> и <code>Video</code>) и четырнадцать функций: логические <code>and</code>, <code>or</code>, <code>not</code>, проверки <code>required</code>, <code>regex</code>, <code>email</code>, <code>length</code>, <code>numeric</code>, форматирование чисел, дат и валют, <code>pluralize</code> и та самая <code>openUrl</code>. Готовый каталог должен быть самодостаточным, без внешних <code>$ref</code>: так его проще целиком положить в промпт модели. Писать его можно модулями, а перед поставкой склеивать отдельным шагом сборки, в примерах проекта это скрипт <code>register-catalogs.js</code>, встроенный в сборку Xcode или Gradle<a class="cite" href="#src-14">14</a>.</p>
+<p>Единого каталога на все клиенты проект не хочет принципиально: «we do not think portability requires a standardized catalog across multiple clients; the LLM can interpret the catalog for each individual frontend»<a class="cite" href="#src-14">14</a>. Переносимость, по мнению авторов, обеспечит модель, которая прочтёт чужой каталог. На практике это значит, что вывод агента привязан к каталогу конкретного клиента, и «написал один раз, работает везде» получается, только если у клиентов общий каталог, например базовый.</p>
+<p>Раз каталог попадает в промпт, он стоит токенов. Для этого в A2UI описаны <dfn>трансформеры каталога</dfn>: правило вроде <code class="wrap">ComponentPruningTransformer</code> вырезает часть компонентов перед тем, как каталог превратится в инструкции для модели, например гостевой режим без полей ввода<a class="cite" href="#src-14">14</a>. В v1.0 у каталога появилось поле <code>instructions</code>, которое заменило внешний файл <code>rules.txt</code> с правилами дизайна для модели<a class="cite" href="#src-13">13</a>. Каталог стал одновременно схемой валидации и куском системного промпта, и его размер — вопрос контекст-инженерии из <a href="../02-context-engineering/index.html">главы 2</a>.</p>
+<h3>Почему кнопка с javascript: сработала</h3>
+<p>Схема проверяет форму, а смысл строки проверяет код, который её исполняет. Функции каталога реализует рендерер, и до июня 2026 года реализация <code>openUrl</code> в общем ядре <code>@a2ui/web_core</code> выглядела так<a class="cite" href="#src-1">1</a>:</p>
+<script type="text/plain" class="code" data-lang="typescript" data-title="@a2ui/web_core ≤ 0.10.1 (из текста advisory)" data-hl="3">
+export const OpenUrlImplementation = createFunctionImplementation(OpenUrlApi, args => {
+  if (args.url && typeof window !== 'undefined' && window.open) {
+    window.open(args.url, '_blank');
+  }
+});
+</script>
+<p>Аргумент описан как <code class="wrap">z.preprocess(v =&gt; (v === undefined ? undefined : String(v)), z.string())</code>, то есть любая строка без проверки схемы URI. Агент кладёт в <code>functionCall</code> кнопки <code>javascript:</code>-адрес, пользователь нажимает, и код выполняется в origin хоста со всеми его cookie и токенами. Уязвимость затронула рендереры на React, Lit и Angular, версии <code>web_core</code> с 0.9.0 по 0.10.1, CVSS 9.3<a class="cite" href="#src-1">1</a>.</p>
+<figure class="fig wide" id="fig-cve">
+<script type="text/x-mermaid">
+flowchart TD
+  agent["Агент под инъекцией"]:::warn --> msg["updateComponents: Button<br/>functionCall openUrl<br/>url = javascript:..."]
+  msg --> val{"Валидация<br/>по каталогу"}
+  val -- "url — строка, ок" --> btn["Рендерер рисует кнопку"]
+  btn -- "клик пользователя" --> impl["OpenUrlImplementation<br/>window.open(url)"]:::warn
+  fix1["web_core 0.10.2:<br/>только http и https"]:::ok -. "исправление" .-> impl
+  fix2["v1.0: requiresUserActivation,<br/>allowedCallers"]:::ok -. "ограничение" .-> impl
+  impl --> xss["JS в origin хоста"]:::warn
+</script>
+<figcaption>Цепочка CVE-2026-10032. Валидация по каталогу пропускает payload, потому что проверяет тип аргумента, а не его смысл. Оба исправления (зелёные) стоят в коде функции, а не в схеме: разрешённые схемы URI в реализации и ограничения вызова, объявленные в каталоге v1.0.</figcaption>
+</figure>
+<p>Исправление вошло в <code>@a2ui/web_core</code> 0.10.2: PR #1707, влит 19 июня 2026 года, разрешает только http(s). Advisory опубликовали 3 августа, через шесть недель<a class="cite" href="#src-1">1</a>. Всё это время тот, кто закрепил версию 0.9.x–0.10.1, был уязвим и не знал об этом. И ещё деталь из проверки 30 сентября 2026 года: глобальная база GitHub Advisory по <code>@a2ui/web_core</code> ничего не возвращала, запись жила только в разделе безопасности репозитория. На <code>npm audit</code>, который опирается на эту базу, здесь рассчитывать не стоит.</p>
+<p>В каталоге v1.0 <code>openUrl</code> помечена <code class="wrap">"requiresUserActivation": true</code> — вызвать её можно только из жеста пользователя, а поле <code>allowedCallers</code> со значением по умолчанию <code>rendererOnly</code> не даёт агенту вызвать функцию напрямую<a class="cite" href="#src-13">13</a>.</p>
+<div class="note key"><p>Декларативный протокол не присылает код, но каждая функция каталога — это код, который рендерер выполняет на аргументах, контролируемых агентом. Относись к ним как к публичному API: проверяй схемы URI, длины, диапазоны, и считай агента враждебным.</p></div>
+<p>Так и поступили авторы одного из сторонних рендереров, для Svelte 5. Его модель угроз начинается со слов «assumes a hostile agent»: белый список компонентов, вычистка свойств <code>on*</code> и вызовов функций, отказ от prototype pollution, экранирование текста до разметки, ограничение глубины рекурсии<a class="cite" href="#src-17">17</a>. README Python SDK предупреждает о том же: фишинг через знакомый интерфейс, скрипты в значениях свойств, раскладки, от которых клиент захлебнётся<a class="cite" href="#src-12">12</a>. Атаки через интерфейс — в <a href="../16-security/index.html">главе 16</a>.</p>
+<h3>Как каталоги должны меняться и как меняются</h3>
+<p>Правила эволюции каталога в документации A2UI стоит забрать себе для любой внутренней схемы. Изменения только добавляющие. Устаревшее не удаляется, а помечается <code>deprecated: true</code> с пояснением в <code>x-deprecated-reason</code>. Перечисления считаются открытыми, и неизвестное значение не должно ронять старый рендерер. Неизвестный компонент рисуется безопасной заглушкой, а посредники вроде оркестраторов пересылают незнакомые поля без изменений. Ломающее изменение — только с новой мажорной версией, и номер версии живёт в самом <code>catalogId</code> (<code>…/v1/catalog.json</code> → <code>…/v2/catalog.json</code>), чтобы на время миграции клиент мог объявить оба<a class="cite" href="#src-14">14</a>.</p>
+<p>Сам проект эти правила нарушил примерно через пять месяцев после запуска. В issue #1469 описано, как <code>@a2ui/react</code> 0.10.0 начал отвергать payload v0.8, который принимала 0.8.0: поле <code>MultipleChoice.selections</code> с одновременными <code>path</code> и <code>literalArray</code>. В официальной схеме v0.8 запрета на такое сочетание нет, его добавил новый валидатор рантайма. Issue закрыли со статусом «not planned»<a class="cite" href="#src-18">18</a>.</p>
+<p>Вторая беда тише. Согласование каталога идёт по точному совпадению строки <code>catalogId</code>, а у базового каталога v0.9.1 в разных местах разные строки.</p>
+<table class="wide">
+<thead><tr><th>Где</th><th>Строка <code>catalogId</code></th></tr></thead>
+<tbody>
+<tr><td>Файл каталога v0.9.1 (<code>$id</code> и <code>catalogId</code>)</td><td><code class="wrap">https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json</code></td></tr>
+<tr><td>Пример на странице What is A2UI</td><td><code class="wrap">https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json</code></td></tr>
+<tr><td><code class="wrap">BasicCatalog.get_catalog_id("0.9.1")</code> в SDK 0.7.0</td><td><code class="wrap">https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json</code></td></tr>
+<tr><td>Руководство A2UI over MCP</td><td><code class="wrap">https://a2ui.org/specification/v0_9/basic_catalog.json</code></td></tr>
+</tbody>
+</table>
+<p>Третья строка таблицы проверена запуском: хелпер SDK возвращает URL с <code>v0_9_1</code>, а каталог, который тот же SDK загружает для версии 0.9.1, объявляет о себе URL с <code>v0_9</code><a class="cite" href="#src-11">11</a><a class="cite" href="#src-15">15</a>. Если агент сверяет одну строку, а рендерер объявляет другую, согласование не находит общего каталога, и агент по правилам протокола просто не присылает интерфейс. Без ошибки. Бери <code>catalogId</code> из файла каталога, который реально загружает рендерер, логируй выбранный id при каждом <code>createSurface</code> и держи сквозной тест на согласование. В v1.0 <code>catalogId</code> стал произвольной строкой, и спецификация советует начинать его со своего домена, вроде <code>mycompany.com:somecatalog</code><a class="cite" href="#src-16">16</a>.</p>
+</section>
+
+<section id="versions">
+<h2>Три поколения за год</h2>
+<p>В треде запуска A2UI на Hacker News в декабре 2025 года пользователь pscanf написал про всю волну UI-протоколов: «In 6 months time half of them will have been abandoned, and the other half will have morphed into something very different and incompatible»<a class="cite" href="#src-10">10</a>. Через полгода половина будет брошена, а вторая превратится во что-то совсем другое и несовместимое. Про сам A2UI он угадал вторую половину: протокол жив, но за девять месяцев формат его сообщений менялся дважды. Вот та же форма бронирования в первой публичной версии, v0.8:</p>
+<script type="text/plain" class="code wide" data-lang="json" data-title="Форма бронирования в v0.8 (из What is A2UI)" data-hl="2,5,8">
+{"surfaceUpdate":{"surfaceId":"booking","components":[
+  {"id":"title","component":{"Text":{"text":{"literalString":"Book Your Table"},"usageHint":"h1"}}},
+  {"id":"datetime","component":{"DateTimeInput":{"value":{"path":"/booking/date"},"enableDate":true}}},
+  {"id":"submit-text","component":{"Text":{"text":{"literalString":"Confirm"}}}},
+  {"id":"submit-btn","component":{"Button":{"child":"submit-text","action":{"name":"confirm_booking"}}}}
+]}}
+{"dataModelUpdate":{"surfaceId":"booking","contents":[
+  {"key":"booking","valueMap":[{"key":"date","valueString":"2025-12-16T19:00:00Z"}]}
+]}}
+{"beginRendering":{"surfaceId":"booking","root":"title"}}
+</script>
+<p>Тип компонента здесь ключ объекта-обёртки, строка обёрнута в <code>{"literalString": …}</code>, данные идут массивом пар <code>key</code>/<code>valueString</code>, а корень объявлен в отдельном сообщении. Руководство по переходу на v0.9 объясняет, откуда это взялось и почему от этого отказались. v0.8 проектировали так, чтобы его генерировала модель в режиме structured output, «above all else»: все формы должны были выражаться урезанным подмножеством JSON Schema, которое понимают движки структурированного вывода. v0.9 проектировали так, чтобы его можно было целиком положить в системный промпт. Прежние формы, по словам авторов, были «definable in the limited schema features but often confusing for an LLM to generate»<a class="cite" href="#src-13">13</a>.</p>
+<table>
+<thead><tr><th>v0.8</th><th>v0.9 и v0.9.1</th></tr></thead>
+<tbody>
+<tr><td><code>beginRendering</code> с полем <code>root</code></td><td><code>createSurface</code>, корень — компонент с <code>id: "root"</code></td></tr>
+<tr><td><code>surfaceUpdate</code>, <code>dataModelUpdate</code></td><td><code>updateComponents</code>, <code>updateDataModel</code> с JSON Pointer</td></tr>
+<tr><td><code class="wrap">"component": {"Text": {…}}</code></td><td><code>"component": "Text"</code> и свойства рядом</td></tr>
+<tr><td><code>{"literalString": "…"}</code>, <code>valueMap</code></td><td>обычные строки и обычный JSON</td></tr>
+<tr><td><code>usageHint</code>, <code>primary: true</code></td><td><code>variant</code> со значениями из перечисления</td></tr>
+<tr><td><code>MultipleChoice</code>, <code>TextField.text</code></td><td><code>ChoicePicker</code>, <code>TextField.value</code></td></tr>
+<tr><td>сообщение <code>userAction</code></td><td>сообщение <code>action</code></td></tr>
+</tbody>
+</table>
+<p>Версия 0.9 вышла 17 апреля 2026 года. Вместе с ней стандартный каталог переименовали в базовый, появилась общая библиотека <code>web_core</code> для веб-рендереров и пакет <code>a2ui-agent-sdk</code> на PyPI<a class="cite" href="#src-19">19</a>. Каталог <code>specification/v0_9_1</code> появился в репозитории 29 мая<a class="cite" href="#src-20">20</a>. Это патч, совместимый с v0.9: схемы принимают <code>"version"</code> со значением и <code>"v0.9"</code>, и <code>"v0.9.1"</code>. В нём MIME-тип закрепили как <code>application/a2ui+json</code> вместо прежнего <code>application/json+a2ui</code>, а требование уникальности <code>surfaceId</code> ослабили до «уникален среди активных поверхностей»<a class="cite" href="#src-13">13</a>.</p>
+<h3>v1.0: кандидат, который продолжает меняться</h3>
+<p>Каталог <code>specification/v1_0</code> создан 8 июня 2026 года, в README сказано, что раньше эта версия называлась 0.10. Ярлык release candidate вводит в заблуждение: крупные вещи пришли уже после него. 23 июля «клиент» и «сервер» переименовали в «рендерер» и «агента» по всей спецификации, вплоть до имён файлов схем. 29 июля разрешили смешивать каталоги в одной поверхности, 4 августа появились ограничения <code>allowedParents</code> и корневой компонент <code>Surface</code>, 12 августа — двусторонний RPC и поле <code>userMessage</code> у действий. 29 сентября изменение про зарезервированные ключи с префиксом <code>@</code> влили и откатили в тот же день<a class="cite" href="#src-20">20</a>.</p>
+<p>Для того, кто будет мигрировать, важны изменения, которые ломают поведение без смены формы сообщений<a class="cite" href="#src-13">13</a>:</p>
+<ul>
+<li>В <code>updateDataModel</code> поле <code>value</code> стало обязательным. Удаление ключа теперь <code>"value": null</code>, а сообщение без <code>value</code> — ошибка схемы. В v0.9 то же сообщение удаляло ключ.</li>
+<li><code>surfaceId</code> снова обязан быть уникальным за всё время жизни рендерера: v0.9.1 это правило ослабила, v1.0 вернула. Создать поверхность с id, который уже был, без предварительного <code>deleteSurface</code> — ошибка.</li>
+<li><code>theme</code> и <code>primaryColor</code> удалены из каталога и из <code>createSurface</code> без замены: оформление целиком принадлежит хосту. Заменявшее их поле <code>surfaceProperties</code> успели добавить в черновик и убрать 31 июля<a class="cite" href="#src-20">20</a>.</li>
+<li><code>createSurface</code> может сразу нести <code>components</code> и <code>dataModel</code>, то есть весь экран одним сообщением.</li>
+<li>Каталоги v0.9 не работают с рантаймом v1.0 напрямую. <code>functions</code> стал словарём «имя → определение», в метаданных каталога нужен <code>"protocolVersion": "1.0"</code> (без него каталог считается v0.9), имена компонентов и функций обязаны подчиняться правилам идентификаторов Unicode UAX #31.</li>
+<li>Компонент ищется сначала по своему <code>catalogId</code>, потом по каталогу поверхности, и если не нашёлся, рендерер его не рисует: «There is no fallback to catalogs advertised in capabilities». Смешивать в поверхности можно только каталоги одной версии протокола.</li>
+</ul>
+<p>Самая показательная история — с <code>actionResponse</code>. В черновике v1.0 у события кнопки были поля <code>wantResponse</code> и <code>responsePath</code>, а агент отвечал отдельным сообщением <code>actionResponse</code>: синхронный вызов из интерфейса в агента. 27 июля 2026 года issue #2104 предложил заменить эту конструкцию функциями, объявленными в каталоге<a class="cite" href="#src-18">18</a>, и 12 августа в спецификацию вошли четыре сообщения двустороннего RPC<a class="cite" href="#src-20">20</a>. Схемы v1.0 сегодня разрешают от агента к рендереру ровно <code>createSurface</code>, <code>updateComponents</code>, <code>updateDataModel</code>, <code>deleteSurface</code>, <code>callRendererFunction</code> и <code>agentFunctionResponse</code>, а в обратную сторону — <code>action</code>, <code>callAgentFunction</code>, <code>rendererFunctionResponse</code> и <code>error</code><a class="cite" href="#src-16">16</a>. <code>actionResponse</code> там нет. При этом главная страница документации и обзор концепций до сих пор обещают «client-to-server RPC (<code>actionResponse</code>)»<a class="cite" href="#src-11">11</a>.</p>
+<script type="text/plain" class="code wide" data-lang="json" data-title="Набросок по схемам v1.0: вызов функции агента и отказ рендерера" data-hl="1,3">
+{"version":"v1.0","callAgentFunction":{"surfaceId":"booking","functionCallId":"fc-17","callFunction":{"call":"checkAvailability","args":{"date":"2026-10-02","guests":4}}}}
+{"version":"v1.0","agentFunctionResponse":{"functionCallId":"fc-17","value":{"available":true,"slots":["19:00","21:30"]}}}
+{"version":"v1.0","callRendererFunction":{"functionCallId":"fc-18","callFunction":{"call":"openUrl","catalogId":"mycompany.com:booking","args":{"url":"https://example.com"}}}}
+{"version":"v1.0","error":{"code":"INVALID_FUNCTION_CALL","functionCallId":"fc-18","message":"openUrl is rendererOnly"}}
+</script>
+<p>Каждый вызов несёт <code>functionCallId</code>, и ответная сторона обязана скопировать его в ответ. В <code>callRendererFunction</code> поле <code>catalogId</code> обязательно. Ответ содержит либо <code>value</code>, либо <code>error</code> с <code>code</code> и <code>message</code>. Кто может вызывать функцию, в сообщении не пишется: это поле <code>allowedCallers</code> в определении функции в каталоге, со значениями <code>rendererOnly</code>, <code>agentOnly</code> и <code>rendererOrAgent</code>. Рендерер, получивший удалённый вызов функции с <code>rendererOnly</code> или незарегистрированной функции, отвечает ошибкой <code>INVALID_FUNCTION_CALL</code><a class="cite" href="#src-13">13</a>.</p>
+<figure class="fig wide" id="fig-v1-rpc">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Пользователь
+  participant R as Рендерер
+  participant A as Агент
+  U->>R: клик по кнопке
+  R->>A: action {name, context} без ответа
+  R->>A: callAgentFunction {functionCallId fc-17}
+  A-->>R: agentFunctionResponse {fc-17, value}
+  A->>R: callRendererFunction {fc-18, catalogId}
+  R->>R: allowedCallers из каталога
+  alt функция rendererOnly или неизвестна
+    R-->>A: error INVALID_FUNCTION_CALL {fc-18}
+  else вызов агентом разрешён
+    R-->>A: rendererFunctionResponse {fc-18, value}
+  end
+</script>
+<figcaption>Двусторонний RPC в A2UI v1.0. Запрос и ответ связаны <code>functionCallId</code>, права на вызов живут в каталоге, а не в сообщении. <code>action</code> по-прежнему уходит без ответа; черновой <code>actionResponse</code>, который делал из события синхронный вызов, из спецификации убран.</figcaption>
+</figure>
+<p>Рендереры за спецификацией не успевают. У всех поддерживаемых проектом рендереров — React, Lit, Angular, Flutter — v1.0 значится как «🚧 Planned»<a class="cite" href="#src-17">17</a>. Официальный рендерер для Jetpack Compose от Android (<code>androidx.a2ui</code>) в статусе alpha и поддерживает v0.9.1<a class="cite" href="#src-21">21</a>. Официального SwiftUI-рендерера нет вовсе: в таблице проекта он значится только как «Planned» для v1.0. Стабильный мобильный путь от проекта один — Flutter GenUI SDK, а на iOS без Flutter есть лишь сторонние <code>a2ui-swift</code> и <code>AGenUI</code> с общим ядром на C++ для iOS, Android и HarmonyOS<a class="cite" href="#src-17">17</a>. Из сторонних v1.0 умеют рендерер для Svelte 5 и <code>uny/a2ui-compose</code>, причём последний только её<a class="cite" href="#src-17">17</a>.</p>
+<ol class="timeline">
+  <li><time>6 октября 2025</time><p>OpenAI показывает Apps SDK на DevDay.</p></li>
+  <li><time>18 ноября 2025</time><p>Google Research публикует Generative UI: страницы целиком пишет Gemini 3.</p></li>
+  <li class="is-major"><time>21 ноября 2025</time><p>Предложение MCP Apps (SEP-1865) от мейнтейнеров MCP из Anthropic и OpenAI и авторов MCP-UI.</p></li>
+  <li class="is-major"><time>15 декабря 2025</time><p>Google анонсирует A2UI v0.8 с рендерерами для Flutter, Web Components и Angular.</p></li>
+  <li class="is-major"><time>26 января 2026</time><p>MCP Apps получает статус Stable; интерактивные коннекторы в Claude.</p></li>
+  <li><time>17 апреля 2026</time><p>A2UI v0.9: базовый каталог, <code>web_core</code>, Python SDK.</p></li>
+  <li><time>8 июня 2026</time><p>Появляется v1.0 RC, дальше в него месяц за месяцем приходят крупные изменения.</p></li>
+  <li><time>28 июля 2026</time><p>Ревизия MCP 2026-07-28 без <code>initialize</code> и без состояния.</p></li>
+  <li class="is-major"><time>3 августа 2026</time><p>Advisory CVE-2026-10032 про <code>openUrl</code>.</p></li>
+  <li><time>8 сентября 2026</time><p>SDK <code>ext-apps</code> 2.0.0; OpenUI выпускает модель OUI-1.</p></li>
+  <li><time>29 сентября 2026</time><p>OpenAI публикует MCP Extensions поверх MCP Apps.</p></li>
+</ol>
+<p>Параллельно проект пробует уйти от JSON как формата генерации. <dfn>A2UI Express</dfn> — компактный позиционный синтаксис, который пишет модель, а компилятор на стороне хоста превращает в обычные сообщения v1.0. Это предложение, оно включается флагом <code>A2UI_EXPRESS_ENABLED=true</code><a class="cite" href="#src-22">22</a>. В пакете <code>a2ui-agent-sdk</code> 0.7.0 рядом с Express лежат ещё два экспериментальных формата, Elemental и Atom. Кусок контракта из промпта Express:</p>
+<script type="text/plain" class="code" data-lang="prompt" data-title="Правила A2UI Express (из предложения в репозитории A2UI)">
+header = ComponentA(prop1="val1")
+root = ComponentB([header, ComponentC("Click", action=Event("submit"))])
+...
+6. Data bindings: prefix absolute paths in the data model with '$', e.g., $/user/firstName.
+7. Logic and validation: prefix client check rules with '?', e.g., ?required or ?regex("^[0-9]{5}$").
+8. Action events: represent server-side actions using the Event helper:
+   Event("save_deal", {rep: $/form/rep})
+</script>
+<p>Соседнее предложение, Markdown Profile (issue #2173 от 5 августа 2026 года), встраивает поверхности блоками <code>&lt;a2ui-express&gt;</code> и <code>&lt;a2ui-json&gt;</code> прямо в Markdown-сообщения чата. Цель — фреймворки, которые хранят историю только текстом: чтобы интерфейс переживал сохранение переписки<a class="cite" href="#src-18">18</a>. Та же мысль у OpenUI: модели пишут JSON дорого и с ошибками, поэтому им дают язык попроще, а JSON собирают детерминированно. Сравни Express с куском из блога OpenUI<a class="cite" href="#src-23">23</a>: присваивание переменным, позиционные аргументы, <code>$</code> для привязок. Два независимых проекта пришли к одной форме.</p>
+<script type="text/plain" class="code wide" data-lang="text" data-title="OpenUI Lang (из блога OpenUI «Stop making AI write JSON», сокращено)">
+root = Stack([CardHeader("Todos"), Stack([Input("title", $title, "What needs to be done?"), submitBtn], "row"), tbl, footer])
+todos = Query("list_todos", {}, {rows: []})
+createResult = Mutation("create_todo", {title: $title})
+submitBtn = Button("Add", Action([@Run(createResult), @Run(todos), @Reset($title)]))
+</script>
+<div class="note practice"><p>Строй на v0.9.1 и закрепи версии рендерера и SDK. Пиши код против файлов <code class="wrap">specification/*/json/*.json</code>, а не против страниц документации: в документации сейчас живут и <code>actionResponse</code>, и потерянный <code>root</code>, и чужой <code>catalogId</code>. Разбирай входящие сообщения по полю <code>version</code> и держи тонкий адаптер между протоколом и своим кодом, чтобы переход на v1.0 касался одного модуля: удаления через <code>null</code>, уникальности <code>surfaceId</code> и пропавшей <code>theme</code>. Переходить стоит, когда твой рендерер объявит поддержку v1.0, не раньше.</p></div>
+</section>
+
+<section id="mcp-apps">
+<h2>MCP Apps: HTML в клетке</h2>
+<p>Вот что сообщает о себе сервер из квикстарта FastMCP 4.0.10, где инструмент возвращает таблицу и круговую диаграмму. Вывод получен запуском, пример сокращён до трёх сотрудников вместо семи.</p>
+<div class="tabs">
+  <section data-tab="tools/list">
+  <script type="text/plain" class="code" data-lang="json" data-title="Инструмент в ответе tools/list" data-hl="6">
+  {
+    "name": "team_directory",
+    "title": "Team Directory",
+    "description": "Browse the team directory.",
+    "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}},
+    "_meta": {"ui": {"resourceUri": "ui://prefab/tool/8c857f49be27/renderer.html"}}
+  }
+  </script>
+  </section>
+  <section data-tab="resources/read">
+  <script type="text/plain" class="code" data-lang="json" data-title="Ресурс, на который он ссылается" data-hl="3,4">
+  {
+    "uri": "ui://prefab/tool/8c857f49be27/renderer.html",
+    "mimeType": "text/html;profile=mcp-app",
+    "_meta": {"ui": {"csp": {"resourceDomains": ["https://cdn.jsdelivr.net"]}}},
+    "text": "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">..."
+  }
+  </script>
+  </section>
+  <section data-tab="tools/call">
+  <script type="text/plain" class="code" data-lang="json" data-title="Результат вызова (сокращён)" data-hl="2,3">
+  {
+    "content": [{"type": "text", "text": "[Rendered Prefab UI]"}],
+    "structuredContent": {
+      "$prefab": {"version": "0.3"},
+      "view": {"type": "Div", "children": [{"type": "Column", "children": [
+        {"type": "Grid", "columnTemplate": "1fr 2fr", "children": [
+          {"type": "PieChart", "data": [{"office": "London", "count": 1}], "dataKey": "count"},
+          {"type": "DataTable", "columns": [{"key": "name", "header": "Name"}], "search": true}
+        ]}]}]}
+    },
+    "isError": false
+  }
+  </script>
+  </section>
+</div>
+<p>Весь интерфейс сервер объявил заранее. Инструмент ссылается на ресурс по схеме <code>ui://</code>, ресурс — 471 байт HTML с пустым <code>&lt;div id="root"&gt;</code>, скриптом и стилями с jsDelivr. Отсюда домен <code>https://cdn.jsdelivr.net</code> в метаданных ресурса: без него хост не выпустит страницу за скриптом. Результат вызова несёт данные для отрисовки в <code>structuredContent</code> и строку <code>[Rendered Prefab UI]</code> в <code>content</code>. Эту строку и видит модель.</p>
+<p>Так работает <dfn>MCP Apps</dfn>, расширение MCP с идентификатором <code class="wrap">io.modelcontextprotocol/ui</code>, описанное в SEP-1865. Ресурс — обычный ресурс MCP с MIME-типом <code>text/html;profile=mcp-app</code>, инструмент ссылается на него полем <code>_meta.ui.resourceUri</code>, хост читает его стандартным <code>resources/read</code> и показывает в песочнице. С песочницей хост разговаривает по JSON-RPC 2.0 поверх <code>postMessage</code>, то есть на диалекте самого MCP: View ведёт себя как MCP-клиент, а хост как сервер, который проксирует настоящий<a class="cite" href="#src-6">6</a>. Предложение вышло 21 ноября 2025 года, и в коде из того анонса стоял MIME-тип <code>text/html+mcp</code><a class="cite" href="#src-24">24</a>; в спецификацию вошёл <code>text/html;profile=mcp-app</code>, и старые примеры с первым вариантом стоит читать с поправкой. 26 января 2026 года спецификация получила статус Stable, и в блоге MCP её назвали готовой к продакшену<a class="cite" href="#src-25">25</a>. Протокол MCP в целом разобран в <a href="../05-mcp/index.html">главе 5</a>, здесь только то, что добавляет расширение.</p>
+<p>Ресурсы объявляются заранее, а не приходят внутри результата, чтобы хост мог скачать шаблон до вызова, закешировать и проверить его до показа. Встраивание HTML прямо в результат, как делал MCP-UI, отложили из-за проверки и производительности. Внешние URL в iframe тоже отложили, «due to concerns around model visibility, inability to screenshot content, and review process»<a class="cite" href="#src-6">6</a>. Так что утверждение из README CopilotKit, будто с MCP Apps «сервер возвращает URL для iframe»<a class="cite" href="#src-3">3</a>, неверно: в стабильной спецификации есть только HTML-ресурсы.</p>
+<h3>Жизненный цикл View</h3>
+<figure class="fig wide" id="fig-apps-lifecycle">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant H as Хост
+  participant P as Sandbox proxy
+  participant V as View
+  participant S as MCP-сервер
+  Note over H,S: вызов тула и загрузка UI идут параллельно
+  H->>S: tools/call (у тула есть _meta.ui)
+  P->>H: sandbox-proxy-ready
+  H->>P: sandbox-resource-ready {html}
+  V->>H: ui/initialize {appCapabilities}
+  H-->>V: McpUiInitializeResult {hostContext}
+  V->>H: ui/notifications/initialized
+  H-->>V: tool-input-partial (0..n раз)
+  H-->>V: tool-input {arguments}
+  S-->>H: CallToolResult
+  H-->>V: tool-result {structuredContent}
+  V->>H: tools/call по клику пользователя
+  H->>S: tools/call, если visibility разрешает
+  V->>H: ui/update-model-context
+  H->>V: ui/resource-teardown
+</script>
+<figcaption>Жизненный цикл View в веб-хосте по SEP-1865. Proxy прозрачно пересылает всё между хостом и View, кроме своих сообщений <code class="wrap">ui/notifications/sandbox-*</code>. До <code>initialized</code> хост не имеет права ничего слать во View; частичные аргументы приходят раньше полных и годятся только для предпросмотра.</figcaption>
+</figure>
+<p>Вызов инструмента и загрузка интерфейса идут параллельно. View первым делом шлёт <code>ui/initialize</code> со своими возможностями: умеет ли он отдавать собственные инструменты, какие режимы показа поддерживает (<code>inline</code>, <code>fullscreen</code>, <code>pip</code>). В ответ хост присылает <code>hostContext</code>: описание вызова, который породил View, тему, CSS-переменные для оформления, режим показа, размеры контейнера, локаль, часовой пояс, платформу. После <code class="wrap">ui/notifications/initialized</code> хост может досылать аргументы: сначала ноль или больше <code>tool-input-partial</code>, пока модель ещё генерирует вызов, потом ровно один <code>tool-input</code> с полными аргументами, потом <code>tool-result</code> или <code>tool-cancelled</code><a class="cite" href="#src-6">6</a>.</p>
+<p>Первые грабли автора View — размер. <code>containerDimensions</code> задаётся по каждой оси либо жёстко (<code>height</code>, <code>width</code>), либо потолком (<code>maxHeight</code>, <code>maxWidth</code>). Во втором случае хост «MUST listen for <code>ui/notifications/size-changed</code>», а View на SDK шлёт это уведомление сам через ResizeObserver, если не выключен <code>autoResize</code>. Полноэкранный режим View просит запросом <code>ui/request-display-mode</code>, и хост возвращает режим, который получился на деле, а не тот, что просили<a class="cite" href="#src-6">6</a>.</p>
+<p>Частичные аргументы спецификация описывает честно: это «best-effort recovery of incomplete JSON», хост может закрыть незакрытые скобки и прислать то, что получилось. View такие данные можно показывать, но «MUST NOT rely on partial arguments for critical operations»<a class="cite" href="#src-6">6</a>. Скелетон карточки из частичных аргументов нарисовать можно, а списать деньги по ним нельзя.</p>
+<p>Дальше пользователь работает с интерфейсом, и View может попросить хост о нескольких вещах. <code>tools/call</code> хост перешлёт на сервер, если инструмент это разрешает. <code>ui/message</code> добавляет в чат сообщение от имени пользователя, и хост может спросить согласия. <code>ui/open-link</code> открывает ссылку в браузере хоста. <code>ui/update-model-context</code> меняет то, что модель увидит на следующем ходе<a class="cite" href="#src-6">6</a>:</p>
+<div class="tabs">
+  <section data-tab="update-model-context">
+  <script type="text/plain" class="code" data-lang="typescript" data-title="Запрос View → хост (из спецификации)">
+  {
+    jsonrpc: "2.0",
+    id: 3,
+    method: "ui/update-model-context",
+    params: {
+      content?: ContentBlock[],
+      structuredContent?: Record<string, unknown>
+    }
+  }
+  </script>
+  </section>
+  <section data-tab="tool-result">
+  <script type="text/plain" class="code" data-lang="json" data-title="Набросок: результат FastMCP, доставленный во View">
+  {
+    "jsonrpc": "2.0",
+    "method": "ui/notifications/tool-result",
+    "params": {
+      "content": [{"type": "text", "text": "[Rendered Prefab UI]"}],
+      "structuredContent": {"$prefab": {"version": "0.3"}, "view": {"type": "Div", "children": ["..."]}},
+      "isError": false
+    }
+  }
+  </script>
+  </section>
+</div>
+<p>Каждый <code>ui/update-model-context</code> перезаписывает предыдущий, и если до следующего сообщения пользователя их пришло несколько, хост должен передать модели только последний. Всё, что пользователь сделал внутри iframe — отфильтровал таблицу, выбрал строку, — модель не видит, пока View сам не сообщит. Она видит результат инструмента, в нашем примере строку <code>[Rendered Prefab UI]</code>, а получит ли ещё и <code>structuredContent</code>, решает хост.</p>
+<h3>Двойной iframe и CSP</h3>
+<p>Если хост — веб-страница, между ней и View обязан стоять промежуточный iframe, <dfn>sandbox proxy</dfn>. Требования спецификации короткие: у хоста и proxy разные origin, у proxy есть права <code>allow-scripts</code> и <code>allow-same-origin</code>, proxy сообщает о готовности, получает от хоста сырой HTML и загружает его во внутренний iframe с CSP, собранной из метаданных ресурса<a class="cite" href="#src-6">6</a>. Настольные хосты могут рисовать View напрямую.</p>
+<figure class="fig wide" id="fig-sandbox">
+<svg class="diagram" viewBox="0 0 1000 350" role="img" aria-label="Страница хоста, sandbox proxy и View, вложенные друг в друга">
+  <rect class="box--soft" x="20" y="20" width="960" height="310" rx="8"/>
+  <text class="t-title" x="40" y="48">Страница хоста, origin A</text>
+  <rect class="box" x="40" y="70" width="230" height="240" rx="6"/>
+  <text class="t-title" x="56" y="98">Мост хоста</text>
+  <text class="t-sub" x="56" y="124">AppBridge из SDK ext-apps</text>
+  <text class="t-sub" x="56" y="148">проверяет методы и id</text>
+  <text class="t-sub" x="56" y="172">шлёт tools/call на сервер</text>
+  <text class="t-sub" x="56" y="196">не пускает тулы без app</text>
+  <text class="t-sub" x="56" y="220">строит CSP из _meta.ui</text>
+  <text class="t-sub" x="56" y="244">может спросить согласия</text>
+  <rect class="box--violet" x="370" y="70" width="590" height="240" rx="6"/>
+  <text class="t-title" x="390" y="98">Sandbox proxy, iframe с origin B, не равным A</text>
+  <text class="t-mono" x="390" y="122">sandbox="allow-scripts allow-same-origin"</text>
+  <text class="t-sub" x="390" y="144">пересылает всё, кроме ui/notifications/sandbox-*</text>
+  <rect class="box--warn" x="390" y="160" width="550" height="135" rx="6"/>
+  <text class="t-title" x="410" y="186">View: HTML сервера во внутреннем iframe (srcdoc)</text>
+  <text class="t-mono" x="410" y="210">sandbox="allow-scripts allow-forms allow-popups allow-modals"</text>
+  <text class="t-sub" x="410" y="234">без allow-same-origin: свой origin, нет cookie и localStorage</text>
+  <text class="t-sub" x="410" y="256">CSP из _meta.ui.csp, без объявлений сеть закрыта</text>
+  <text class="t-red" x="410" y="280">scripts + same-origin здесь означают побег из песочницы</text>
+  <path class="arrow arrow--both" d="M272,200 L368,200"/>
+  <text class="t-mono" x="320" y="190" text-anchor="middle">postMessage</text>
+</svg>
+<figcaption>Три слоя изоляции MCP Apps в веб-хосте. Proxy живёт на другом origin, чем хост, и потому может иметь <code>allow-same-origin</code>, не получая доступа к странице хоста. Внутренний iframe с кодом сервера этого права лишён: сочетание <code>allow-scripts</code> и <code>allow-same-origin</code> позволило бы скрипту снять с себя атрибут sandbox.</figcaption>
+</figure>
+<p>Вся конструкция держится на одном правиле: внутренний iframe не получает <code>allow-same-origin</code>. Руководство A2UI, где используется та же схема, объясняет причину: «any iframe with <code>allow-scripts</code> and <code>allow-same-origin</code> can escape its sandbox by programmatically interacting with its parent DOM or removing its own sandbox attribute»<a class="cite" href="#src-26">26</a>. Шаблон «iframe с sandbox», скопированный из другого проекта, может содержать оба флага: для собственного кода это допустимо, для кода чужого сервера — нет. Цена правила — у View уникальный непрозрачный origin, и в нём нет <code>localStorage</code>, <code>sessionStorage</code>, IndexedDB и cookie. Состояние хранят на сервере или просят у хоста.</p>
+<p>Сеть View закрыта по умолчанию. Если сервер не объявил <code>ui.csp</code>, хост обязан применить такую политику<a class="cite" href="#src-6">6</a>:</p>
+<script type="text/plain" class="code" data-lang="text" data-title="CSP по умолчанию (из спецификации 2026-01-26)">
+default-src 'none';
+script-src 'self' 'unsafe-inline';
+style-src 'self' 'unsafe-inline';
+img-src 'self' data:;
+media-src 'self' data:;
+connect-src 'none';
+</script>
+<p>Объявленные домены разложены по четырём спискам: <code>connectDomains</code> для запросов, <code>resourceDomains</code> для скриптов, стилей и картинок, <code>frameDomains</code> для вложенных iframe, <code>baseUriDomains</code> для <code>&lt;base&gt;</code>. Хост может политику ужесточить, но «MUST NOT allow undeclared domains». В черновике спецификации в блок по умолчанию добавлен <code>object-src 'none'</code>, это пришло с релизом SDK 1.7.5 от 23 июля 2026 года<a class="cite" href="#src-27">27</a>. Поле <code>permissions</code> превращается в атрибут <code>allow</code> для камеры, микрофона, геолокации и записи в буфер обмена. А поле <code>domain</code> просит у хоста стабильный выделенный origin для View, например <code class="wrap">a904794854a047f6.claudemcpcontent.com</code> или <code class="wrap">www-example-com.oaiusercontent.com</code>: он нужен, когда View проходит OAuth, ходит в API с CORS или с ключом, привязанным к домену<a class="cite" href="#src-6">6</a>.</p>
+<div class="note field">
+<blockquote>I was just tinkering around with MCP Apps the other day, and I had a really hard time serving images (this is for rendering in VSCode Copilot).
+<footer>— JambalayaJimbo, <a href="https://news.ycombinator.com/item?id=47939079">Hacker News, 29 апреля 2026</a></footer></blockquote>
+<p>Вопрос задан в треде про DOOM, запущенный как MCP App в ChatGPT и Claude<a class="cite" href="#src-28">28</a>. Модель CSP с объявлением доменов заранее не мешает текстовым виджетам и сразу бьёт по приложениям с картинками, шрифтами и медиа с чужих CDN: каждый источник надо перечислить, а хосты различаются тем, что они реально разрешают.</p>
+</div>
+<p>Писать транспорт руками спецификация разрешает и даже показывает, как. Копировать этот пример нельзя:</p>
+<script type="text/plain" class="code" data-lang="typescript" data-title="Фрагмент примера из спецификации 2026-01-26" data-hl="4,6,20">
+let nextId = 1;
+function sendRequest(method: string, params: any) {
+  const id = nextId++;
+  window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, '*');
+  return new Promise((resolve, reject) => {
+    window.addEventListener('message', function listener(event) {
+      const data: JSONRPCMessage = event.data;
+      if (event.data?.id === id) {
+        // ...
+      }
+    });
+  });
+}
+// ...
+const initializeResult = await sendRequest("initialize", {
+  capabilities: {},
+  clientInfo: {name: "My UI", version: "1.0.0"},
+  protocolVersion: "2026-01-26",
+});
+</script>
+<div class="note warn"><p>В этом примере три ошибки. Сообщения уходят с целевым origin <code>'*'</code>, обработчик не проверяет <code>event.source</code> и <code>event.origin</code>, то есть принимает сообщения от любого окна, а метод назван <code>initialize</code>, хотя везде в той же спецификации рукопожатие View — <code>ui/initialize</code>. Бери классы <code>App</code> и <code>AppBridge</code> из <code class="wrap">@modelcontextprotocol/ext-apps</code>, которые делают эти проверки, или хотя бы шли сообщения на известный origin родителя и сверяй источник входящих.</p></div>
+<h3>Что изменилось после Stable</h3>
+<p>Стабильная версия спецификации датирована 26 января, а работа продолжается в черновике<a class="cite" href="#src-29">29</a>. Самое заметное: инструменты теперь ходят в обе стороны, и хост может вызывать инструменты, которые зарегистрировал сам View. Обоснование в тексте — «Without tool registration, apps are opaque to the model». Там же предупреждение: iframe могут снести в любой момент, поэтому долгую работу View должен отдавать серверу. Черновик добавляет <code>sampling/createMessage</code> из View с требованием к хосту ограничивать частоту, стоимость и спрашивать пользователя, <code>ui/download-file</code> (в песочнице нет <code>allow-downloads</code>, скачать файл напрямую нельзя), <code class="wrap">ui/notifications/request-teardown</code> для кнопки «Готово» и метаданные <code>_meta.ui</code> прямо в <code>resources/list</code>, чтобы хост мог проверить CSP при подключении. Реализуют ли это ChatGPT и Claude, в открытых источниках на конец сентября 2026 года не видно.</p>
+<p>Вокруг расширения поменялся сам MCP: в ревизии 2026-07-28 рукопожатия <code>initialize</code> больше нет<a class="cite" href="#src-30">30</a>, подробности — в <a href="../05-mcp/index.html">главе 5</a>. Рукопожатие <code>ui/initialize</code> внутри iframe от ядра не зависит, а вот объявление поддержки расширения спецификация по-прежнему показывает через <code>initialize</code>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Хост объявляет поддержку MCP Apps (из спецификации 2026-01-26)" data-hl="6-8">
+{
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {
+      "extensions": {
+        "io.modelcontextprotocol/ui": {
+          "mimeTypes": ["text/html;profile=mcp-app"]
+        }
+      }
+    },
+    "clientInfo": { "name": "claude-desktop", "version": "1.0.0" }
+  }
+}
+</script>
+<p>Как этот же сигнал передаётся в ревизии без <code>initialize</code>, на 30 сентября 2026 года не описано ни в стабильной спецификации расширения, ни в черновике<a class="cite" href="#src-29">29</a>, так что не строй логику на единственном способе узнать о поддержке. Если хост MCP Apps не поддерживает, инструмент работает как обычный, с текстовым фолбэком<a class="cite" href="#src-6">6</a>, поэтому текст в <code>content</code> должен быть осмысленным сам по себе. Черновик советует серверу проверить возможности клиента хелпером <code>getUiCapability</code> из <code class="wrap">@modelcontextprotocol/ext-apps/server</code> и без поддержки регистрировать текстовую версию инструмента<a class="cite" href="#src-29">29</a>.</p>
+<p>SDK <code class="wrap">@modelcontextprotocol/ext-apps</code> 2.0.0 вышел 8 сентября 2026 года: переход на TypeScript SDK MCP 2.0 и zod 4.2, при этом «wire protocol … unchanged»; текущая версия 2.0.3 от 25 сентября<a class="cite" href="#src-27">27</a>. В дорожной карте MCP от 22 августа интерфейсов среди приоритетов нет<a class="cite" href="#src-31">31</a>, так что расширение будет развиваться в своём репозитории, а не в ядре.</p>
+</section>
+
+<section id="fastmcp">
+<h2>MCP App на Python за вечер</h2>
+<p>Писать HTML и мост на <code>postMessage</code> руками не обязательно. Для Python есть FastMCP: интерфейсы в нём появились в версии 3.0.0 (18 февраля 2026), генерация интерфейса моделью — в 3.2.0 (30 марта), текущая версия 4.0.10<a class="cite" href="#src-8">8</a>. Питоновский пакет от авторов MCP-UI, <code>mcp-ui-server</code>, застрял на 1.0.0 от 4 ноября 2025 года<a class="cite" href="#src-32">32</a>, так что самый короткий путь к MCP Apps на Python сейчас лежит через FastMCP.</p>
+<ol class="steps">
+  <li><b>Поставь пакет и закрепи Prefab.</b> <code class="wrap">uv pip install "fastmcp[apps]" "prefab-ui==0.20.2"</code>. Prefab — библиотека Python-компонентов от Prefect, на которой FastMCP описывает интерфейсы. FastMCP сам предупреждает, что в Prefab «frequent breaking changes», и задаёт только нижнюю границу версии, так что верхнюю ставь сам.</li>
+  <li><b>Напиши инструмент с <code>app=True</code>.</b> Он возвращает не текст, а дерево компонентов.</li>
+  <li><b>Запусти <code class="wrap">fastmcp dev apps server.py</code>.</b> Откроется интерфейс на <code>localhost:8080</code>, сервер поднимется на порту 8000. Выбираешь инструмент, заполняешь аргументы, результат открывается во вкладке внутри того же <code>AppBridge</code>, которым пользуются настоящие хосты. Слева панель инспектора показывает JSON-RPC между браузером и сервером и сообщения <code>postMessage</code> между мостом и View<a class="cite" href="#src-8">8</a>.</li>
+</ol>
+<script type="text/plain" class="code" data-lang="python" data-title="server.py — квикстарт FastMCP, сокращён; запускался: fastmcp 4.0.10, prefab-ui 0.20.2" data-hl="11,21-35">
+from collections import Counter
+
+from prefab_ui.app import PrefabApp
+from prefab_ui.components import Column, DataTable, DataTableColumn, Grid
+from prefab_ui.components.charts import PieChart
+from fastmcp import FastMCP
+
+mcp = FastMCP("My First App")
+
+
+@mcp.tool(app=True)
+def team_directory() -> PrefabApp:
+    """Browse the team directory."""
+    members = [
+        {"name": "Alice Chen", "role": "Staff Engineer", "office": "San Francisco"},
+        {"name": "Bob Martinez", "role": "Lead Designer", "office": "New York"},
+        {"name": "Carol Johnson", "role": "Senior Engineer", "office": "London"},
+    ]
+    office_counts = [
+        {"office": office, "count": count}
+        for office, count in Counter(m["office"] for m in members).items()
+    ]
+    with PrefabApp() as app:
+        with Column(gap=4, css_class="p-6"):
+            with Grid(columns=[1, 2], gap=4):
+                PieChart(data=office_counts, data_key="count", name_key="office", show_legend=True)
+                DataTable(
+                    columns=[
+                        DataTableColumn(key="name", header="Name", sortable=True),
+                        DataTableColumn(key="role", header="Role", sortable=True),
+                        DataTableColumn(key="office", header="Office", sortable=True),
+                    ],
+                    rows=members,
+                    search=True,
+                )
+    return app
+</script>
+<p>Именно этот сервер выдал JSON из предыдущего раздела. Декоратор с <code>app=True</code> сделал три вещи: зарегистрировал для инструмента ресурс <code class="wrap">ui://prefab/tool/&lt;hash&gt;/renderer.html</code> с универсальным рендерером Prefab, сгенерировал для него CSP и повесил ссылку на ресурс в <code>_meta.ui</code>. Сам инструмент возвращает JSON-дерево компонентов в <code>structuredContent</code>. Сортировка таблицы, поиск и подсказки на диаграмме работают в браузере, без обращений к серверу.</p>
+<figure class="fig wide" id="fig-prefab">
+<ol class="pipeline">
+  <li><b>Python-компоненты</b><span><code>PieChart</code>, <code>DataTable</code> внутри <code>PrefabApp</code></span></li>
+  <li><b>JSON-дерево</b><span><code class="wrap">{"type": "Grid", "children": […]}</code></span></li>
+  <li data-tone="accent"><b>structuredContent</b><span>в ответе <code>tools/call</code>; модели — «[Rendered Prefab UI]»</span></li>
+  <li><b>Рендерер во View</b><span>один HTML на тул, JS Prefab с jsDelivr</span></li>
+  <li data-tone="ok"><b>Хост</b><span>песочница, CSP из <code>_meta.ui.csp</code></span></li>
+</ol>
+<figcaption>Как FastMCP превращает Python в интерфейс. По сети от сервера к View едет только структура, код рендерера один и тот же для всех вызовов. Это декларативный класс, построенный поверх открытого: JSON-описание живёт внутри iframe из MCP Apps.</figcaption>
+</figure>
+<p>Подвох для агента: модель получает строку <code>[Rendered Prefab UI]</code>, а данные лежат в дереве для рендерера. Если агент должен рассуждать о содержимом таблицы, отдай ему данные отдельным инструментом без интерфейса.</p>
+<h3>Когда интерфейс зовёт сервер обратно</h3>
+<p>Форма, которая сохраняет запись, требует серверного инструмента, который модели показывать незачем. Для этого в FastMCP есть <code>FastMCPApp</code>: точки входа регистрируются через <code>@app.ui()</code>, серверные инструменты через <code>@app.tool()</code>, а имя инструмента в кнопке FastMCP разрешает при сериализации, так что монтирование сервера под префиксом её не ломает<a class="cite" href="#src-8">8</a>.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок по notes.py из документации FastMCP: импорты и часть разметки опущены" data-hl="4,10,16-18">
+app = FastMCPApp("Notes")
+notes_db: list[dict] = []
+
+@app.tool()
+def add_note(title: str, body: str) -> list[dict]:
+    """Save a note and return all notes."""
+    notes_db.append({"title": title, "body": body})
+    return list(notes_db)
+
+@app.ui()
+def notes_app() -> PrefabApp:
+    """Open the notes app."""
+    with Column(gap=6, css_class="p-6") as view:
+        with ForEach("notes") as note:
+            Text(note.title, css_class="font-semibold")
+        with Form(on_submit=CallTool("add_note",
+                                     on_success=[SetState("notes", RESULT)])):
+            Input(name="title", label="Title", required=True)
+            Input(name="body", label="Body", required=True)
+            Button("Add Note")
+    return PrefabApp(view=view, state={"notes": list(notes_db)})
+
+mcp = FastMCP("Notes Server", providers=[app])
+</script>
+<script type="text/plain" class="code" data-lang="json" data-title="tools/list полного примера, получено запуском; title, description и outputSchema опущены" data-hl="3,7">
+[
+  {"name": "add_note",
+   "_meta": {"ui": {"visibility": ["app"]}},
+   "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+                   "required": ["title", "body"]}},
+  {"name": "notes_app",
+   "_meta": {"ui": {"resourceUri": "ui://prefab/tool/671b444e4010/renderer.html", "visibility": ["model"]}},
+   "inputSchema": {"type": "object", "properties": {}}}
+]
+</script>
+<p>Сервер отдаёт в <code>tools/list</code> оба инструмента, а дальше работает поле <dfn>visibility</dfn> из спецификации MCP Apps. Значение по умолчанию — <code>["model", "app"]</code>. Хост «MUST NOT include tools in the agent's tool list when their visibility does not include "model"», и хост «MUST reject <code>tools/call</code> requests from apps for tools that don't include "app"». Область <code>"app"</code> ограничена соединением с тем же сервером: вызвать app-инструмент чужого сервера View не может никогда<a class="cite" href="#src-6">6</a>. Отправка формы в JSON-дереве выглядит как <code class="wrap">{"action": "toolCall", "tool": "add_note", …}</code>, и модель про <code>add_note</code> не знает вовсе.</p>
+<figure class="fig wide" id="fig-visibility">
+<script type="text/x-mermaid">
+flowchart TD
+  list["tools/list от сервера"] --> m{"visibility<br/>содержит model?"}
+  m -- "да" --> inlist["В списке тулов модели"]:::ok
+  m -- "нет" --> hidden["Модель не видит"]:::mute
+  view["View шлёт tools/call"] --> a{"visibility<br/>содержит app?"}
+  a -- "нет" --> rej["Хост отклоняет"]:::warn
+  a -- "да" --> same{"Тот же сервер,<br/>что у View?"}
+  same -- "нет" --> rej
+  same -- "да" --> fwd["Хост пересылает на сервер"]:::ok
+</script>
+<figcaption>Две проверки, которые хост делает по полю <code>_meta.ui.visibility</code>. Первая решает, что попадёт в контекст модели, вторая — что может вызвать интерфейс. Инструмент с <code>["app"]</code> работает только из интерфейса, инструмент с <code>["model"]</code> — только из модели.</figcaption>
+</figure>
+<p>Спецификация объясняет, почему это один массив, а не два поля: у OpenAI было <code>widgetAccessible</code> плюс <code>visibility</code>, и одним массивом выражается всё то же самое<a class="cite" href="#src-6">6</a>. Инструменты, которые нужны только интерфейсу — сохранить, пересчитать, подгрузить страницу, — помечай <code>["app"]</code>: они не тратят контекст модели и не отвлекают её при выборе инструмента (про цену описаний инструментов — <a href="../03-tool-design/index.html">глава 3</a>). Инструмент, который должен срабатывать только от действия в интерфейсе, тоже <code>["app"]</code>: модель не сможет вызвать его в обход формы.</p>
+<h3>Когда интерфейс пишет модель</h3>
+<p>Третий режим FastMCP включается одной строкой, <code class="wrap">mcp.add_provider(GenerativeUI())</code>. Провайдер регистрирует инструмент <code>generate_prefab_ui</code>, который принимает Python-код, и <code>search_prefab_components</code>, через который модель узнаёт, какие компоненты есть<a class="cite" href="#src-8">8</a>. Модель пишет код на Prefab с циклами, f-строками и вычислениями, и пользователь видит, как интерфейс собирается по мере генерации.</p>
+<p>Iframe рендерера создаётся параллельно с вызовом инструмента, так что к моменту, когда пойдут частичные аргументы, он уже работает. Хост пересылает их через <code>tool-input-partial</code>, рендерер вытаскивает растущую строку <code>code</code>, и Pyodide в браузере исполняет ту часть, которая уже компилируется. Когда модель закончила, сервер прогоняет полный код в серверном Pyodide под Deno, и рендерер заменяет предпросмотр проверенным результатом<a class="cite" href="#src-8">8</a>. Это буквальное исполнение правила «MUST NOT rely on partial arguments»: частичное — для глаз, итоговое — после проверки. В песочнице только стандартная библиотека и Prefab. Импорт NumPy, pandas или requests даёт <code>ImportError</code><a class="cite" href="#src-8">8</a>.</p>
+<p>В Claude Code такой интерфейс не нарисуется: это терминал. Документация Claude Code называет UI-ресурсы MCP Apps «pages for a host application to render rather than content for Claude to read», не показывает их в подсказках <code>@</code> и в списке ресурсов, хотя прочитать ресурс по URI можно<a class="cite" href="#src-33">33</a>. Модель в терминале получит ту самую строку-заглушку, так что в Claude Code сервер пишут и тестируют, а интерфейс смотрят в <code>fastmcp dev apps</code> или в хосте с поддержкой MCP Apps.</p>
+<div class="note practice"><p>Вечерний план: подними квикстарт, открой инспектор в <code>fastmcp dev apps</code> и найди в трафике <code>ui/initialize</code>, <code>tool-input</code> и <code>tool-result</code>. Потом переделай его в <code>FastMCPApp</code> с формой и проверь в <code>tools/list</code>, что серверный инструмент получил <code>visibility: ["app"]</code>. И добавь рядом обычный инструмент, который возвращает те же данные текстом, чтобы агенту в терминале было что читать.</p></div>
+</section>
+
+<section id="openai">
+<h2>OpenAI: от window.openai к MCP Apps</h2>
+<p>В документации OpenAI на сентябрь 2026 года есть таблица, которая коротко пересказывает последний год истории ChatGPT-приложений<a class="cite" href="#src-34">34</a>:</p>
+<table class="wide">
+<thead><tr><th>Задача</th><th>Стандарт MCP Apps</th><th>Алиас для ChatGPT</th></tr></thead>
+<tbody>
+<tr><td>Связать тул с UI-ресурсом</td><td><code>_meta.ui.resourceUri</code></td><td><code class="wrap">_meta["openai/outputTemplate"]</code></td></tr>
+<tr><td>Получить аргументы тула</td><td><code>ui/initialize</code> + <code class="wrap">ui/notifications/tool-input</code></td><td><code>window.openai.toolInput</code></td></tr>
+<tr><td>Получить результат тула</td><td><code class="wrap">ui/notifications/tool-result</code></td><td><code>window.openai.toolOutput</code></td></tr>
+<tr><td>Вызвать тул из UI</td><td><code>tools/call</code></td><td><code>window.openai.callTool</code></td></tr>
+<tr><td>Отправить сообщение в чат</td><td><code>ui/message</code></td><td><code class="wrap">window.openai.sendFollowUpMessage</code></td></tr>
+</tbody>
+</table>
+<p>Правая колонка — это Apps SDK, который OpenAI показала на DevDay 6 октября 2025 года; тред запуска на Hacker News набрал 468 пунктов<a class="cite" href="#src-35">35</a>. Левая колонка — то, во что Apps SDK влился. Страницы <code class="wrap">developers.openai.com/apps-sdk/*</code> теперь отвечают редиректом 301 на раздел Plugins, а плагин в терминах OpenAI — это скиллы, MCP-серверы и необязательный интерфейс, которые работают в ChatGPT и Codex. Документация говорит прямо: начни со стандарта MCP Apps, а <code>window.openai</code> используй только для того, чего в стандарте нет<a class="cite" href="#src-34">34</a>. Сейчас это встроенный чекаут (<code>requestCheckout</code>), работа с файлами ChatGPT, модальные окна хоста и сохранение состояния виджета. Алиасы из таблицы оставлены для существующих интеграций.</p>
+<p>Сохранение состояния показывает, как OpenAI делит видимость. <code class="wrap">window.openai.setWidgetState()</code> хранит состояние отображения — выбранную строку, раскрытую панель — и модель его не видит. <code>ui/update-model-context</code> — переносимый способ сказать модели, что изменилось. Про режимы показа совет такой: «Choose the smallest presentation that lets people understand the result or complete the task»<a class="cite" href="#src-34">34</a>, то есть сначала встроенная карточка, полноэкранный режим и картинка-в-картинке — только когда без них никак.</p>
+<h3>Разделяй данные и отрисовку</h3>
+<p>Самый полезный совет из этой документации касается не интерфейса, а проектирования инструментов. «If you attach a widget template to every tool call, ChatGPT can re-render your iframe too often»<a class="cite" href="#src-34">34</a>. Лекарство — два вида инструментов. Инструменты данных ищут, считают и меняют данные и возвращают только <code>structuredContent</code>. Инструменты отрисовки принимают готовые данные и несут <code>_meta.ui.resourceUri</code>, и только они.</p>
+<script type="text/plain" class="code" data-lang="typescript" data-title="Два инструмента вместо одного (из документации OpenAI Plugins, сокращено)" data-hl="7,17">
+// 1) Data tool: no output template, returns chainable structuredContent.
+server.registerTool("roll_dice", {
+    description: "Roll an N-sided die and return { sides, value }.",
+    inputSchema: { sides: z.number().int().min(2) },
+  },
+  async ({ sides }) => {
+    const value = 1 + Math.floor(Math.random() * sides);
+    return { structuredContent: { sides, value },
+             content: [{ type: "text", text: `Rolled ${value} on ${sides} sides.` }] };
+  });
+
+// 2) Render tool: owns the template and requires data from roll_dice.
+server.registerTool("render_dice_widget", {
+    description:
+      "Render the dice widget from roll data. First call roll_dice, then pass its sides and value to this tool.",
+    inputSchema: { sides: z.number().int().min(2), value: z.number().int().min(1) },
+    _meta: { ui: { resourceUri: TEMPLATE_URI } },
+  }, /* ... */);
+</script>
+<p>Выигрыш не только в перерисовках. Пример из той же документации: инструмент поиска недвижимости умеет фильтровать по городу, цене и числу спален, но не по школьному округу. Пользователь спрашивает, какие из найденных домов попадают в округ Richmond Primary School. Модель вызывает поиск широко, сама отбирает подходящие варианты и только потом вызывает отрисовку с отфильтрованными id. Виджет появляется один раз, уже с правильным набором. Кнопка «перебросить» в интерфейсе при этом может звать инструмент данных напрямую, не пересоздавая iframe<a class="cite" href="#src-34">34</a>. Это та же проблема, что и со строкой <code>[Rendered Prefab UI]</code> в FastMCP: модели нужны данные, пользователю — картинка, и смешивать их в одном инструменте неудобно обоим.</p>
+<figure class="fig" id="fig-openai-stack">
+<div class="layers">
+  <div class="layer" data-tone="violet"><b>OpenAI MCP Extensions</b><span>Точки входа в боковой панели, в треде и для файлов, настройки, @-упоминания. Только ChatGPT, с 29 сентября 2026 года.</span></div>
+  <div class="layer" data-tone="warn"><b>window.openai</b><span>Алиасы стандарта плюс чекаут, файлы, модальные окна, <code>widgetState</code>. Только ChatGPT.</span></div>
+  <div class="layer" data-tone="accent"><b>MCP Apps (SEP-1865)</b><span>Ресурсы <code>ui://</code>, мост <code>ui/*</code>, <code>visibility</code>, CSP. Работает в любом хосте с поддержкой расширения.</span></div>
+  <div class="layer" data-tone="soft"><b>Ядро MCP</b><span>Инструменты, ресурсы, <code>structuredContent</code>. Ревизия 2026-07-28.</span></div>
+</div>
+<figcaption>Слои, из которых собирается интерфейс плагина ChatGPT. Два нижних переносимы между хостами, два верхних привязывают сервер к ChatGPT. Держи код верхних слоёв отдельно, и тот же сервер будет работать в Claude и VS Code.</figcaption>
+</figure>
+<p>Верхний слой совсем свежий. Репозиторий <code>openai/mcp-extensions</code> создан 29 сентября 2026 года, в нём написано «This specification defines extensions to MCP and MCP Apps for use across ChatGPT» и обещана поддержка к запуску на DevDay<a class="cite" href="#src-36">36</a>. Расширения регистрируют точки входа через <code class="wrap">_meta["openai/ui"]["entrypoints"]</code>: глобальную в боковой панели, в панели разговора и обработчик файлов по расширению (только в десктопном приложении). При вызове как точка входа <code>_meta["ui"]["visibility"]</code> игнорируется.</p>
+<p>У OpenAI есть и собственный декларативный формат, не связанный с MCP Apps: виджеты ChatKit. Корень <code>WidgetRoot</code> (<code>Card</code>, <code>ListView</code>, <code>Form</code>) собирается из узлов <code>Text</code>, <code>Button</code>, <code>Select</code>, <code>DatePicker</code> и других, действия уходят в колбэк <code>onAction</code> на твоём бэкенде, а JSON можно собрать в визуальном Widget Builder<a class="cite" href="#src-37">37</a>. По идее это каталог, как в A2UI, только один и для одного продукта.</p>
+<p>С ним часто путают Open-JSON-UI: CopilotKit описывает его как «An open standardization of OpenAI's internal declarative Generative UI schema», но в документации OpenAI это название не встречается ни разу, собственная страница CopilotKit о нём теперь перенаправляет на страницу про A2UI, а публичной схемы найти не удалось<a class="cite" href="#src-3">3</a>. Пока это формулировка вендора, а не спецификация.</p>
+</section>
+
+<section id="frontend">
+<h2>Когда фронтенд твой: AI SDK, CopilotKit, json-render</h2>
+<p><code class="wrap">'input-streaming' | 'input-available' | 'approval-requested' | 'approval-responded' | 'output-available' | 'output-error' | 'output-denied'</code> — это все состояния, через которые проходит вызов инструмента внутри сообщения Vercel AI SDK<a class="cite" href="#src-2">2</a>. Каждое из них — готовый повод что-то нарисовать, и в этом весь controlled-подход: протокола нет, каталога нет, есть типизированная часть сообщения <code>tool-${toolName}</code> и твой React-компонент на каждое состояние.</p>
+<p>Страница документации про generative UI по-прежнему говорит «In AI SDK 5.0, tool parts use typed naming», хотя 5.0 вышел 31 июля 2025 года, 6.0 — 22 декабря, а текущий мажор 7.0 — 25 июня 2026 года<a class="cite" href="#src-32">32</a>. Набор состояний расширился по сравнению с тремя, которые знают старые туториалы: добавились потоковый ввод, подтверждение и отказ.</p>
+<figure class="fig wide" id="fig-aisdk-states">
+<script type="text/x-mermaid">
+stateDiagram-v2
+  state "input-streaming — скелетон" as is
+  state "input-available — форма с аргументами" as ia
+  state "approval-requested — карточка подтверждения" as areq
+  state "approval-responded" as aresp
+  state "output-available — карточка результата" as oa
+  state "output-error — ошибка" as oe
+  state "output-denied — отказано" as od
+  [*] --> is: модель пишет аргументы
+  is --> ia: аргументы полные
+  ia --> areq: нужен апрув
+  areq --> aresp: ответ пользователя
+  aresp --> od: отказ
+  aresp --> oa: разрешено и исполнено
+  ia --> oa: исполнено без апрува
+  ia --> oe: исключение
+  aresp --> oe: исключение
+  oa --> [*]
+  oe --> [*]
+  od --> [*]
+</script>
+<figcaption>Семь состояний tool part в AI SDK 7 и паттерн интерфейса для каждого. Скелетон рисуется из частичных аргументов, поэтому действовать по нему нельзя; карточка подтверждения живёт в <code>approval-requested</code>, а ответ на неё отправляется через <code>addToolApprovalResponse</code>.</figcaption>
+</figure>
+<p>Подтверждения настраиваются на агенте, например <code class="wrap">toolApproval: { runCode: 'user-approval' }</code>, а пакет <code>@ai-sdk/policy-opa</code> позволяет вынести правила «что требует апрува» в OPA и Rego<a class="cite" href="#src-2">2</a>. Если в старом коде у тебя <code>streamUI</code> и серверные компоненты React, документация предупреждает: «AI SDK RSC is currently experimental», для стабильного продакшена не рекомендуется, мигрируй на AI SDK UI. Причины перечислены: поток из server action нельзя прервать, на <code>.done()</code> интерфейс мигает, а объём передачи растёт квадратично<a class="cite" href="#src-2">2</a>.</p>
+<p>А ещё AI SDK теперь умеет быть хостом MCP Apps. Твоё React-приложение может показывать интерфейсы чужих MCP-серверов:</p>
+<script type="text/plain" class="code" data-lang="typescript" data-title="AI SDK как хост MCP Apps (из документации AI SDK)" data-hl="4-5">
+import { createMCPClient, mcpAppClientCapabilities } from '@ai-sdk/mcp';
+...
+const definitions = await client.listTools();
+const { modelVisible } = splitMCPAppTools(definitions);
+const tools = client.toolsFromDefinitions(modelVisible);
+</script>
+<p><code>splitMCPAppTools</code> — это та самая первая проверка <code>visibility</code>: модели уходят только инструменты с <code>"model"</code>. <code>readMCPAppResource</code> проверяет схему <code>ui://</code> и MIME-тип и возвращает HTML вместе с CSP и разрешениями, а для вызовов из View документация велит сначала убедиться, что инструмент доступен приложению, и отвечать 403 в противном случае. Компонент <code class="wrap">experimental_MCPAppRenderer</code> «is experimental and may change»<a class="cite" href="#src-2">2</a>. Став хостом, ты берёшь на себя обязательства хоста из предыдущего раздела: песочницу, CSP, фильтрацию инструментов, согласие пользователя. Без AI SDK хостом делает <code>@mcp-ui/client</code>: пакеты MCP-UI теперь реализуют стандарт, компонент <code>AppRenderer</code> рисует MCP Apps, а <code>UIResourceRenderer</code> оставлен для «legacy MCP-UI hosts»<a class="cite" href="#src-38">38</a>.</p>
+<h3>CopilotKit: три класса в одной библиотеке</h3>
+<p>CopilotKit покрывает все три класса из начала главы. Controlled — хук <code>useFrontendTool</code>, где ты описываешь инструмент и компонент для каждого статуса<a class="cite" href="#src-3">3</a>:</p>
+<script type="text/plain" class="code" data-lang="typescript" data-title="useFrontendTool (из README CopilotKit/generative-ui)" data-hl="6-10">
+useFrontendTool({
+  name: "get_weather",
+  description: "Get current weather information for a location",
+  parameters: z.object({ location: z.string().describe("The city or location to get weather for") }),
+  handler: async ({ location }) => { /* ... */ return getMockWeather(location); },
+  render: ({ status, args, result }) => {
+    if (status === "inProgress" || status === "executing") return <WeatherLoadingState location={args?.location} />;
+    if (status === "complete" && result) {
+      const data = JSON.parse(result) as WeatherData;
+      return <WeatherCard {...data} />;
+    }
+    return <></>;
+  },
+});
+</script>
+<p>Declarative — A2UI, который включается на сервере одной опцией: <code class="wrap">new CopilotRuntime({ agents, a2ui: {} })</code> из <code>@copilotkit/runtime/v2</code> подключает <code>A2UIMiddleware</code> ко всем агентам. Для MCP Apps есть <code>MCPAppsMiddleware</code> из пакета <code class="wrap">@ag-ui/mcp-apps-middleware</code>. Open-ended — флаг <code class="wrap">openGenerativeUI: { agents: [...] }</code>: middleware перехватывает потоковый вызов инструмента <code>generateSandboxedUi</code> и превращает его в события, по которым клиент рисует сгенерированный HTML в изолированном iframe<a class="cite" href="#src-3">3</a>. Всё это едет событиями AG-UI, их устройство — в <a href="../08-ag-ui/index.html">главе 8</a>.</p>
+<div class="note warn"><p>Если пример в статье или в ответе ассистента импортирует что-то из <code>@copilotkitnext/react</code>, он устарел. Пакет помечен как deprecated с сообщением «Moved into @copilotkit/react-core. Import from '@copilotkit/react-core/v2'», его последняя версия 1.54.1 вышла 26 марта 2026 года<a class="cite" href="#src-32">32</a>. Текущие пакеты <code>@copilotkit/*</code> на 30 сентября 2026 года — 1.75.2.</p></div>
+<h3>json-render: декларативно, но не A2UI</h3>
+<p>json-render из Vercel Labs часто называют рендерером A2UI, и это неточно. Его родной формат — плоский словарь <code class="wrap">{root, elements: {id: {type, props, children}}}</code>, каталог описывается на Zod через <code>defineCatalog</code>, а <code>catalog.prompt()</code> генерирует из каталога системный промпт. Потоковый формат называется SpecStream: строки JSON Lines, каждая — операция JSON Patch по RFC 6902<a class="cite" href="#src-5">5</a>.</p>
+<script type="text/plain" class="code" data-lang="json" data-title="SpecStream (из документации json-render)">
+{"op":"add","path":"/root","value":"root"}
+{"op":"add","path":"/elements/root","value":{"type":"Card","props":{"title":"Dashboard"},"children":["metric-1","metric-2"]}}
+</script>
+<p>Разница с A2UI в гранулярности. A2UI обновляет компонент целиком, присылая запись с тем же id, а патч json-render может поменять одно свойство по пути JSON Pointer. Каталоги в формате A2UI json-render рисовать умеет, для этого в документации есть отдельный разбор, но это надстройка, а не родной протокол<a class="cite" href="#src-5">5</a>. Рендереры у json-render выходят далеко за веб: PDF, письма, видео на Remotion, картинки через Satori.</p>
+<div class="note field">
+<blockquote>I’m building an agentic commerce chat that uses MCP-UI and want to start using these new implementations instead of MCP-UI but can’t wrap my head around how button on click and actions work?
+<footer>— theturtletalks, <a href="https://news.ycombinator.com/item?id=47439300">Hacker News, 19 марта 2026</a></footer></blockquote>
+<p>Комментарий из треда про Markdown как протокол для generative UI<a class="cite" href="#src-39">39</a>, речь об OpenUI и json-render. Автор объясняет, что держит его на MCP-UI: там обработчик кнопки написан заранее, а в декларативной схеме действие — это имя события в JSON, который модель каждый раз генерирует заново. Переход от императивного <code>onClick</code> к событиям с именами и контекстом — главное, что придётся объяснить команде фронтенда, и лучше сделать это до выбора библиотеки.</p>
+</div>
+</section>
+
+<section id="patterns">
+<h2>Формы, подтверждения, потоковая отрисовка</h2>
+<p>«It seems like latency will be poor if you have to wait for a server-side round trip to an LLM to update the UI whenever you press a button?» — спросил skybrian 17 декабря 2025 года, на второй день треда запуска A2UI<a class="cite" href="#src-10">10</a>. Если каждое нажатие ждёт ответа модели, интерфейс будет медленным. Он прав для всего, что проходит через модель, и все рабочие паттерны сводятся к тому, чтобы через модель не ходило то, где её решение не нужно.</p>
+<p>У каждого подхода для этого есть свой локальный слой. В A2UI это модель данных, которая пишется без сети, функции каталога для форматирования и проверок и поле <code>checks</code> у полей ввода: кнопка, чья проверка не проходит, отключается рендерером до всякого сетевого запроса<a class="cite" href="#src-14">14</a>. В Prefab это клиентское состояние, <code>SetState</code> и реактивные выражения, а сортировка и поиск в таблице работают в браузере. В MCP Apps это обычный JavaScript во View плюс прямые вызовы инструментов данных, которые хост пересылает серверу без участия модели.</p>
+<p>Клик, который уходит агенту, стоит полноценного хода модели. Клик, который вызывает инструмент с <code>visibility: ["app"]</code>, стоит одного RPC. Опубликованных замеров задержки для круга A2UI или MCP Apps нет ни у одного вендора, так что это сравнение по устройству, а не по цифрам. Единственная цифра про время из первоисточников — у Google Research: генерация страницы целиком «can often take a minute or two»<a class="cite" href="#src-40">40</a>.</p>
+<h3>Что показывать, пока модель пишет</h3>
+<p>Потоковая отрисовка различается тем, на какие куски режется поток и что гарантировано про каждый.</p>
+<table class="wide">
+<thead><tr><th>Подход</th><th>Единица потока</th><th>Что гарантировано про промежуточное состояние</th></tr></thead>
+<tbody>
+<tr><td>A2UI</td><td>строка JSONL: целое сообщение; дробит его потоковый парсер агента</td><td>каждое сообщение валидно, недостающих детей агент заменяет заглушками</td></tr>
+<tr><td>json-render</td><td>строка SpecStream: одна операция JSON Patch</td><td>каждая операция применима к текущему дереву, можно менять одно свойство</td></tr>
+<tr><td>MCP Apps</td><td><code>tool-input-partial</code>: аргументы с закрытыми хостом скобками</td><td>ничего, «best-effort», полагаться для важных действий нельзя</td></tr>
+<tr><td>AI SDK</td><td>tool part в состоянии <code>input-streaming</code></td><td>частичный ввод, окончательный — в <code>input-available</code></td></tr>
+<tr><td>FastMCP GenerativeUI</td><td>растущий Python-код, исполняется компилируемый префикс</td><td>предпросмотр, итог проверяется повторным запуском на сервере</td></tr>
+</tbody>
+</table>
+<p>Протоколы, которые режут поток на самостоятельные единицы, дают промежуточные состояния, которые можно показывать как есть. Протоколы, которые стримят сырые аргументы, дают только предпросмотр, и финальную версию надо перерисовать. Отсюда и грабли, на которые наступили в самом A2UI: если компонент ссылается на ребёнка, который ещё не пришёл, рендерер рисует заглушку. В React-рендерере этой заглушкой была отладочная строка <code>[Loading {id}...]</code>, и её видели конечные пользователи (issue #2013)<a class="cite" href="#src-18">18</a>. Заглушка для недостающего узла — часть дизайна, а не отладочный вывод.</p>
+<h3>Карточки подтверждения</h3>
+<p>Паттерн «покажи, что агент собирается сделать, и дай нажать да или нет» есть везде, но устроен по-разному. В AI SDK это состояние <code>approval-requested</code> и ответ через <code>addToolApprovalResponse</code>, правила задаются на сервере<a class="cite" href="#src-2">2</a>. В MCP Apps хост может спросить согласия на <code>ui/message</code> и вообще «MAY decide to block some messages or subject them to further user approval» для всего, что View шлёт серверу<a class="cite" href="#src-6">6</a>. В A2UI v1.0 у события появилось поле <code>userMessage</code>, человекочитаемое описание того, что сделал пользователь, чтобы в истории чата стояло «подтвердил бронь на пятницу», а не голое <code>confirm_booking</code><a class="cite" href="#src-16">16</a>.</p>
+<p>Есть и тонкость, о которой спецификации говорят вскользь. Среди остаточных рисков MCP Apps названо «UI can still display misleading content», и единственная защита — хост должен ясно показывать границы песочницы<a class="cite" href="#src-6">6</a>. Карточка подтверждения, которую нарисовал сам сгенерированный интерфейс, может сказать что угодно. Поэтому подтверждение необратимого действия лучше рисовать силами хоста, из его собственных компонентов, а сгенерированный интерфейс пусть только его запрашивает.</p>
+<p>С формами похожая история про данные. В глоссарии A2UI есть понятие NoAI information: данные вроде номера карты, которые не должны попасть в модель ни при какой проводке<a class="cite" href="#src-14">14</a>. С <code>sendDataModel: true</code> всё, что пользователь ввёл в поверхность, уходит агенту с каждым сообщением, а значит, и в контекст модели. Платёжные поля не место в модели данных сгенерированной формы. Их показывает хост, как <code>requestCheckout</code> в ChatGPT, а сам агентный платёж разобран в <a href="../10-agentic-commerce/index.html">главе 10</a>.</p>
+<h3>Доступность не приходит с каталогом</h3>
+<p>Issue #1410 в репозитории A2UI открыт 12 мая 2026 года с приоритетом P1 и на 30 сентября не закрыт. Эталонный пример Restaurant Finder генерирует несколько кнопок «Book Now» с одинаковым видимым текстом и разными действиями, что нарушает критерий WCAG 2.4.6: пользователь скринридера не отличит одну от другой<a class="cite" href="#src-18">18</a>. Предложенные исправления — скрытый текст, <code>aria-label</code>, <code>aria-labelledby</code> — те же, что пришлось бы помнить разработчику, пишущему разметку руками. Декларативный каталог не убирает этот класс ошибок, он переносит его в момент генерации, где за ним следит модель.</p>
+<p>Ответ спецификации — в v1.0: атрибуты доступности получили <code>live</code> (<code>off</code>, <code>polite</code>, <code>assertive</code>) и <code>hidden</code>, а нормативный текст требует от каталогов и рендереров передавать эти атрибуты, выводить семантику для скринридера из видимого текста и проверять это линтером SDK<a class="cite" href="#src-13">13</a>. В MCP Apps доступность целиком на совести HTML сервера, и CopilotKit называет открытый класс тем, где труднее всего гарантировать доступность, фирменный стиль и безопасность<a class="cite" href="#src-3">3</a>. Есть и обратный взгляд: Бектур Рыскельдиев по итогам шести исследований с незрячими, слабовидящими и пожилыми пользователями маркетплейсов предлагает генерировать адаптированный интерфейс в момент использования<a class="cite" href="#src-41">41</a>. Его вывод хорошо ложится на каталоги: роль дизайнера смещается «from specifying layouts to specifying policies».</p>
+</section>
+
+<section id="evidence">
+<h2>Что показывают замеры</h2>
+<p>1800,3 против 1736,2 по Эло. Так в статье Google Research от 24 февраля 2026 года сайты, сделанные людьми-экспертами, соотносятся со страницами, которые целиком сгенерировала их система на Gemini 3<a class="cite" href="#src-40">40</a>.</p>
+<figure class="fig" id="fig-genui-elo">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Рейтинг Эло пяти форматов ответа", "decimals": 1, "emphasis": ["Generative UI на Gemini 3"],
+ "rows": [["Сайт от эксперта-человека", 1800.3], ["Generative UI на Gemini 3", 1736.2], ["Ответ в Markdown", 1437.7], ["Верхний результат поиска", 1352.2], ["Обычный текст", 1173.7]],
+ "note": "Leviathan и др., Google, arXiv 2604.09577. 100 случайных промптов LMArena, по 2 оценщика, результаты закешированы, время генерации не учитывалось."}
+</script>
+<figcaption>Попарные предпочтения оценщиков, сведённые в рейтинг Эло. Сгенерированная страница близка к работе эксперта и далеко впереди текстовых ответов, но это сравнение готовых результатов: минута-другая ожидания в него не входит.</figcaption>
+</figure>
+<p>Условия здесь важнее чисел. Сто случайных промптов из LMArena, восемь исключены, по два оценщика, трёхбалльная шкала. Результаты заранее сгенерированы и закешированы, «Generation time is not a factor», а сами авторы пишут, что генерация «can often take a minute or two». Авторы работают в Google и оценивают систему Google. Внутри этих условий GenUI предпочли ответу в Markdown в 82,8% случаев, а на наборе информационных запросов — в 90,5%. Сайт эксперта предпочли сгенерированному в 50% сравнений, сгенерированный эксперту — в 35,3%, остальное ничьи<a class="cite" href="#src-40">40</a>. Это потолок качества при неограниченном времени, а не опыт пользователя в продукте.</p>
+<p>Две абляции из той же статьи полезны тем, кто собирается генерировать интерфейс сам. Полный системный промпт с целями, планированием, примерами и техническими требованиями дал 1553,2, минимальный — 1496,0, промпт без раздела «философии» — 1450,8. Работа над промптом стоит около сотни очков Эло. Вторая абляция меняла модель-основу, и на ней видно, насколько это свежая способность:</p>
+<figure class="fig" id="fig-genui-errors">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Доля ответов с битым результатом", "unit": "%", "emphasis": ["Gemini 2.0 Flash", "Gemini 2.0 Flash-Lite"],
+ "rows": [["Gemini 3", 0, "Эло 1706,7"], ["Gemini 2.5 Pro", 0, "Эло 1653,6"], ["Gemini 2.5 Flash", 0, "Эло 1623,9"], ["Gemini 2.0 Flash", 29, "Эло 1332,9"], ["Gemini 2.0 Flash-Lite", 60, "Эло 1183,0"]],
+ "note": "Абляция модели-основы, arXiv 2604.09577, набор LMArena."}
+</script>
+<figcaption>Одна и та же система генерации страниц на разных моделях. Модели поколения 2.5 и 3 не ломают вывод ни разу, у 2.0 Flash битым оказывается почти каждый третий ответ, у Flash-Lite — больше половины.</figcaption>
+</figure>
+<p>Если ты собираешься генерировать открытый HTML дешёвой моделью, этот график отвечает на вопрос «почему у нас всё разваливается». Декларативный протокол с валидацией по каталогу такую ошибку хотя бы ловит и возвращает модели на исправление.</p>
+<h3>Одна страница — не интерфейс</h3>
+<div class="stats">
+  <div class="stat"><b>74,9%</b><span>ходов проходит лучшая из восьми моделей в EvoGenUI-Bench</span></div>
+  <div class="stat"><b>37,3%</b><span>пятиходовых сценариев она доводит до конца без поломки</span></div>
+  <div class="stat"><b>52,4%</b><span>удержание результата от хода к ходу в задачах с внешними инструментами</span></div>
+</div>
+<p>EvoGenUI-Bench, опубликованный 29 августа 2026 года, проверяет то, чего не проверяет статья Google: поддержку интерфейса, пока пользователь меняет требования. 150 задач по пять ходов, 750 ходов в трёх сценариях — показ информации, интерактивность и работа с внешним состоянием через инструменты. Сгенерированные артефакты исполняются в браузере и проверяются по скриншотам, DOM, трассам действий и логам<a class="cite" href="#src-41">41</a>. Лучшая модель проходит почти три хода из четырёх, но доводит до конца чуть больше трети пятиходовых сценариев. Авторы разложили отказы по классам: при показе ломается информационная архитектура, при интерактивности — распространение производного состояния и привязка элементов к действиям, в задачах с инструментами добавляются привязка к внешнему состоянию и разбиение требований.</p>
+<p>Продуктовая жизнь интерфейса как раз и состоит из правок: «добавь фильтр», «отсортируй по цене», «убери колонку». Декларативные протоколы с отдельной моделью данных частично обходят эту проблему устройством: агент меняет данные или один узел, а не переписывает страницу. Замеров, которые сравнивали бы это напрямую, на сентябрь 2026 года нет. Есть работа в другую сторону: Macaron-A2UI (май 2026) дообучает модели от 30B до 754B параметров генерировать A2UI и заявляет 75,6 балла на собственном A2UI-Bench «without explicit schema hints»<a class="cite" href="#src-41">41</a>. Цифра авторов, независимых проверок нет.</p>
+<h3>Цифры вендора и вопрос вкуса</h3>
+<p>Thesys перевёл C1 в архив, выпустил под новым именем OpenUI и перестал генерировать JSON. Ставка OpenUI — строчный язык OpenUI Lang, который дешевле в токенах и удобнее для потокового разбора, и модель OUI-1 с открытыми весами под Apache 2.0, дообученная писать этот язык; выпущена 8 сентября 2026 года<a class="cite" href="#src-23">23</a>. В отчёте «The State of Generative UI in 2026» от 10 июня OpenUI сравнивает форматы на одних и тех же сценариях:</p>
+<figure class="fig" id="fig-openui-tokens">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Токены на один сценарий: интерфейс интернет-магазина", "unit": "токенов", "emphasis": ["OpenUI Lang"],
+ "rows": [["OpenUI Lang", 4800], ["YAML", 9122], ["JSON старого C1", 9948], ["json-render", 10180]],
+ "note": "Цифры вендора: OpenUI, The State of Generative UI in 2026. Токенизатор tiktoken для GPT-5, один из семи сценариев. Независимых воспроизведений нет."}
+</script>
+<figcaption>Замер OpenUI в пользу собственного формата. При 60 токенах в секунду это 19,4 секунды генерации против 40,8 у патчей json-render. Базовые линии выбирал сам вендор, включая собственный прежний продукт.</figcaption>
+</figure>
+<p>Про OUI-1 те же оговорки: 71,7% на «Generative UI Benchmark» OpenUI против 13,0% у базовой DiffusionGemma и 46,7% у Gemma 4 31B, бенчмарк и модель принадлежат одному автору, а «больше 700 токенов в секунду» в блоге — цифра Google про базовую модель<a class="cite" href="#src-23">23</a>. Самый заметный ответ на запуск пришёл не про цифры:</p>
+<div class="note field">
+<blockquote>Generative UI is unsolved because current models do not have taste and end up generating the same kind of slop. I'm amazed that this blog doesn't even have a single screenshot/photo of the kind of UI they can generate. Focusing on benchmarks in this domain feels very wrong.
+<footer>— tracyhenry, <a href="https://news.ycombinator.com/item?id=49613182">Hacker News, 8 сентября 2026</a></footer></blockquote>
+<p>В треде про OUI-1<a class="cite" href="#src-42">42</a> tracyhenry упрекает авторов в том, что в посте о модели для интерфейсов нет ни одного скриншота интерфейса. Токены и секунды измеряют цену, а не качество. Google измерил качество, но выключил время. Никто из публиковавшихся не измерил оба сразу, и на своих задачах это придётся делать самому: скриншоты, оценщики, многоходовые правки. Как собрать такой eval — в <a href="../17-evals/index.html">главе 17</a>.</p>
+</div>
+</section>
+
+<section id="adoption">
+<h2>Кто это внедрил и что об этом говорят</h2>
+<p>3 904 817 загрузок за неделю с 23 по 29 сентября 2026 года насчитал npm у пакета <code class="wrap">@modelcontextprotocol/ext-apps</code><a class="cite" href="#src-32">32</a>. Это больше, чем у всех пакетов A2UI вместе взятых, но читать такие числа надо осторожно.</p>
+<figure class="fig" id="fig-downloads">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Загрузки npm за неделю 23–29 сентября 2026", "unit": "", "emphasis": ["@modelcontextprotocol/ext-apps", "@a2ui/web_core", "@json-render/core"],
+ "rows": [["@modelcontextprotocol/ext-apps", 3904817], ["@json-render/core", 1776604], ["@a2ui/web_core", 1181253], ["@a2ui/lit", 604303], ["@copilotkit/a2ui-renderer", 438154], ["@ag-ui/mcp-apps-middleware", 380993], ["@mcp-ui/client", 296696], ["@openuidev/react-lang", 138475], ["@a2ui/react", 103579], ["@thesysai/genui-sdk", 8273]],
+ "note": "npm downloads API. Включает CI и транзитивные установки: web_core, например, тянут все веб-рендереры A2UI и CopilotKit. Это не число пользователей."}
+</script>
+<figcaption>Недельные загрузки основных пакетов generative UI. Выделены ядра трёх подходов. Разрыв между <code>@a2ui/web_core</code> и <code>@a2ui/react</code> в десять с лишним раз показывает, сколько установок приходит транзитивно, через CopilotKit и другие библиотеки.</figcaption>
+</figure>
+<p>На PyPI за последнюю неделю сентября <code>fastmcp</code> скачали 12,5 млн раз, <code>a2ui-agent-sdk</code> — 111 тыс., <code>prefab-ui</code> — 108 тыс., <code>mcp-ui-server</code> — около 10 тыс. По звёздам GitHub на 30 сентября впереди CopilotKit (37 618), json-render (18 438) и A2UI (16 565), а у <code>ext-apps</code>, первого по загрузкам, всего 2886<a class="cite" href="#src-32">32</a>. Звёзды меряют интерес, загрузки — зависимости, и ни то ни другое не меряет продакшен.</p>
+<p>Надёжнее названные внедрения. MCP Apps на момент получения статуса Stable поддерживали Claude в вебе и на десктопе, Goose, VS Code Insiders и ChatGPT<a class="cite" href="#src-25">25</a>, README SDK добавляет Postman, MCPJam, mcp-use и Alpic<a class="cite" href="#src-27">27</a>. В Claude это интерактивные коннекторы, запущенные 26 января 2026 года на всех тарифах, от Asana и Figma до Slack и Hex. Графики, которые Claude рисует сам с 12 марта 2026 года, — отдельная функция, и на чём она сделана, Anthropic не раскрывает<a class="cite" href="#src-43">43</a>. Ещё до стандарта подход MCP-UI использовали Postman, Shopify, Hugging Face, Goose и ElevenLabs<a class="cite" href="#src-24">24</a>.</p>
+<p>У A2UI список внедрений ведёт сам проект, и почти все они из Google<a class="cite" href="#src-17">17</a>. Opal, конструктор мини-приложений, участвует в протоколе с самого начала, Flutter GenUI SDK использует A2UI как провод: «When you use GenUI, you're using A2UI under the covers». В Gemini Enterprise A2UI работает только для агентов, зарегистрированных через A2A, а управляемые агенты на Vertex AI Agent Engine его пока не рисуют — даже внутри Google поддержка неравномерная. Из сторонних заметен <code>A2UIAgent</code> в AG2.</p>
+<h3>Три лагеря на Hacker News</h3>
+<p>Тред запуска A2UI 16 декабря 2025 года собрал все позиции, которые с тех пор повторяются<a class="cite" href="#src-10">10</a>. Первая — усталость от протоколов. mbossie: «So there's MCP-UI, OpenAI's ChatKit widgets and now Google's A2UI, that I know of. And probably some more... How many more variants are we introducing to solve the same problem». Ему тут же ответил hobofan: «MCP-UI and OpenAI Apps are converging into the MCP Apps extension specification». Через девять месяцев видно, что консолидация случилась только на открытом полюсе: MCP Apps поглотил MCP-UI и формат OpenAI. На декларативном полюсе по-прежнему A2UI, json-render, OpenUI Lang, виджеты ChatKit и JSON Prefab, и сближаться они не собираются. Вторая позиция — что всё это обычный server-driven UI с моделью в роли шаблонизатора, о ней было в начале главы. Третья, самая горячая, — про безопасность.</p>
+<div class="note debate">
+<p>lowsong: «Why on earth would you trust an LLM to output a UI? You're just asking for security bugs, UI impersonation attacks, terrible usability, and more. This is a nightmare». DannyBee возразил, что опасность не в чате как таковом: «If the interactive diagram or UI you click on now owns you, it doesn't matter if it was inside the chat window or outside the chat window», и всё решает качество разбора, валидации и отрисовки<a class="cite" href="#src-10">10</a>.</p>
+<p>CVE-2026-10032 подтвердила страх первого и диагноз второго: уязвимость сидела не в том, что модель выдаёт интерфейс, а в коде рендерера, который исполнял её аргументы. Обе позиции стоит принять как рабочие правила: агент — недоверенный автор, а рендерер, каталог и песочница — код, критичный для безопасности, с аудитом и тестами как у парсера пользовательского ввода. При таком отношении generative UI не опаснее любого другого отображения чужого контента.</p>
+</div>
+</section>
+
+<section id="choose">
+<h2>Как выбрать и как поделить работу</h2>
+<p>Если интерфейс должен появиться внутри чужого чата — Claude, ChatGPT, VS Code, Goose, — выбора почти нет: это MCP Apps, а на Python — FastMCP. Выбор появляется, когда фронтенд твой.</p>
+<figure class="fig wide" id="fig-choose">
+<script type="text/x-mermaid">
+flowchart TD
+  where{"Где живёт интерфейс?"} -- "в чужом чате" --> apps["MCP Apps,<br/>на Python через FastMCP"]:::accent
+  where -- "в твоём приложении" --> known{"Набор экранов<br/>известен заранее?"}
+  where -- "разовая визуализация" --> open["Открытая генерация<br/>только в песочнице"]:::warn
+  known -- "да" --> ctrl["Controlled:<br/>AI SDK 7, useFrontendTool"]:::ok
+  known -- "нет, их собирает агент" --> native{"Нужны нативные<br/>мобильные клиенты?"}
+  native -- "да" --> a2ui["A2UI v0.9.1, свой каталог<br/>iOS: Flutter или сторонний"]:::accent
+  native -- "только веб" --> web["A2UI или json-render"]:::violet
+  apps -. "нужен нативный вид внутри" .-> both["A2UI внутри MCP App"]:::mute
+</script>
+<figcaption>Дерево выбора на сентябрь 2026 года. Первый вопрос не про протоколы, а про то, кому принадлежит экран. Пунктир — одна из трёх схем композиции, когда нужно и то и другое.</figcaption>
+</figure>
+<table class="wide">
+<thead><tr><th>Подход</th><th>По сети</th><th>Кто рисует</th><th>Главный риск</th><th>Бери, если</th></tr></thead>
+<tbody>
+<tr><td>Controlled: AI SDK, <code>useFrontendTool</code></td><td>аргументы тула</td><td>твои компоненты</td><td>мало свободы, каждый экран пишешь сам</td><td>экраны известны, фронтенд твой</td></tr>
+<tr><td>A2UI v0.9.1</td><td>компоненты из каталога и данные</td><td>рендерер хоста</td><td>смена версий, функции каталога как атакуемый код</td><td>агент собирает экраны, нужны веб и мобильные клиенты</td></tr>
+<tr><td>json-render, OpenUI Lang</td><td>свой JSON или DSL</td><td>рендерер библиотеки</td><td>привязка к одной библиотеке</td><td>React-стек, важны токены или вывод в PDF и письма</td></tr>
+<tr><td>MCP Apps</td><td>HTML-ресурс сервера</td><td>код сервера в песочнице</td><td>CSP, доступность, обманчивый интерфейс</td><td>интерфейс нужен внутри чужого хоста</td></tr>
+<tr><td>Открытая генерация</td><td>код, который пишет модель</td><td>модель, в песочнице</td><td>минуты на генерацию, 37% успеха на многоходовых правках</td><td>одноразовая визуализация важнее стабильности</td></tr>
+</tbody>
+</table>
+<p>Противопоставлять A2UI и MCP Apps не обязательно. В совместном посте команды A2UI и авторов MCP-UI от 17 июня 2026 года описаны три способа их совместить<a class="cite" href="#src-19">19</a>. A2UI поверх MCP: шаблоны как ресурсы, данные из инструментов, нативная отрисовка на клиенте, который понимает A2UI. MCP App внутри поверхности A2UI: сложный модуль с собственным состоянием встраивается как компонент <code>McpApp</code> в нативную раскладку, причём песочница и соседние нативные компоненты напрямую не общаются, изменения идут через агента и возвращаются как обновления модели данных<a class="cite" href="#src-26">26</a>. И A2UI внутри MCP App: для хоста, который A2UI не знает, View сам содержит рендерер A2UI и получает поверхности из результатов инструментов.</p>
+<h3>Что делает сервер, а что клиент</h3>
+<p>Вне зависимости от протокола обязанности делятся одинаково. Сервер или агент отделяет инструменты данных от инструментов отрисовки, проверяет свой вывод по каталогу до отправки и держит у себя источник истины для состояния: iframe могут закрыть в любой момент, а поверхность — удалить. Он же помечает служебные инструменты как <code>["app"]</code> и кладёт в текстовый результат что-то осмысленное для модели и для хостов без поддержки интерфейсов.</p>
+<p>Клиент или хост владеет каталогом и рендерером и проверяет всё повторно, потому что агенту не доверяет. Он держит песочницу и CSP, фильтрует инструменты по <code>visibility</code>, рисует подтверждения опасных действий своими компонентами, вычищает модель данных перед пересылкой сабагентам и решает, что из действий пользователя увидит модель. Если в команде этот список никому не назначен, он не сделан никем.</p>
+<div class="note practice"><p>Выбор для Python-бэкендера на сентябрь 2026 года. Пользователи в Claude или ChatGPT — FastMCP Apps с закреплённым <code>prefab-ui</code>, разделением данных и отрисовки и серверными инструментами с <code>["app"]</code>. Свой продукт на React с понятным набором экранов — AI SDK 7 с подтверждениями, а декларативный слой добавлять только тогда, когда экраны должен собирать агент. Веб и мобильные клиенты от одного агента — A2UI v0.9.1 со своим каталогом (на iOS пока через Flutter или сторонний рендерер), id с префиксом своего домена и валидацией через <code>a2ui-agent-sdk</code> перед отправкой. Открытую генерацию — только в песочнице и только для того, у чего нет кнопки «отправить». Пересматривать это стоит, когда рендереры A2UI объявят поддержку v1.0 и когда хосты начнут реализовывать черновик MCP Apps с инструментами View и сэмплированием.</p></div>
+</section>
+
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>Агент прислал кнопку с <code>openUrl</code> и адресом <code>javascript:…</code>, валидатор по каталогу не нашёл ошибок. Почему валидация не помогла и где должна стоять защита?</summary><p>JSON Schema проверяет форму: <code>url</code> — строка, и строка на месте. Смысл аргумента проверяет только реализация функции в рендерере. Защита — белый список схем URI в самой функции (так исправлен <code>web_core</code> 0.10.2), плюс в v1.0 <code>requiresUserActivation</code> и <code>allowedCallers</code> в каталоге. Каждую функцию каталога нужно проверять как публичный API, считая агента враждебным.</p></details>
+<details><summary>Почему A2UI передаёт компоненты плоским списком с ссылками по id, а не вложенным деревом?</summary><p>Из-за стриминга. Вложенный JSON становится валидным только когда закрыты все скобки, а каждая запись плоского списка валидна сама по себе. Разбирает их по мере генерации не рендерер, он получает <code>updateComponents</code> целиком. Это делает потоковый парсер агента: шлёт частичные <code>updateComponents</code> с поддеревом, уже достижимым от <code>root</code>. Рендерер буферизует их до появления <code>root</code> и рисует то, что есть. Поменять один узел — прислать одну запись с тем же id, не пересылая остальное.</p></details>
+<details><summary>Агент и рендерер «поддерживают базовый каталог v0.9.1», ошибок в логах нет, но интерфейс не появляется. Что проверить первым?</summary><p>Строку <code>catalogId</code> с обеих сторон. Согласование идёт по точному совпадению, а у базового каталога v0.9.1 в разных местах разные строки (<code>v0_9</code> в файле каталога, <code>v0_9_1</code> в документации и в хелпере SDK). Если общего каталога нет, агент по протоколу просто не присылает интерфейс, без ошибки.</p></details>
+<details><summary>Пользователь отфильтровал таблицу внутри MCP App и спрашивает агента «что из этого дешевле всего?». Что знает модель?</summary><p>Ничего о фильтре. Модель видит результат инструмента, а у FastMCP это строка <code>[Rendered Prefab UI]</code>. Действия внутри iframe попадают к модели, только если View отправит <code>ui/update-model-context</code> или <code>ui/message</code>. Отсюда совет отдавать модели данные отдельным инструментом и сообщать об изменениях явно.</p></details>
+<details><summary>Почему sandbox proxy в MCP Apps получает <code>allow-same-origin</code>, а внутренний iframe с кодом сервера — нет?</summary><p>Proxy живёт на другом origin, чем страница хоста, поэтому <code>allow-same-origin</code> даёт ему доступ только к самому себе. Внутреннему iframe сочетание <code>allow-scripts</code> и <code>allow-same-origin</code> позволило бы добраться до DOM родителя и снять с себя атрибут sandbox. Цена — у View уникальный origin без cookie и <code>localStorage</code>.</p></details>
+<details><summary>Ты переводишь агента с A2UI v0.9 на v1.0 и не меняешь формат сообщений. Что начнёт вести себя иначе?</summary><p><code>updateDataModel</code> без <code>value</code> раньше удалял ключ, теперь это ошибка схемы, удаление — <code>"value": null</code>. <code>createSurface</code> с уже использованным <code>surfaceId</code> теперь ошибка: уникальность снова на всё время жизни рендерера. Поле <code>theme</code> исчезло без замены. И каталоги v0.9 с рантаймом v1.0 напрямую не работают.</p></details>
+<details><summary>Зачем разделять инструменты данных и инструменты отрисовки?</summary><p>Если шаблон висит на каждом вызове, хост перерисовывает iframe слишком часто. Разделение даёт модели сначала получить и отфильтровать данные, а потом один раз вызвать отрисовку с итоговым набором; интерфейс при этом может сам звать инструмент данных, не пересоздавая iframe. Заодно модель получает данные, а не заглушку.</p></details>
+<details><summary>Инструмент <code>save_order</code> должен срабатывать только от кнопки в интерфейсе. Как это выразить и что проверит хост?</summary><p><code class="wrap">_meta.ui.visibility: ["app"]</code>. Хост не включит инструмент в список для модели, а вызов из View пропустит, только если View принадлежит тому же серверу. Модель не сможет вызвать сохранение в обход формы.</p></details>
+<details><summary>Можно ли по <code>tool-input-partial</code> показывать итоговую сумму заказа и по ней же списывать деньги?</summary><p>Показывать как предпросмотр можно, действовать нельзя. Частичные аргументы — «best-effort» восстановление недописанного JSON с закрытыми хостом скобками, и спецификация прямо запрещает на них полагаться в важных операциях. Действовать только по <code>tool-input</code> и <code>tool-result</code>.</p></details>
+<details><summary>В оркестраторе с несколькими сабагентами поверхности открыты с <code>sendDataModel: true</code>. Что может пойти не так?</summary><p><code>a2uiClientDataModel</code> несёт данные всех поверхностей, и без очистки сабагент погоды прочитает форму, открытую банковским агентом. Оркестратор обязан вырезать чужие поверхности перед пересылкой, в Python SDK для этого есть <code class="wrap">A2uiSubagentMap.strip_unowned_surfaces_from_data_model</code>. Протокол этого не навязывает.</p></details>
+<details><summary>У Google сгенерированные страницы набрали 1736 Эло против 1800 у экспертов. Почему из этого не следует, что открытая генерация готова для продукта?</summary><p>Сравнивали закешированные результаты, время генерации (минута-другая) не учитывалось, задача была одноходовой, а авторы оценивали собственную систему. На многоходовых правках в EvoGenUI-Bench лучшая модель доводит до конца 37,3% сценариев, и продукт живёт как раз правками.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу по памяти написать поток JSONL для поверхности A2UI v0.9.1: <code>createSurface</code>, <code>updateComponents</code> с корнем <code>root</code>, <code>updateDataModel</code> с привязкой через JSON Pointer</li>
+  <li>Прогонял вывод агента через валидатор <code>a2ui-agent-sdk</code> по базовому каталогу и разбирал ошибки <code>unrecognized_component</code> и <code>type_mismatch</code></li>
+  <li>Писал цикл генерации A2UI на Python: промпт из каталога через <code>DirectJsonFormat</code>, разбор блоков <code>&lt;a2ui-json&gt;</code>, валидация и возврат ошибок модели на исправление</li>
+  <li>Беру <code>catalogId</code> из файла каталога, который загружает рендерер, и логирую выбранный каталог при каждом <code>createSurface</code></li>
+  <li>Проверял функции своего каталога враждебными аргументами: <code>javascript:</code> и <code>data:</code> в URL, огромные строки, глубокую вложенность</li>
+  <li>Поднимал MCP App на FastMCP и находил в инспекторе <code>fastmcp dev apps</code> сообщения <code>ui/initialize</code>, <code>tool-input</code> и <code>tool-result</code></li>
+  <li>Размечаю инструменты через <code>_meta.ui.visibility</code> так, чтобы служебные не попадали в контекст модели, и проверяю это по <code>tools/list</code></li>
+  <li>Умею найти в чужом коде iframe с <code>allow-scripts</code> и <code>allow-same-origin</code> одновременно и объяснить, почему это ломает песочницу</li>
+  <li>Собирал CSP для MCP App и знаю, какой домен в какой из четырёх списков класть</li>
+  <li>Делил инструмент на data и render и проверял, что модель получает данные, а не строку-заглушку</li>
+  <li>Рисовал все семь состояний tool part в AI SDK 7, включая карточку подтверждения и отказ</li>
+  <li>Могу перечислить ломающие изменения A2UI v0.9 → v1.0 и держу разбор входящих сообщений по полю <code>version</code></li>
+  <li>По payload определяю класс подхода — controlled, declarative или open-ended, — даже если вендор назвал его иначе</li>
+  <li>Оцениваю генерацию интерфейса на многоходовых правках и по скриншотам, а не по одной странице и не по числу токенов</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://github.com/a2ui-project/a2ui/security/advisories/GHSA-72qq-p3r5-f7wq">GHSA-72qq-p3r5-f7wq / CVE-2026-10032: <code>openUrl</code> permits <code>javascript:</code> URI execution via agent-supplied button actions</a>. A2UI, security advisory, 3 августа 2026.</li>
+  <li id="src-2"><a href="https://ai-sdk.dev/docs/ai-sdk-ui/generative-user-interfaces">Generative User Interfaces</a>, <a href="https://ai-sdk.dev/docs/ai-sdk-core/mcp-apps">MCP Apps</a> и страница миграции с AI SDK RSC. Vercel, документация AI SDK, по состоянию на 30 сентября 2026.</li>
+  <li id="src-3"><a href="https://docs.copilotkit.ai/llms-full.txt">Документация CopilotKit: Generative UI, A2UI, MCP Apps, Open Generative UI</a> и <a href="https://github.com/CopilotKit/generative-ui">README репозитория CopilotKit/generative-ui</a>. CopilotKit, по состоянию на 30 сентября 2026.</li>
+  <li id="src-4"><a href="https://github.com/a2ui-project/a2ui">a2ui-project/a2ui, README</a>. Проект A2UI (начат в Google), Apache-2.0, по состоянию на 30 сентября 2026.</li>
+  <li id="src-5"><a href="https://github.com/vercel-labs/json-render">vercel-labs/json-render, README</a> и <a href="https://json-render.dev/docs/streaming">json-render.dev: Streaming</a>. Vercel Labs, репозиторий создан 14 января 2026.</li>
+  <li id="src-6"><a href="https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx">SEP-1865: MCP Apps: Interactive User Interfaces for MCP</a>, <code class="wrap">specification/2026-01-26/apps.mdx</code>, статус Stable (2026-01-26). Model Context Protocol.</li>
+  <li id="src-7"><a href="https://research.google/blog/generative-ui-a-rich-custom-visual-interactive-user-experience-for-any-prompt/">Generative UI: a rich, custom, visual interactive user experience for any prompt</a>. Y. Leviathan, D. Valevski, V. Natchu, Y. Matias, Google Research, 18 ноября 2025.</li>
+  <li id="src-8"><a href="https://gofastmcp.com/apps/overview">FastMCP: Apps</a>, <a href="https://gofastmcp.com/apps/quickstart">Quickstart</a>, <a href="https://gofastmcp.com/apps/fastmcp-app">FastMCPApp</a>, <a href="https://gofastmcp.com/apps/generative">Generative UI</a>, <a href="https://gofastmcp.com/apps/development">Development</a>. Prefect, документация FastMCP 4.0, по состоянию на 30 сентября 2026.</li>
+  <li id="src-9"><a href="https://docs.thesys.dev/llms.txt">Thesys docs: C1 by Thesys documentation (archive)</a> и <a href="https://docs.thesys.dev/legacy/guides/how-c1-works.md">How C1 Works</a>. Thesys, по состоянию на 30 сентября 2026.</li>
+  <li id="src-10"><a href="https://news.ycombinator.com/item?id=46286407">A2UI: A Protocol for Agent-Driven Interfaces</a>. Hacker News, обсуждение, 16 декабря 2025, 164 пункта, 75 комментариев.</li>
+  <li id="src-11"><a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/reference/messages.md">A2UI docs: Message Types</a> и <a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/introduction/what-is-a2ui.md">What is A2UI?</a>, спецификация протокола <a href="https://github.com/a2ui-project/a2ui/blob/main/specification/v0_9_1/docs/a2ui_protocol.md">A2UI v0.9.1 Protocol</a> и схема <a href="https://github.com/a2ui-project/a2ui/blob/main/specification/v0_9_1/json/common_types.json"><code>common_types.json</code></a>. Проект A2UI, ветка main, по состоянию на 30 сентября 2026.</li>
+  <li id="src-12"><a href="https://pypi.org/project/a2ui-agent-sdk/">a2ui-agent-sdk 0.7.0 на PyPI</a> (README и исходники пакета: <code>inference_formats/direct_json</code>, <code>parser/payload_fixer.py</code>, <code>schema/manager.py</code>, <code>adk/send_a2ui_to_client_toolset.py</code>) и <a href="https://pypi.org/project/a2ui-core/">a2ui-core 0.2.0</a>. Проект A2UI, 28 сентября 2026.</li>
+  <li id="src-13"><a href="https://github.com/a2ui-project/a2ui/blob/main/specification/v1_0/docs/evolution_guide.md">A2UI Protocol Evolution Guide: v0.9 to v1.0</a>. Проект A2UI, по состоянию на 30 сентября 2026.</li>
+  <li id="src-14">A2UI docs, раздел Concepts: <a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/concepts/catalogs.md">A2UI Catalogs</a>, <a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/concepts/actions.md">Handling User Actions</a>, <a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/concepts/transports.md">Transports</a>, <a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/concepts/glossary.md">Glossary</a>. Проект A2UI, по состоянию на 30 сентября 2026.</li>
+  <li id="src-15"><a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/guides/a2ui_over_mcp.md">A2UI over Model Context Protocol (MCP)</a>. Проект A2UI, руководство, по состоянию на 30 сентября 2026.</li>
+  <li id="src-16"><a href="https://github.com/a2ui-project/a2ui/tree/main/specification/v1_0/json">A2UI v1.0 JSON schemas</a>: <code>agent_to_renderer.json</code>, <code>renderer_to_agent.json</code>, <code>common_types.json</code>. Проект A2UI, по состоянию на 30 сентября 2026.</li>
+  <li id="src-17">A2UI docs: <a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/reference/renderers.md">Renderers (Client Libraries)</a>, <a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/ecosystem/renderers.md">Ecosystem Renderers</a>, <a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/ecosystem/a2ui-in-the-world.md">A2UI in the World</a>. Проект A2UI, по состоянию на 30 сентября 2026.</li>
+  <li id="src-18">Issues и PR в a2ui-project/a2ui: <a href="https://github.com/a2ui-project/a2ui/issues/1410">#1410</a> (12 мая 2026, открыт), <a href="https://github.com/a2ui-project/a2ui/issues/1469">#1469</a> (открыт 20 мая 2026, закрыт как not planned 26 мая 2026), <a href="https://github.com/a2ui-project/a2ui/pull/1707">PR #1707</a> (19 июня 2026), <a href="https://github.com/a2ui-project/a2ui/issues/2013">#2013</a>, <a href="https://github.com/a2ui-project/a2ui/issues/2104">#2104</a> (Proposal: Server-Side Functions and Unified Function RPC, 27 июля 2026), <a href="https://github.com/a2ui-project/a2ui/issues/2173">#2173</a> (5 августа 2026), <a href="https://github.com/a2ui-project/a2ui/issues/2584">#2584</a> (закрыт 9 сентября 2026), <a href="https://github.com/a2ui-project/a2ui/issues/1893">#1893</a>. По состоянию на 30 сентября 2026.</li>
+  <li id="src-19">Google A2UI Team, Google Developers Blog: <a href="https://developers.googleblog.com/en/introducing-a2ui-an-open-project-for-agent-driven-interfaces/">Introducing A2UI: An open project for agent-driven interfaces</a> (15 декабря 2025), <a href="https://developers.googleblog.com/en/a2ui-v0-9-generative-ui/">A2UI v0.9</a> (17 апреля 2026), <a href="https://developers.googleblog.com/en/a2ui-and-mcp-apps/">A2UI and MCP Apps</a> (17 июня 2026, совместно с Ido Salomon и Liad Yosef).</li>
+  <li id="src-20"><a href="https://github.com/a2ui-project/a2ui/commits/main/specification">История коммитов a2ui-project/a2ui в <code>specification/</code></a> (каталоги v0_8, v0_9, v0_9_1, v1_0, inference_formats). По состоянию на 30 сентября 2026.</li>
+  <li id="src-21"><a href="https://developer.android.com/develop/ui/compose/agentic">Agent-to-UI Renderer for Jetpack Compose (A2UI)</a>. Android Developers, по состоянию на 30 сентября 2026.</li>
+  <li id="src-22"><a href="https://github.com/a2ui-project/a2ui/tree/main/specification/proposals/express">A2UI Express proposal</a>: README, <code>express_dsl_examples.md</code>, грамматика <code>Express.g4</code>. Проект A2UI, июль 2026.</li>
+  <li id="src-23"><a href="https://www.openui.com/blog/state-of-generative-ui-report">The State of Generative UI in 2026</a> (10 июня 2026), <a href="https://www.openui.com/blog/oui-1">OUI-1: world's first model for Generative UI</a> (8 сентября 2026), <a href="https://www.openui.com/blog/stop-making-ai-write-json">Stop making AI write JSON</a>. OpenUI (бывший Thesys), блог.</li>
+  <li id="src-24"><a href="https://blog.modelcontextprotocol.io/posts/2025-11-21-mcp-apps/">MCP Apps: Extending servers with interactive user interfaces</a>. A. Pidkuiko, O. Chafik, I. Salomon, L. Yosef, N. Cooper, S. Strong, J. Swannack, A. Christakis, B. Ashley, MCP Blog, 21 ноября 2025.</li>
+  <li id="src-25"><a href="https://blog.modelcontextprotocol.io/posts/2026-01-26-mcp-apps/">MCP Apps - Bringing UI Capabilities To MCP Clients</a>. MCP Core Maintainers, MCP Blog, 26 января 2026.</li>
+  <li id="src-26"><a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/guides/mcp-apps-in-a2ui.md">MCP Apps Integration in A2UI Surfaces</a> и <a href="https://github.com/a2ui-project/a2ui/blob/main/docs/public/guides/a2ui-in-mcp-apps.md">A2UI Dynamic Rendering within MCP Applications</a>. Проект A2UI, руководства, по состоянию на 30 сентября 2026.</li>
+  <li id="src-27"><a href="https://github.com/modelcontextprotocol/ext-apps/releases">modelcontextprotocol/ext-apps: Releases</a> (1.7.5 — 23 июля 2026, 2.0.0 — 8 сентября 2026, 2.0.3 — 25 сентября 2026) и <a href="https://github.com/modelcontextprotocol/ext-apps">README</a>. Model Context Protocol.</li>
+  <li id="src-28"><a href="https://news.ycombinator.com/item?id=47939079">A playable DOOM MCP app</a>. Hacker News, обсуждение, 28 апреля 2026, 93 пункта, 31 комментарий.</li>
+  <li id="src-29"><a href="https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/draft/apps.mdx">SEP-1865, <code class="wrap">specification/draft/apps.mdx</code></a>, статус Draft. Model Context Protocol, по состоянию на 30 сентября 2026.</li>
+  <li id="src-30"><a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog">Model Context Protocol, ревизия 2026-07-28: Key Changes</a>. Model Context Protocol, 28 июля 2026.</li>
+  <li id="src-31"><a href="https://blog.modelcontextprotocol.io/posts/mcp-roadmap/">The New MCP Roadmap</a>. MCP Blog, 22 августа 2026.</li>
+  <li id="src-32">Данные реестров на 30 сентября 2026: <a href="https://registry.npmjs.org/">npm registry</a> (версии, даты публикации, пометка deprecated у <a href="https://www.npmjs.com/package/@copilotkitnext/react">@copilotkitnext/react</a>), <a href="https://api.npmjs.org/downloads/">npm downloads API</a> (неделя 23–29 сентября 2026), <a href="https://pypistats.org/">pypistats</a> и <a href="https://pypi.org/">PyPI JSON API</a>, <a href="https://api.github.com/">GitHub REST API</a> (звёзды и даты создания репозиториев).</li>
+  <li id="src-33"><a href="https://code.claude.com/docs/en/mcp">Connect Claude Code to tools via MCP</a>. Anthropic, документация Claude Code, по состоянию на 30 сентября 2026.</li>
+  <li id="src-34"><a href="https://developers.openai.com/plugins/build/chatgpt-ui">Add UI to your MCP server</a> и <a href="https://developers.openai.com/plugins/llms-full.txt">полная выгрузка документации Plugins</a> (бывший Apps SDK, редиректы с <code>/apps-sdk</code>). OpenAI, по состоянию на 30 сентября 2026.</li>
+  <li id="src-35"><a href="https://news.ycombinator.com/item?id=45494558">Apps SDK</a>. Hacker News, обсуждение, 6 октября 2025, 468 пунктов.</li>
+  <li id="src-36"><a href="https://github.com/openai/mcp-extensions/blob/main/docs/spec.md">openai/mcp-extensions: spec</a> и <a href="https://developers.openai.com/plugins/build/extensions">Plugin Extensions</a>. OpenAI, репозиторий создан 29 сентября 2026.</li>
+  <li id="src-37"><a href="https://developers.openai.com/api/docs/guides/chatkit-widgets">ChatKit widgets</a>. OpenAI, документация, по состоянию на 30 сентября 2026.</li>
+  <li id="src-38"><a href="https://github.com/MCP-UI-Org/mcp-ui">MCP-UI-Org/mcp-ui, README</a>. I. Salomon, L. Yosef, по состоянию на 30 сентября 2026.</li>
+  <li id="src-39"><a href="https://news.ycombinator.com/item?id=47439300">I turned Markdown into a protocol for generative UI</a>. Hacker News, обсуждение, 19 марта 2026, 130 пунктов.</li>
+  <li id="src-40">Leviathan, Valevski, Kalman, Lumen, Segalis, Molad, Pasternak, Natchu, Nygaard, Venkatachary, Manyika, Matias. <a href="https://arxiv.org/abs/2604.09577">Generative UI: LLMs are Effective UI Generators</a>. arXiv 2604.09577, Google, 24 февраля 2026.</li>
+  <li id="src-41">Y. Peng и др. <a href="https://arxiv.org/abs/2608.29387">EvoGenUI-Bench: Evaluating LLMs as Multi-Turn Generative UI Assistants</a>, arXiv, 29 августа 2026; <a href="https://arxiv.org/abs/2605.24830">Macaron-A2UI</a>, arXiv, 24 мая 2026; B. Ryskeldiev, <a href="https://arxiv.org/abs/2604.25455">Generative UI as an Accessibility Bridge: Lessons from C2C E-Commerce</a>, arXiv, 28 апреля 2026.</li>
+  <li id="src-42"><a href="https://news.ycombinator.com/item?id=49613182">OUI-1: world's first model for Generative UI</a>. Hacker News, обсуждение, 8 сентября 2026, 62 пункта, 65 комментариев.</li>
+  <li id="src-43">Anthropic, блог Claude: <a href="https://claude.com/blog/interactive-tools-in-claude">Interactive tools in Claude</a> (26 января 2026) и <a href="https://claude.com/blog/claude-builds-visuals">Claude builds visuals</a> (12 марта 2026, обновлено 22 апреля 2026).</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>

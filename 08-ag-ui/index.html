@@ -1,0 +1,1224 @@
+<!doctype html>
+<html lang="ru" data-chapter="08">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AG-UI: протокол агент ↔ интерфейс — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 8</b> из 17, часть «Протоколы»</p>
+  <h1>AG-UI: протокол агент ↔ интерфейс</h1>
+  <p class="lead">Агент на FastAPI, фронтенд на React, между ними SSE. Пока по этому каналу идёт только текст, хватает десяти строк кода. Потом агенту нужно спросить разрешения перед удалением файла, показать план из пяти шагов и вызвать инструмент, который умеет выполнить только браузер, и выясняется, что у каждого фреймворка для этого свой формат событий. AG-UI предлагает один: запрос <code>RunAgentInput</code> на вход и поток из 31 типа событий на выход. Версия 1.0 вышла 17 сентября 2026 года.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="wire">
+<h2>Один POST и поток событий</h2>
+
+<p>Вот весь протокол в миниатюре. Пример взят из нормативной спецификации AG-UI 1.0, из раздела о привязке к HTTP и SSE<a class="cite" href="#src-1">1</a>:</p>
+
+<div class="tabs">
+<section data-tab="Запрос">
+<script type="text/plain" class="code" data-lang="http" data-title="POST /agent — запуск прогона">
+POST /agent HTTP/1.1
+Content-Type: application/json
+Accept: text/event-stream
+
+{"threadId":"thr-1","runId":"run-1","messages":[…]}
+</script>
+</section>
+<section data-tab="Ответ">
+<script type="text/plain" class="code" data-lang="sse" data-title="HTTP/1.1 200 OK, Content-Type: text/event-stream">
+data: {"type":"RUN_STARTED","threadId":"thr-1","runId":"run-1"}
+
+data: {"type":"TEXT_MESSAGE_START","messageId":"msg-1","role":"assistant"}
+
+data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"msg-1","delta":"Hello."}
+
+data: {"type":"TEXT_MESSAGE_END","messageId":"msg-1"}
+
+data: {"type":"RUN_FINISHED","threadId":"thr-1","runId":"run-1"}
+</script>
+</section>
+</div>
+
+<p>Клиент отправляет один JSON-объект и получает поток. Пока поток идёт, в обратную сторону не уходит ничего: ни подтверждений, ни отмены, ни правок состояния. Всё, что приложение хочет сообщить агенту, поедет в следующем запросе. На этой асимметрии держится почти каждое решение в протоколе, и почти каждая ошибка интеграции в этой главе растёт из попытки её обойти.</p>
+
+<p>Единица работы — <dfn>прогон</dfn> (run): от <code>RUN_STARTED</code> до <code>RUN_FINISHED</code> или <code>RUN_ERROR</code>, с идентификатором <code>runId</code>. Прогоны одного разговора объединены <code>threadId</code>. Реплика пользователя, ответ на вызов инструмента, решение по запросу на подтверждение — каждый раз это новый прогон в том же треде.</p>
+
+<figure class="fig wide" id="fig-first-run">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Пользователь
+  participant A as Приложение (клиент)
+  participant P as Агент (продюсер)
+  U->>A: пишет сообщение
+  A->>P: POST RunAgentInput r1
+  P-->>A: RUN_STARTED
+  P-->>A: TEXT_MESSAGE_* (дельты)
+  P-->>A: TOOL_CALL_* (аргументы)
+  P-->>A: STATE_DELTA
+  P-->>A: RUN_FINISHED
+  Note over A,P: соединение закрыто, агенту нечего ждать
+  U->>A: реплика или ответ инструмента
+  A->>P: POST RunAgentInput r2, вся история
+  P-->>A: RUN_STARTED ... RUN_FINISHED
+</script>
+<figcaption>Два прогона одного треда. Стрелок от приложения к агенту по одной на прогон, и во втором запросе снова вся история, а не только новая реплика.</figcaption>
+</figure>
+
+<h3>Что лежит в <code>RunAgentInput</code></h3>
+
+<p>Запрос в протоколе один, и спецификация описывает каждое его поле вместе с обязательствами сторон<a class="cite" href="#src-2">2</a>:</p>
+
+<table>
+<thead><tr><th>Поле</th><th>Обязательно</th><th>Что значит</th></tr></thead>
+<tbody>
+<tr><td><code>threadId</code>, <code>runId</code></td><td><span class="yes">да</span></td><td>Тред и прогон. <code>runId</code> нельзя повторять внутри треда.</td></tr>
+<tr><td><code>messages</code></td><td><span class="yes">да</span></td><td>Полная история, как её видит приложение. Бокового канала для прошлых ходов нет.</td></tr>
+<tr><td><code>protocolVersion</code></td><td><span class="part">должен</span></td><td>Отправитель версии 1.0 объявляет <code>"1.0"</code>, если не знает точно, что собеседник старше этого поля.</td></tr>
+<tr><td><code>tools</code></td><td><span class="no">нет</span></td><td>Инструменты, которые выполняет приложение, а не агент. Отсутствие равно пустому списку.</td></tr>
+<tr><td><code>context</code></td><td><span class="no">нет</span></td><td>Пары <code>{description, value}</code> для заземления агента.</td></tr>
+<tr><td><code>state</code></td><td><span class="no">нет</span></td><td>Состояние, с которого стартует прогон. Отсутствие равно <code>{}</code>.</td></tr>
+<tr><td><code>forwardedProps</code></td><td><span class="no">нет</span></td><td>Непрозрачные данные приложения; посредники не имеют права их менять.</td></tr>
+<tr><td><code>resume</code></td><td><span class="no">нет</span></td><td>Ответы на прерывания прошлого прогона.</td></tr>
+<tr><td><code>parentRunId</code></td><td><span class="no">нет</span></td><td>Родительский прогон, когда один агент запускает другой отдельным прогоном.</td></tr>
+</tbody>
+</table>
+
+<p>Главная строка таблицы — <code>messages</code>. Сервер агента не обязан ничего помнить между прогонами: всё, что было в разговоре, приходит заново в каждом запросе. Это удобно для масштабирования, потому что любой экземпляр сервера может обслужить любой прогон. Обратная сторона: историю присылает клиент, и сервер получает ровно то, что клиент решил прислать. Что из этого следует для безопасности, разобрано в разделе <a href="#state">про состояние</a>.</p>
+
+<aside class="margin"><p><b>Продюсер и потребитель</b> — термины спецификации. Продюсер выпускает поток: агент, мост фреймворка, прокси, тестовая заглушка. Потребитель читает: клиентский SDK, интерфейс, запись в лог.</p></aside>
+
+<p>Ещё два правила определяют, как стороны переживают расхождения в версиях. Запрос, который продюсер не может разобрать, отклоняется до <code>RUN_STARTED</code> обычной ошибкой транспорта, например HTTP 4xx; потока нет, и <code>RUN_ERROR</code> тоже нет. А вот незнакомое поле или незнакомый тип события в потоке ошибкой не считается: потребитель выбрасывает его с предупреждением и продолжает работу. Спецификация называет этот принцип <q>tolerant reader, strict writer</q><a class="cite" href="#src-3">3</a>: пишешь только то, что описано в схеме, а читая, переживаешь всё, чего не знаешь. Сломанное известное поле, скажем строка вместо массива, фатально на любом пути. Путь здесь — маршрут, которым поток доходит до потребителя: чистый SSE, SSE через установленный middleware или бинарная привязка на protobuf<a class="cite" href="#src-10">10</a>.</p>
+
+<p>Последнее правило конверта легко пропустить: <q>absent means absent</q>. Необязательное поле без значения опускается, а не отправляется как <code>null</code>. При этом <code>null</code> внутри открытого объекта, например внутри <code>state</code>, — это данные, и их надо сохранить<a class="cite" href="#src-4">4</a>. Идентификаторы непрозрачны: разбирать структуру из <code>runId</code> или <code>messageId</code> потребитель не должен. Уникальность <code>messageId</code> нужна в пределах треда, а не прогона: сообщение переходит через границу прогонов, и снапшот в следующем прогоне вправе переизложить его по тому же идентификатору<a class="cite" href="#src-4">4</a>.</p>
+
+<h3>Откуда это взялось</h3>
+
+<p>AG-UI вырос из внутреннего кода CopilotKit, которым компания подключала к своему React-фронтенду агентов на LangGraph и CrewAI. Организацию <code>ag-ui-protocol</code> на GitHub завели 30 апреля 2025 года, репозиторий <code>ag-ui</code> с первым коммитом появился 7 мая<a class="cite" href="#src-16">16</a>. Страница обновлений в документации AG-UI называет датой открытия репозиториев 9 апреля, но история GitHub этого не подтверждает. В июне 2025-го CopilotKit объяснял смысл затеи формулой «M×N → M+N»: вместо того чтобы каждому интерфейсу учить каждый фреймворк, каждый фреймворк один раз пишет мост в общий протокол<a class="cite" href="#src-5">5</a>. Представитель CopilotKit позже признал в трекере: <q>releasing a protocol wasn't planned, and it's been a work in progress to decouple it</q><a class="cite" href="#src-6">6</a>.</p>
+
+<p>Протоколов вокруг агента несколько. MCP подключает к нему инструменты и данные (<a href="../05-mcp/index.html">глава 5</a>), A2A связывает агентов между собой (<a href="../07-a2a/index.html">глава 7</a>), AG-UI отвечает за участок между агентом и приложением, у которого есть живой пользователь. Где проходят границы между ними и какой протокол в этой схеме обычно забывают, — в разделе <a href="#landscape">о соседних протоколах</a>.</p>
+</section>
+
+<section id="events">
+<h2>События: 31 тип в восьми семействах</h2>
+
+<p>Сколько в AG-UI типов событий? Пост CopilotKit от июня 2025 года говорит о шестнадцати<a class="cite" href="#src-5">5</a>, и та же цифра до сих пор стоит на странице CopilotKit о различиях открытой и платной версий<a class="cite" href="#src-7">7</a>. Страница документации о сабагентах пишет «19 of the 36 event types»<a class="cite" href="#src-8">8</a>. Нормативная спецификация дважды называет тридцать одно событие в восьми семействах, и в перечислении <code>EventType</code> из опубликованной JSON Schema ровно 31 значение<a class="cite" href="#src-4">4</a><a class="cite" href="#src-9">9</a>. Число 36, по всей видимости, получается, если прибавить пять выведенных из употребления событий <code>THINKING_*</code>; сама документация этого нигде не объясняет. Верь 31: столько же даёт <code>list(EventType)</code> в Python-пакете <code>ag-ui-protocol</code> 1.0.0.</p>
+
+<table class="wide">
+<thead><tr><th>Семейство</th><th class="num">Шт.</th><th>События</th><th>Зачем</th></tr></thead>
+<tbody>
+<tr><td>Жизненный цикл</td><td class="num">5</td><td><code>RUN_STARTED</code>, <code>RUN_FINISHED</code>, <code>RUN_ERROR</code>, <code>STEP_STARTED</code>, <code>STEP_FINISHED</code></td><td>Границы прогона и именованные этапы. Единственное семейство, обязательное для продюсера.</td></tr>
+<tr><td>Текст</td><td class="num">4</td><td><code>TEXT_MESSAGE_START</code>, <code>_CONTENT</code>, <code>_END</code>, <code>_CHUNK</code></td><td>Сообщение, собранное из дельт.</td></tr>
+<tr><td>Вызовы инструментов</td><td class="num">5</td><td><code>TOOL_CALL_START</code>, <code>_ARGS</code>, <code>_END</code>, <code>_CHUNK</code>, <code>_RESULT</code></td><td>Вызов с потоковыми аргументами и отдельно его результат.</td></tr>
+<tr><td>Состояние</td><td class="num">3</td><td><code>STATE_SNAPSHOT</code>, <code>STATE_DELTA</code>, <code>MESSAGES_SNAPSHOT</code></td><td>Общий документ состояния и восстановление истории.</td></tr>
+<tr><td>Активность</td><td class="num">2</td><td><code>ACTIVITY_SNAPSHOT</code>, <code>ACTIVITY_DELTA</code></td><td>Структурированный прогресс, который видит только интерфейс.</td></tr>
+<tr><td>Рассуждения</td><td class="num">7</td><td><code>REASONING_START</code>, <code>_MESSAGE_START</code>, <code>_MESSAGE_CONTENT</code>, <code>_MESSAGE_END</code>, <code>_MESSAGE_CHUNK</code>, <code>_END</code>, <code>_ENCRYPTED_VALUE</code></td><td>Видимая сводка рассуждений и непрозрачный зашифрованный блоб.</td></tr>
+<tr><td>Сабагенты</td><td class="num">3</td><td><code>SUBAGENT_STARTED</code>, <code>_FINISHED</code>, <code>_ERROR</code></td><td>Кто из вложенных агентов что сказал.</td></tr>
+<tr><td>Специальные</td><td class="num">2</td><td><code>RAW</code>, <code>CUSTOM</code></td><td>Чужое событие как есть и расширение приложения.</td></tr>
+</tbody>
+</table>
+
+<p>Продюсер обязан выпускать только события жизненного цикла, всё остальное по желанию. Потребитель обязан принимать все 31<a class="cite" href="#src-4">4</a>. Если пишешь свой клиент, ветка «неизвестное событие» в твоём <code>match</code> должна существовать с первого дня, даже если сервер пока шлёт только текст.</p>
+
+<h3>Грамматика потока</h3>
+
+<p>Текст и вызовы инструментов устроены одинаково: открывающее событие с идентификатором, одна или больше дельт, закрывающее событие. У текста это <code>messageId</code>, у вызова <code>toolCallId</code>. Сообщения и вызовы могут перемежаться, поэтому потребитель склеивает дельты по идентификатору, а не по порядку. Короткая форма <code>*_CHUNK</code> экономит продюсеру открытие и закрытие: клиент сам раскрывает её в тройку. В 1.0 у этой формы появились жёсткие правила. Первый чанк обязан нести идентифицирующие поля, следующие могут их опускать, а чанк, который повторяет поле открытия с другим значением, роняет прогон<a class="cite" href="#src-10">10</a>. И закрытое здесь не значит запечатанное: продюсер вправе переоткрыть тот же <code>messageId</code> или <code>toolCallId</code> новым <code>*_START</code>, и новые дельты допишутся к старым<a class="cite" href="#src-11">11</a>.</p>
+
+<p>С вызовами инструментов есть тонкость, на которой ошибаются интерфейсы. <code>TOOL_CALL_ARGS</code> несёт кусок JSON-строки, и протокол не проверяет его на лету; <code>TOOL_CALL_END</code> говорит, что аргументы кончились, но не что они валидны. Спецификация формулирует запрет прямо: <mark>потребитель не должен действовать по аргументам до <code>TOOL_CALL_END</code></mark><a class="cite" href="#src-11">11</a>. Показывать частичные аргументы как превью можно, запускать по ним что-либо нельзя. Результат приходит отдельным событием <code>TOOL_CALL_RESULT</code>, это полноценное сообщение с ролью <code>tool</code>, и вызов оно не переоткрывает.</p>
+
+<p>Клиентский SDK на TypeScript прогоняет каждое входящее событие через цепочку этапов. Порядок у них не случайный: трансляция старых форм и пользовательский middleware стоят раньше проверки, чтобы успеть переписать то, что проверка иначе отбросила бы.</p>
+
+<figure class="fig wide" id="fig-pipeline">
+<ol class="pipeline">
+  <li data-tone="soft"><b>Совместимость</b><span>старые формы, например <code>THINKING_*</code>, переписываются в новые</span></li>
+  <li><b>Middleware</b><span>твои функции из <code>agent.use()</code></span></li>
+  <li data-tone="accent"><b>Enforcement</b><span>незнакомое выбрасывается с предупреждением, битое известное роняет прогон</span></li>
+  <li><b>Раскрытие чанков</b><span><code>*_CHUNK</code> становится тройкой START, CONTENT, END</span></li>
+  <li data-tone="warn"><b>Верификация</b><span>порядок событий, всё открытое закрыто</span></li>
+  <li data-tone="ok"><b>Приложение</b><span>подписчики и состояние интерфейса</span></li>
+</ol>
+<figcaption>Путь события внутри <code>@ag-ui/client</code>. В Python-SDK ничего из этого нет: там только типы и кодировщик, и если ты пишешь потребителя на Python, этапы с третьего по пятый придётся делать самому.</figcaption>
+</figure>
+
+<h3>Рассуждения, активность и метаданные</h3>
+
+<p>Семейство рассуждений в 1.0 заменило пять событий <code>THINKING_*</code>. Внутри два разных механизма. <code>REASONING_MESSAGE_*</code> несёт видимую пользователю сводку. <code>REASONING_ENCRYPTED_VALUE</code> с полями <code>subtype</code> (<code>"message"</code> или <code>"tool-call"</code>), <code>entityId</code> и <code>encryptedValue</code> несёт блоб, который клиент хранит и возвращает агенту в следующем прогоне, не читая. Документация называет образцы: зашифрованные reasoning items у OpenAI при <code>store:false</code> и thought signatures у Gemini<a class="cite" href="#src-4">4</a>. Для Claude то же самое делает подпись блока рассуждений. Мост к Claude Agent SDK из репозитория AG-UI накапливает <code>signature_delta</code> из потока Anthropic и после закрытия блока выпускает <code>REASONING_ENCRYPTED_VALUE</code> с <code>subtype: "message"</code>, привязанный к идентификатору этого блока<a class="cite" href="#src-12">12</a>. Как подписи и зашифрованные рассуждения выглядят на уровне API провайдеров, разобрано в <a href="../01-llm-api-agent-loop/index.html">главе 1</a>.</p>
+
+<p>Правила открытия и закрытия в 1.0 стали строгими: незакрытый блок рассуждений на момент <code>RUN_FINISHED</code> теперь валит прогон на любом пути, раньше это зависело от пути обработки<a class="cite" href="#src-10">10</a>. Продюсер, написанный под старые правила, может начать падать на новом клиенте. Мост к Claude Agent SDK на всякий случай закрывает все висящие вызовы и блоки рассуждений перед концом потока.</p>
+
+<p><dfn>Активность</dfn> — сообщения с ролью <code>activity</code> и структурированным содержимым вместо строки: план из шагов, чеклист поиска, прогресс-бар. <code>ACTIVITY_SNAPSHOT</code> несёт <code>messageId</code>, тип вроде <code>"PLAN"</code> или <code>"SEARCH"</code>, объект <code>content</code> и флаг <code>replace</code>; <code>ACTIVITY_DELTA</code> правит его JSON Patch'ем. Такие сообщения живут только в интерфейсе, и потребитель обязан вырезать их из <code>messages</code>, прежде чем отправить историю агенту<a class="cite" href="#src-2">2</a>. Модель их не видит. Именно по этому каналу поверх AG-UI едет A2UI, об этом в <a href="#ux">разделе про интерфейс</a>.</p>
+
+<p>Произвольные поля верхнего уровня в событиях 1.0 до приложения больше не доезжают, клиент их выбрасывает. В посте о выходе версии это сказано одной фразой: <q>Custom fields you read off events are gone. Use <code>metadata</code> instead</q><a class="cite" href="#src-13">13</a>. <code>metadata</code> есть у каждого события, сообщения, вызова инструмента и ответа на прерывание. Когда события складываются в сообщение, метаданные сливаются по ключам, последняя запись побеждает, без рекурсии. Метаданные вызова инструмента оседают на самом вызове, а не на родительском сообщении: у одного сообщения бывает несколько вызовов, и общий получатель сделал бы результат зависимым от порядка. Ключ <code>ag-ui</code> зарезервирован.</p>
+
+<div class="tabs">
+<section data-tab="Python, продюсер">
+<script type="text/plain" class="code" data-lang="python" data-title="Метаданные на событии (из поста о 1.0)">
+TextMessageEndEvent(
+    message_id="msg-1",
+    metadata={"acme.model": "gpt-5.5", "acme.trace_id": "tr_8f2a"},
+)
+</script>
+</section>
+<section data-tab="TypeScript, потребитель">
+<script type="text/plain" class="code" data-lang="typescript" data-title="Те же метаданные на собранном сообщении">
+agent.messages.at(-1)?.metadata;
+// { "acme.model": "gpt-5.5", "acme.trace_id": "tr_8f2a" }
+</script>
+</section>
+</div>
+
+<p>Для чужих событий есть <code>RAW</code> (событие другой системы как есть, с необязательным <code>source</code>), для своих событий приложения — <code>CUSTOM</code> с <code>name</code> и <code>value</code>. У любого события есть необязательное поле <code>rawEvent</code> с исходником, если событие получено трансляцией, но выводить из него поведение потребитель не должен. То же с <code>timestamp</code>: порядок событий задаёт порядок прихода, а не метка времени<a class="cite" href="#src-4">4</a>.</p>
+
+<h3>Счёт токенов</h3>
+
+<p>Одна из новинок 1.0 появилась после публичного ревью черновика в сентябре 2026 года<a class="cite" href="#src-14">14</a>: поле <code>usage</code> на <code>RUN_FINISHED</code> и <code>RUN_ERROR</code>, по записи на каждую пару провайдер и модель<a class="cite" href="#src-15">15</a>.</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="RUN_FINISHED с usage (пример из поста о 1.0)">
+{
+  "type": "RUN_FINISHED",
+  "threadId": "t1",
+  "runId": "r1",
+  "usage": [
+    { "model": "gpt-5.5", "inputTokens": 1200, "outputTokens": 340, "cachedInputTokens": 800 }
+  ]
+}
+</script>
+
+<p><code>inputTokens</code> и <code>outputTokens</code> — итоги, а <code>cachedInputTokens</code>, <code>cacheWriteInputTokens</code> и <code>reasoningTokens</code> — их части. В примере выше 800 токенов из кеша входят в 1200, а не прибавляются к ним. <code>totalTokens</code> равен сумме входа и выхода. Отсутствующий счётчик не равен нулю: продюсер не имеет права отправить ноль там, где данных нет. Токены сабагентов засчитываются в родительский прогон, а дочерние прогоны с <code>parentRunId</code> и возобновлённые после прерывания отчитываются сами за себя<a class="cite" href="#src-15">15</a>. Мост LangGraph начал заполнять <code>usage</code> 9 сентября 2026 года, в версии 0.0.45<a class="cite" href="#src-16">16</a>.</p>
+</section>
+
+<section id="python">
+<h2>Сервер и клиент на Python за вечер</h2>
+
+<p>Лучший способ понять поток — собрать обе стороны без фреймворков. Код ниже написан и запущен 30 сентября 2026 года на <code>ag-ui-protocol</code> 1.0.0, FastAPI 0.142.2 и Pydantic 2.13.5<a class="cite" href="#src-17">17</a>. Модели в нём нет: сервер отдаёт заготовленный текст, одну дельту состояния и, если клиент прислал инструменты, предлагает вызвать первый из них.</p>
+
+<div class="tabs">
+<section data-tab="server.py">
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок, проверен: server.py" data-hl="25-34">
+import asyncio, uuid
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from ag_ui.core import (RunAgentInput, RunStartedEvent, RunFinishedEvent, RunErrorEvent,
+    TextMessageStartEvent, TextMessageContentEvent, TextMessageEndEvent,
+    ToolCallStartEvent, ToolCallArgsEvent, ToolCallEndEvent, StateSnapshotEvent, StateDeltaEvent)
+from ag_ui.encoder import EventEncoder
+
+app = FastAPI()
+
+@app.post("/agent")
+async def run(input: RunAgentInput):
+    enc = EventEncoder()
+    async def events():
+        yield enc.encode(RunStartedEvent(thread_id=input.thread_id, run_id=input.run_id, protocol_version="1.0"))
+        try:
+            yield enc.encode(StateSnapshotEvent(snapshot={"steps": []}))
+            yield enc.encode(StateDeltaEvent(delta=[{"op": "add", "path": "/steps/-", "value": "thinking"}]))
+            mid = str(uuid.uuid4())
+            yield enc.encode(TextMessageStartEvent(message_id=mid, role="assistant"))
+            for word in ["Hello", ", ", "world"]:
+                await asyncio.sleep(0.05)
+                yield enc.encode(TextMessageContentEvent(message_id=mid, delta=word))
+            yield enc.encode(TextMessageEndEvent(message_id=mid))
+            if input.tools:  # инструмент фронтенда: предлагаем, но не отвечаем
+                tc = str(uuid.uuid4())
+                yield enc.encode(ToolCallStartEvent(tool_call_id=tc,
+                    tool_call_name=input.tools[0].name, parent_message_id=mid))
+                yield enc.encode(ToolCallArgsEvent(tool_call_id=tc,
+                    delta='{"color": "blue"}'))
+                yield enc.encode(ToolCallEndEvent(tool_call_id=tc))
+                yield enc.encode(RunFinishedEvent(
+                    thread_id=input.thread_id, run_id=input.run_id,
+                    outcome={"type": "success", "pendingToolCallIds": [tc]}))
+            else:
+                yield enc.encode(RunFinishedEvent(thread_id=input.thread_id, run_id=input.run_id))
+        except Exception as e:
+            yield enc.encode(RunErrorEvent(message=str(e)))
+    return StreamingResponse(events(), media_type=enc.get_content_type())
+</script>
+</section>
+<section data-tab="client.py">
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок, проверен: client.py" data-hl="5,15-16,19-20,25-26">
+import asyncio, uuid, httpx, jsonpatch
+from pydantic import TypeAdapter
+from ag_ui.core import Event, EventType, RunAgentInput, UserMessage, Tool
+
+EVENT = TypeAdapter(Event)  # дискриминированное объединение по полю "type"
+
+async def run_once(url: str, text: str) -> None:
+    body = RunAgentInput(thread_id="t-1", run_id=str(uuid.uuid4()), protocol_version="1.0",
+        messages=[UserMessage(id="u-1", role="user", content=text)],
+        tools=[Tool(name="change_background", description="Set page background",
+                    parameters={"type": "object", "properties": {"color": {"type": "string"}}})])
+    state, buf = {}, {}
+    async with httpx.AsyncClient(timeout=None) as http:
+        async with http.stream("POST", url,
+                headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
+                content=body.model_dump_json(by_alias=True, exclude_none=True)) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"):
+                    continue  # пустые разделители, комментарии, keep-alive
+                ev = EVENT.validate_json(line[5:].strip())
+                if ev.type == EventType.TEXT_MESSAGE_CONTENT: print(ev.delta, end="", flush=True)
+                elif ev.type == EventType.TEXT_MESSAGE_END: print()
+                elif ev.type == EventType.STATE_SNAPSHOT: state = ev.snapshot
+                elif ev.type == EventType.STATE_DELTA:  # в 1.0 операции патча — объекты, а не dict
+                    state = jsonpatch.apply_patch(state, [op.model_dump(by_alias=True, exclude_none=True) for op in ev.delta])
+                elif ev.type == EventType.TOOL_CALL_START: buf[ev.tool_call_id] = ""
+                elif ev.type == EventType.TOOL_CALL_ARGS: buf[ev.tool_call_id] += ev.delta
+                elif ev.type == EventType.TOOL_CALL_END: print("tool call ready:", ev.tool_call_id, buf[ev.tool_call_id])
+                elif ev.type == EventType.RUN_FINISHED: print("finished:", ev.outcome, "state:", state)
+                elif ev.type == EventType.RUN_ERROR: raise RuntimeError(ev.message)
+
+asyncio.run(run_once("http://127.0.0.1:8765/agent", "hi"))
+</script>
+</section>
+<section data-tab="Вывод">
+<script type="text/plain" class="code" data-lang="output" data-title="python client.py">
+Hello, world
+tool call ready: e264c1d9-77b8-4ce3-9cda-e5e7a8fbd4a1 {"color": "blue"}
+finished: type='success' pending_tool_call_ids=['e264c1d9-77b8-4ce3-9cda-e5e7a8fbd4a1'] state: {'steps': ['thinking']}
+</script>
+</section>
+</div>
+
+<p>Три места в этом коде стоили времени при проверке. Без заголовка <code>Content-Type: application/json</code> FastAPI отвечает 422: httpx с параметром <code>content=</code> его не ставит. В 1.0 <code>STATE_DELTA.delta</code> в Python — список типизированных моделей операций, а не словарей, поэтому перед <code>jsonpatch</code> их надо сдампить; в посте о выходе 1.0 это названо коротко: <q><code>patch["path"]</code> becomes <code>patch.path</code></q><a class="cite" href="#src-13">13</a>. И клиент обязан пропускать строки без <code>data:</code>: спецификация разрешает продюсеру слать комментарии и keep-alive<a class="cite" href="#src-1">1</a>. Кодировщик, наоборот, ведёт себя образцово: отсутствующие поля в выводе не появляются, а <code>null</code> внутри <code>state</code> доезжает до клиента как <code>null</code>.</p>
+
+<p>Бросается в глаза, чего в Python-пакете нет. Клиентского класса нет совсем, <code>ag_ui.core</code> и <code>ag_ui.encoder</code> — это типы и кодировщик для продюсера. Официальный quickstart создаёт кодировщик как <code>EventEncoder(accept=accept_header)</code>, будто тот выбирает формат по заголовку <code>Accept</code><a class="cite" href="#src-18">18</a>. В исходнике на <code>main</code> конструктор этот аргумент игнорирует, <code>get_content_type()</code> всегда возвращает <code>text/event-stream</code>, а <code>encode()</code> всегда пишет SSE<a class="cite" href="#src-19">19</a>. Python-продюсеры бывают только SSE-продюсерами. Quickstart, кстати, всё ещё вызывает модель <code>gpt-4o</code>.</p>
+
+<div class="note warn"><p><code>TypeAdapter(Event)</code> валидирует только 31 известный тип. На событии <code>{"type":"META",…}</code> из черновика или на <code>THINKING_START</code> от старого продюсера он бросает <code>ValidationError</code>, проверено на 1.0.0. Незнакомые поля внутри известного события, наоборот, модели молча сохраняют, а не выбрасывают с предупреждением, как требует спецификация. Спецификация об этом знает: раздел о модели обработки называет Python и .NET SDK, где модели разбирают поток мягко, а этапа, который вырезал бы лишнее до кода приложения, нет<a class="cite" href="#src-3">3</a>. Правило tolerant reader в Python-клиенте реализуешь сам: сначала читаешь <code>type</code> из сырого JSON, незнакомое логируешь и пропускаешь, остальное отдаёшь в адаптер.</p></div>
+
+<h3>Тот же поток в Claude Code</h3>
+
+<p>События вроде этих ты видишь каждый день, только в другом формате. Claude Code в неинтерактивном режиме умеет отдавать поток построчно<a class="cite" href="#src-20">20</a>:</p>
+
+<script type="text/plain" class="code" data-lang="bash" data-title="Токены из Claude Code, из документации по headless-режиму">
+claude -p "Write a poem" --output-format stream-json --verbose --include-partial-messages | \
+  jq -rj 'select(.type == "stream_event" and .event.delta.type? == "text_delta") | .event.delta.text'
+</script>
+
+<p>Внутри <code>stream_event</code> лежат сырые события потокового API Anthropic: <code>content_block_start</code>, <code>content_block_delta</code>, <code>content_block_stop</code>. Мост <code>ag-ui-claude-sdk</code> (0.1.5 на PyPI, 5 июня 2026 года; в таблице интеграций AG-UI он в разряде community<a class="cite" href="#src-21">21</a>) берёт тот же поток из Claude Agent SDK и переводит его в события AG-UI<a class="cite" href="#src-12">12</a>. В логах адаптера строки stderr подписаны <code>[Claude CLI stderr]</code>: под капотом Python-версия Agent SDK запускает CLI, так что прогон AG-UI обслуживает тот же бинарник, в котором ты работаешь.</p>
+
+<table>
+<thead><tr><th>Событие Anthropic</th><th>Что выпускает мост</th></tr></thead>
+<tbody>
+<tr><td><code>content_block_delta</code> / <code>text_delta</code></td><td><code>TEXT_MESSAGE_START</code> на первой дельте, дальше <code>TEXT_MESSAGE_CONTENT</code></td></tr>
+<tr><td><code>content_block_start</code> типа <code>thinking</code></td><td><code>REASONING_START</code> и <code>REASONING_MESSAGE_START</code></td></tr>
+<tr><td><code>thinking_delta</code></td><td><code>REASONING_MESSAGE_CONTENT</code></td></tr>
+<tr><td><code>signature_delta</code></td><td>копится до конца блока, затем <code>REASONING_ENCRYPTED_VALUE</code></td></tr>
+<tr><td><code>content_block_start</code> типа <code>tool_use</code></td><td><code>TOOL_CALL_START</code>, имя без префикса <code>mcp__…__</code></td></tr>
+<tr><td><code>input_json_delta</code></td><td><code>TOOL_CALL_ARGS</code></td></tr>
+<tr><td><code>content_block_stop</code></td><td><code>TOOL_CALL_END</code> или закрытие блока рассуждений</td></tr>
+<tr><td>итоговое сообщение с <code>is_error</code></td><td><code>RUN_ERROR</code> вместо <code>RUN_FINISHED</code></td></tr>
+</tbody>
+</table>
+
+<div class="note practice"><p>Вечерняя задача: подними <code>server.py</code>, прогони <code>client.py</code>, потом сними сырой поток <code>curl -N</code> с заголовком <code>Accept: text/event-stream</code>. Затем запусти <code>claude -p</code> с <code>stream-json</code> и сопоставь его строки с таблицей выше. После этого любой мост к любому фреймворку читается за десять минут: это всегда такой же перевод одного потока событий в другой.</p></div>
+
+<p>Раз клиент у тебя свой, заодно пиши на диск пары из входа прогона и событий, которые на него ответили. Спецификация ставит это во второй принцип дизайна: <q>Everything observable is in the exchange</q>. Запись обменов восстанавливает, что интерфейс знал в каждый момент, поэтому такие пары годятся и для регрессионных тестов клиента, и для разбора жалобы пользователя<a class="cite" href="#src-3">3</a>. Для хранения поток можно ужать функцией <code>compactEvents()</code> из <code>@ag-ui/client</code>: она склеивает тройки START, CONTENT, END в одно событие. Но склейка переставляет события, и документация предупреждает, что это не всегда безопасно: <code>MESSAGES_SNAPSHOT</code>, пришедший посреди открытого сообщения, после сжатия окажется позади него и перетрёт содержимое<a class="cite" href="#src-22">22</a>. Для тестов храни поток как есть.</p>
+</section>
+
+<section id="ending">
+<h2>Как прогон заканчивается</h2>
+
+<p>Пользователь закрыл вкладку посреди ответа. Протокол об этом ничего не знает: поток оборвался без завершающего события. Спецификация называет такой прогон <dfn>обрезанным</dfn> (truncated) и запрещает потребителю достраивать за продюсера <code>RUN_FINISHED</code><a class="cite" href="#src-1">1</a>. У обрезанного прогона нет исхода, и продолжить его нельзя: SSE-привязка не поддерживает возобновление, <code>Last-Event-ID</code> не используется, после обрыва нужен новый прогон с новым <code>runId</code>.</p>
+
+<p>Теперь пользователь нажал «Стоп». Если твой фронтенд вызывает <code>abortRun()</code> у <code>HttpAgent</code>, он отменяет HTTP-запрос через <code>AbortController</code><a class="cite" href="#src-22">22</a>, и по спецификации это тот же самый обрыв. Настоящая отмена — отдельный исход, который сообщает продюсер: <code>RUN_FINISHED</code> с <code>outcome: {"type": "cancelled"}</code>. Чтобы он появился, серверу нужно узнать о кнопке каким-то другим путём. Документация Pydantic AI предупреждает: закрытое соединение для их адаптера — внешняя отмена, и обработчик <code>on_cancel</code> на ней не срабатывает; для настоящей отмены заведи отдельный эндпоинт и токен отмены<a class="cite" href="#src-23">23</a>.</p>
+
+<figure class="fig wide" id="fig-run-end">
+<script type="text/x-mermaid">
+flowchart TD
+  act["RUN_STARTED: прогон идёт"] --> fin{"RUN_FINISHED"}
+  act -- "RUN_ERROR" --> err["сбой продюсера"]:::warn
+  act -. "обрыв" .-> trunc["исхода нет,<br/>не выдумывать"]:::warn
+  fin -- "success" --> ok["тред свободен"]:::ok
+  fin -- "+ pendingToolCallIds" --> pend["ответы тулов<br/>в messages"]
+  fin -- "interrupt" --> intr["resume[]<br/>в новом прогоне"]:::accent
+  fin -- "cancelled" --> canc["продолжать<br/>нечего"]:::mute
+</script>
+<figcaption>Все концовки одного прогона и что несёт следующий. Исходы <code>RUN_FINISHED</code> различает поле <code>outcome</code>, и его отсутствие значит успех. Обрыв — не исход, а его отсутствие. Не нарисован редкий случай: <code>RUN_ERROR</code> после успешного <code>RUN_FINISHED</code> превращает прогон в неудачный.</figcaption>
+</figure>
+
+<p>Схема 1.0 описывает <code>outcome</code> как объединение трёх вариантов<a class="cite" href="#src-9">9</a>. Успех может нести <code>pendingToolCallIds</code>, список вызовов инструментов фронтенда, оставшихся без ответа. Прерывание несёт непустой массив <code>interrupts</code>. Отмена не несёт ничего, и <code>result</code> при ней ставить не следует. Если <code>outcome</code> нет, это успех, поэтому любой продюсер, написанный до появления исходов, автоматически остаётся корректным.</p>
+
+<p>Отмену добавили сразу в 1.0, а не отложили, и раздел спецификации о жизненном цикле объясняет почему: исход, добавленный после 1.0, пришёл бы к клиентам 1.0 без <code>outcome</code>, который они понимают, то есть выглядел бы как обычный успех<a class="cite" href="#src-15">15</a>. Новое значение терминального состояния нельзя добавить обратно совместимо: старый читатель трактует его как самое безобидное из известных.</p>
+
+<p>Конец прогона не обязательно конец ответа. Один POST несёт один запрос, но поток в ответ может нести несколько прогонов подряд, и обычный случай тут — продюсер проигрывает историю треда перед запрошенным прогоном<a class="cite" href="#src-1">1</a>. Следующий прогон открывается только после закрытия текущего, а любое другое событие после закрытия потребитель обязан отвергнуть. Историю, которая у клиента уже есть, продюсер переизлагает снапшотами: <code>MESSAGES_SNAPSHOT</code> сверяет сообщения по идентификаторам, <code>STATE_SNAPSHOT</code> заменяет состояние, поэтому повтор безвреден. Прогнать вместо этого заново тройки <code>TEXT_MESSAGE_*</code> нельзя: текст допишется к уже имеющемуся<a class="cite" href="#src-15">15</a>. Клиент, который перестаёт читать на первом <code>RUN_FINISHED</code>, на таком потоке потеряет как раз запрошенный прогон.</p>
+
+<h3>Ошибки: в потоке и до него</h3>
+
+<p>Ошибок три вида, и отличаются они тем, когда и как о них узнаёт клиент. Запрос, который продюсер не смог разобрать, получает ошибку транспорта до всякого потока. <code>RUN_ERROR</code> — сообщение продюсера о собственном сбое уже внутри потока; поток может даже начаться с него. Третий вид редкий, но законный: <code>RUN_ERROR</code> после <code>RUN_FINISHED</code>, например если после успешного прогона не удалось дописать ответ в транспорт. Потребитель обязан считать такой прогон неудачным<a class="cite" href="#src-15">15</a>.</p>
+
+<p>Платформа поверх протокола может провести эту границу по-своему. В контракте Amazon Bedrock AgentCore любая ошибка приходит SSE-событием <code>RUN_ERROR</code>, даже если запрос не дошёл до контейнера, а категории различаются HTTP-статусом ответа. Ошибки уровня соединения (аутентификация, права, валидация, троттлинг, занятая сессия) идут с настоящим кодом: 401, 403, 400, 429, 409. Сбой самого агента, <code>AGENT_ERROR</code>, приходит с кодом 200, потому что поток к этому моменту уже открыт<a class="cite" href="#src-24">24</a>. Мониторинг по статусам ответа увидит отказы платформы, но не падения агентов. А клиент, который при 4xx не читает тело, потеряет код ошибки. Для 409 это важно: <code>SESSION_BUSY</code> с сообщением <q>Session operation in progress, please retry</q> AWS советует повторять с экспоненциальной задержкой, потому что клиенты AG-UI сами этого не делают.</p>
+
+<p>README моста LangGraph описывает, что сбой продюсера приходит терминальным <code>RUN_ERROR</code>, после которого поток закрывается без <code>RUN_FINISHED</code>, и такие сбои <q>no longer reject the <code>runAgent()</code> promise</q><a class="cite" href="#src-25">25</a>. Код, который ловил ошибки через <code>catch</code> вокруг <code>await agent.runAgent()</code>, после обновления перестал их видеть; ловить надо в подписчике <code>onRunErrorEvent</code>.</p>
+</section>
+
+<section id="frontend-tools">
+<h2>Инструмент, на который агент не отвечает</h2>
+
+<p>Приложение может отдать агенту свои инструменты: поменять фон страницы или прочитать выделенный текст в редакторе. Описания едут в <code>RunAgentInput.tools</code> в том же формате, что у обычных инструментов модели: имя, описание, JSON Schema параметров. Модель вызывает такой инструмент обычным образом, и продюсер транслирует вызов в <code>TOOL_CALL_START</code>, <code>ARGS</code> и <code>END</code>. Дальше действует правило, которое удивляет всех, кто писал цикл агента руками: <mark>продюсер не должен на этот вызов отвечать</mark>. Никакого выдуманного <code>TOOL_CALL_RESULT</code>. Прогон завершается успехом, а не прерыванием, и может перечислить неотвеченные вызовы в <code>pendingToolCallIds</code><a class="cite" href="#src-11">11</a>.</p>
+
+<p>В спецификации это сказано так: прогон, остановившийся на инструменте фронтенда, — завершённый прогон, и продюсер не знает, ждёт ли он чего-то. Инструмент фронтенда часто оказывается конечным действием, и нужен ли после него ещё один прогон, решает приложение<a class="cite" href="#src-11">11</a>. Смена темы оформления может ничего не требовать от агента. А если продолжать тред, ответить нужно на каждый висящий вызов: следующий <code>RunAgentInput.messages</code> несёт по tool-сообщению на каждый <code>toolCallId</code>, а отказ или сбой передаётся в поле <code>error</code>.</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="Tool-сообщения в следующем прогоне (сериализация ag-ui-protocol 1.0.0)">
+{"id":"tm-1","role":"tool","content":"ok","toolCallId":"tc-1"}
+{"id":"tm-2","role":"tool","content":"","toolCallId":"tc-2","error":"user declined"}
+</script>
+
+<p>У вызова инструмента три возможные судьбы, и их легко перепутать, потому что начало у всех трёх одинаковое.</p>
+
+<figure class="fig wide" id="fig-tool-endings">
+<script type="text/x-mermaid">
+flowchart TD
+  call["TOOL_CALL_START / ARGS / END"]:::accent --> who{"Кто выполняет?"}
+  who -- "бэкенд агента" --> res["TOOL_CALL_RESULT<br/>в том же прогоне"]:::ok
+  res --> cont["модель продолжает,<br/>прогон идёт дальше"]
+  who -- "приложение" --> fin1["RUN_FINISHED success<br/>+ pendingToolCallIds"]
+  fin1 --> app["приложение выполняет<br/>или отказывает"]
+  app --> next1["следующий прогон:<br/>tool-сообщение в messages"]
+  who -- "бэкенд, но нужно согласие" --> fin2["RUN_FINISHED interrupt"]:::warn
+  fin2 --> user["человек решает"]
+  user --> next2["следующий прогон: resume[],<br/>TOOL_CALL_RESULT уже там"]
+</script>
+<figcaption>Три концовки одного и того же начала. На инструмент фронтенда отвечают историей сообщений, на прерывание — массивом <code>resume</code>, и это два разных механизма, хотя в интерфейсе оба выглядят как «агент ждёт».</figcaption>
+</figure>
+
+<p>Спецификация специально оговаривает, что остановка на инструменте фронтенда — не отдельный вид концовки рядом с успехом и прерыванием<a class="cite" href="#src-11">11</a>. Если сделать подтверждение опасного действия через инструмент фронтенда, продюсер не отличит «ждём решения человека» от «разговор окончен»: прогон честно закончился успехом, и если приложение не станет продолжать тред, вызов так и останется висеть. Особенно легко ошибиться при переносе графа LangGraph: встроенный <code>interrupt()</code> ложится на исход interrupt, а обычный вызов инструмента фронтенда — нет.</p>
+
+<h3>Как это сделано для Claude</h3>
+
+<p>Мост к Claude Agent SDK показывает, во что правило «не отвечать» превращается в реальном коде<a class="cite" href="#src-12">12</a>. Каждый инструмент из <code>RunAgentInput.tools</code> адаптер превращает в инструмент внутрипроцессного MCP-сервера с именем <code>ag_ui</code>. Модель видит их как <code>mcp__ag_ui__change_background</code>, по той же схеме именования, что MCP-инструменты в твоём Claude Code, и адаптер сам добавляет эти имена в <code>allowed_tools</code>, чтобы SDK не спрашивал разрешения. Когда приходит <code>content_block_stop</code> для такого вызова, адаптер выпускает <code>TOOL_CALL_END</code>, выставляет флаг остановки и выходит из цикла чтения, не дав SDK выполнить инструмент. Результат прогона в текущем коде уходит в <code>result</code>; <code>pendingToolCallIds</code> мост не заполняет, и по спецификации это допустимо, поле необязательное.</p>
+
+<div class="note warn"><p>Тот же мост применяет <code>forwardedProps</code> как переопределения опций на один прогон. В белом списке, среди прочего, <code>model</code>, <code>max_turns</code> и <code>max_budget_usd</code><a class="cite" href="#src-12">12</a>. <code>forwardedProps</code> присылает клиент, то есть браузер. Если эндпоинт торчит наружу, модель и бюджет прогона выбирает тот, кто шлёт запрос. Сузь список до того, что готов доверить пользователю.</p></div>
+
+<p>На стороне React регистрация инструмента в CopilotKit v2 выглядит так. Хуки <code>useCopilotAction</code> и <code>useCoAgent</code>, которые до сих пор встречаются в статьях, относятся к API первой версии; актуальные импортируются из <code>@copilotkit/react-core/v2</code>, на 30 сентября 2026 года это версия 1.75.2<a class="cite" href="#src-7">7</a>.</p>
+
+<script type="text/plain" class="code" data-lang="typescript" data-title="useFrontendTool из документации CopilotKit">
+useFrontendTool({
+  name: "sayHello",
+  description: "Say hello to the user",
+  parameters: z.object({
+    name: z.string().describe("The name of the user to say hello to"),
+  }),
+  handler: async ({ name }) => {
+    alert(`Hello, ${name}!`);
+    return `Said hello to ${name}!`;
+  },
+});
+</script>
+
+<h3>Картинки, PDF и файлы провайдера</h3>
+
+<p>Пользователь прикрепил скриншот, инструмент сгенерировал счёт в PDF. До 1.0 чистого пути для этого не было: вопросы вроде <q>How to transport multimodel messages like images, files?</q> висели в трекере с июня 2025 года<a class="cite" href="#src-16">16</a>, и люди прятали base64 в строку или заводили свои события. В 1.0 содержимое сообщения пользователя, tool-сообщения и <code>TOOL_CALL_RESULT</code> — либо строка, либо массив <code>ContentPart</code> из частей <code>text</code>, <code>image</code>, <code>audio</code>, <code>video</code> и <code>document</code>. У медиачасти есть <code>source</code> одного из трёх видов: <code>data</code> с байтами в base64 прямо в сообщении, <code>url</code>, который можно скачать, и новый <code>file</code> — хендл файла, уже загруженного к провайдеру модели: file id у OpenAI или Anthropic, file URI у Gemini<a class="cite" href="#src-2">2</a>.</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="Результат инструмента с документом (пример из поста о 1.0)">
+{
+  "type": "TOOL_CALL_RESULT",
+  "messageId": "msg-2",
+  "toolCallId": "call-1",
+  "content": [
+    { "type": "text", "text": "Here is your invoice." },
+    { "type": "document", "source": { "type": "url", "value": "https://example.com/invoice.pdf", "mimeType": "application/pdf" } }
+  ]
+}
+</script>
+
+<p>Значение источника <code>file</code> непрозрачно: <q>A peer MUST NOT fetch it, parse it or read a scheme out of it</q>. Хендл либо отдают своему провайдеру, либо не используют часть вовсе. Для него и завели отдельный вид источника: положи хендл в <code>url</code>, и каждый посредник попробует его скачать<a class="cite" href="#src-2">2</a>.</p>
+
+<p>Продюсер, которому досталась часть не по силам, например картинка для модели без зрения или хендл чужого провайдера, прогон не роняет. Он выбрасывает часть и продолжает, но на вызов всё равно отвечает: если выброшены все части результата, ответом будет пустая строка, потому что неотвеченный вызов инструмента большинство моделей отвергают. Потребитель, который умеет хранить только строку, склеивает текстовые части, а о потере остального ему следует предупредить<a class="cite" href="#src-11">11</a>. Почему <code>file</code> вошёл именно в 1.0: набор видов источника закрыт, незнакомый вид не проходит валидацию, и клиент 1.0 не смог бы даже переслать источник, добавленный позже<a class="cite" href="#src-2">2</a>. Это та же логика, что у исхода <code>cancelled</code>.</p>
+
+<p>Интеграции пока держат это плохо. README моста LangGraph пишет: <q>Provider file handles remain unsupported and are skipped with a warning</q><a class="cite" href="#src-25">25</a>. <code>ag_ui_strands</code> 0.4.1 выбрасывает источники <code>file</code> с предупреждением и сплющивает результаты инструментов в текст<a class="cite" href="#src-16">16</a>. Если инструмент должен вернуть PDF, отдавай его через <code>url</code> или <code>data</code>: хендл провайдера сегодня переживёт не каждый мост.</p>
+
+<h3>Где здесь граница доверия</h3>
+
+<p>Спецификация 1.0 называет вызовы инструментов самой большой поверхностью атаки протокола, потому что они превращают вывод модели в действия<a class="cite" href="#src-11">11</a>. Аргументы сгенерированы моделью и проверяются как недоверенный ввод, а вызов с побочным эффектом требует согласия пользователя до выполнения. Результат инструмента — данные, а не инструкции с полномочиями пользователя. Вызов инструмента, которого не было в объявленном списке, заслуживает той же подозрительности, что и совершенно новый.</p>
+
+<p>В клиентском SDK есть <code>FilterToolCallsMiddleware</code> с параметрами <code>allowedToolCalls</code> и <code>disallowedToolCalls</code>. Он прячет вызовы от интерфейса, но не мешает агенту их выполнить на бэкенде<a class="cite" href="#src-22">22</a>. Использовать его как механизм авторизации нельзя. Подробно про границы доверия в агентных приложениях — в <a href="../16-security/index.html">главе 16</a>.</p>
+</section>
+
+<section id="interrupts">
+<h2>Human-in-the-loop: прогон кончается, а не ждёт</h2>
+
+<p>Ниже запрос на подтверждение удаления файла, как он выглядит на проводе. Сервер и клиент для этой трассы написаны для главы и запущены на <code>ag-ui-protocol</code> 1.0.0; сервер не хранит между прогонами ничего. Агент предлагает удалить <code>/data/report.csv</code>, пользователь соглашается, но исправляет путь.</p>
+
+<div class="tabs">
+<section data-tab="Прогон 1: поток">
+<script type="text/plain" class="code" data-lang="sse" data-title="Набросок, проверен: первый прогон заканчивается прерыванием" data-hl="5">
+data: {"type":"RUN_STARTED","threadId":"t-1","runId":"r-1","protocolVersion":"1.0"}
+data: {"type":"TOOL_CALL_START","toolCallId":"tc-738bb1","toolCallName":"delete_file"}
+data: {"type":"TOOL_CALL_ARGS","toolCallId":"tc-738bb1","delta":"{\"path\": \"/data/report.csv\"}"}
+data: {"type":"TOOL_CALL_END","toolCallId":"tc-738bb1"}
+data: {"type":"RUN_FINISHED","threadId":"t-1","runId":"r-1","outcome":{"type":"interrupt","interrupts":[{"id":"int-tc-738bb1","reason":"tool_call","message":"Удалить /data/report.csv?","toolCallId":"tc-738bb1","responseSchema":{"type":"object","required":["approved"],"properties":{"approved":{"type":"boolean"},"editedArgs":{"type":"object"}}}}]}}
+</script>
+</section>
+<section data-tab="Прогон 2: запрос">
+<script type="text/plain" class="code" data-lang="json" data-title="Набросок, проверен: RunAgentInput второго прогона" data-hl="17-24">
+{
+  "threadId": "t-1",
+  "runId": "r-2",
+  "protocolVersion": "1.0",
+  "messages": [
+    { "id": "u-1", "role": "user", "content": "удали старый отчёт" },
+    {
+      "id": "a-1",
+      "role": "assistant",
+      "toolCalls": [
+        { "id": "tc-738bb1", "type": "function",
+          "function": { "name": "delete_file", "arguments": "{\"path\": \"/data/report.csv\"}" } }
+      ]
+    }
+  ],
+  "resume": [
+    {
+      "interruptId": "int-tc-738bb1",
+      "status": "resolved",
+      "payload": {
+        "approved": true,
+        "editedArgs": { "path": "/data/report-2025.csv" }
+      }
+    }
+  ]
+}
+</script>
+</section>
+<section data-tab="Прогон 2: поток">
+<script type="text/plain" class="code" data-lang="sse" data-title="Набросок, проверен: второй прогон">
+data: {"type":"RUN_STARTED","threadId":"t-1","runId":"r-2","protocolVersion":"1.0"}
+data: {"type":"TOOL_CALL_RESULT","messageId":"res-tc-738bb1","toolCallId":"tc-738bb1","content":"deleted /data/report-2025.csv"}
+data: {"type":"RUN_FINISHED","threadId":"t-1","runId":"r-2"}
+</script>
+</section>
+</div>
+
+<details class="deep"><summary>сервер для этой трассы</summary>
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок, проверен: hitl_server.py" data-hl="29-34,36-41">
+import json, uuid
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from ag_ui.core import (RunAgentInput, RunStartedEvent, RunFinishedEvent, Interrupt,
+    ToolCallStartEvent, ToolCallArgsEvent, ToolCallEndEvent, ToolCallResultEvent)
+from ag_ui.encoder import EventEncoder
+
+app = FastAPI()
+SCHEMA = {"type": "object", "required": ["approved"],
+          "properties": {"approved": {"type": "boolean"}, "editedArgs": {"type": "object"}}}
+
+def find_call(messages, call_id):
+    for m in messages:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            if tc.id == call_id:
+                return json.loads(tc.function.arguments)
+    return None
+
+@app.post("/agent")
+async def run(inp: RunAgentInput):
+    enc = EventEncoder()
+    async def events():
+        yield enc.encode(RunStartedEvent(thread_id=inp.thread_id, run_id=inp.run_id, protocol_version="1.0"))
+        if not inp.resume:  # прогон 1: предложить и остановиться
+            tc = f"tc-{uuid.uuid4().hex[:6]}"
+            yield enc.encode(ToolCallStartEvent(tool_call_id=tc, tool_call_name="delete_file"))
+            yield enc.encode(ToolCallArgsEvent(tool_call_id=tc, delta='{"path": "/data/report.csv"}'))
+            yield enc.encode(ToolCallEndEvent(tool_call_id=tc))
+            yield enc.encode(RunFinishedEvent(
+                thread_id=inp.thread_id, run_id=inp.run_id,
+                outcome={"type": "interrupt", "interrupts": [Interrupt(
+                    id=f"int-{tc}", reason="tool_call", tool_call_id=tc,
+                    message="Удалить /data/report.csv?",
+                    response_schema=SCHEMA)]}))
+            return
+        for entry in inp.resume:  # прогон 2: всё из входа, ничего не помним
+            tc = entry.interrupt_id.removeprefix("int-")
+            args = find_call(inp.messages, tc)
+            p = entry.payload or {}
+            if entry.status == "resolved" and p.get("approved"):
+                args = p.get("editedArgs", args)
+                text = f"deleted {args['path']}"
+            else:
+                text = "declined by user"
+            yield enc.encode(ToolCallResultEvent(message_id=f"res-{tc}", tool_call_id=tc, content=text))
+        yield enc.encode(RunFinishedEvent(thread_id=inp.thread_id, run_id=inp.run_id))
+    return StreamingResponse(events(), media_type=enc.get_content_type())
+</script>
+</details>
+
+<p>Первое, что видно в трассе: <mark>первый прогон закончился</mark>. Никакой паузы посреди потока, никакого открытого соединения, которое ждёт клика. <code>RUN_FINISHED</code> несёт <code>outcome</code> типа <code>interrupt</code>, и продолжение — это новый прогон в том же треде, с новым <code>runId</code> и массивом <code>resume</code>, где каждый элемент ссылается на прерывание по <code>interruptId</code><a class="cite" href="#src-26">26</a>. Так человек может думать хоть сутки, а сервер за это время перезапуститься.</p>
+
+<p>Второе: во втором прогоне нет повторных <code>TOOL_CALL_START</code>, <code>ARGS</code> и <code>END</code>. Прерывание, привязанное к вызову инструмента, продолжается сразу результатом с исходным <code>toolCallId</code>. Аудиторский след получается из трёх частей в двух прогонах: предложенные моделью аргументы в первом, правка человека в <code>resume[].payload.editedArgs</code>, фактический результат во втором.</p>
+
+<figure class="fig wide" id="fig-interrupt">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Человек
+  participant A as Приложение (потребитель)
+  participant P as Агент (продюсер)
+  A->>P: RunAgentInput r1
+  P-->>A: TOOL_CALL_* delete_file
+  P-->>A: RUN_FINISHED, outcome interrupt
+  Note over A: вызов собран в messages
+  Note over P: может забыть всё
+  A->>U: форма по responseSchema
+  U->>A: одобряю, путь исправлен
+  Note over A: покрыты все прерывания? не истёк expiresAt?
+  A->>P: RunAgentInput r2 + resume[]
+  P-->>A: RUN_STARTED
+  P-->>A: TOOL_CALL_RESULT для исходного toolCallId
+  P-->>A: RUN_FINISHED success
+</script>
+<figcaption>Прерывание и продолжение, как в трассе выше. Между прогонами продюсер ничего не обязан помнить: предложенный вызов потребитель собрал из потока и вернёт в <code>messages</code>, решение человека приедет в <code>resume</code>, а проверку ответов делает потребитель.</figcaption>
+</figure>
+
+<h3>Что лежит в прерывании</h3>
+
+<p><code>Interrupt</code> содержит обязательные <code>id</code> и <code>reason</code> и необязательные <code>message</code>, <code>toolCallId</code>, <code>responseSchema</code>, <code>expiresAt</code>, <code>metadata</code> и <code>subagentRunId</code>. У <code>reason</code> три базовых значения: <code>tool_call</code> для вызова инструмента, <code>input_required</code>, когда агенту нужны структурированные данные, и <code>confirmation</code> для простого «да или нет». Всё остальное — расширения с пространством имён фреймворка: <code>langgraph:database_modification</code>, <code>mastra:tool_approval</code>. Префикс <code>core:</code> зарезервирован за спецификацией<a class="cite" href="#src-27">27</a>.</p>
+
+<p><code>responseSchema</code> работает двояко. Потребитель валидирует по ней ответ человека, а по её форме решает, какой интерфейс рисовать. Схема «одобрить с правками» из документации содержит <code>approved</code> и <code>editedArgs</code> с пометкой <q>Full replacement of the tool args. Not merged.</q> Сам факт, что в схеме есть <code>editedArgs</code>, — сигнал клиенту, что форму редактирования показывать можно. Нет поля — остаются две кнопки.</p>
+
+<p>О том, что должно пережить разрыв между прогонами, спецификация и концептуальная страница документации <code>concepts/interrupts</code> говорят по-разному. Нормативный текст 1.0 опирается на обычную преемственность треда: продолжающий прогон несёт тот же <code>threadId</code>, накопленные сообщения и состояние, которое оставил прерванный прогон<a class="cite" href="#src-26">26</a>. В трассе выше так и вышло: аргументы <code>delete_file</code> доехали до второго прогона потому, что клиент собрал из <code>TOOL_CALL_*</code> сообщение ассистента с <code>toolCalls</code> и вернул его в <code>messages</code>. Концептуальная страница требует большего: всё нужное для продолжения агент должен отдать через <code>STATE_SNAPSHOT</code> и <code>MESSAGES_SNAPSHOT</code> до прерывающего <code>RUN_FINISHED</code>, чтобы продолжение из чекпойнта LangGraph и продолжение из <code>messages</code> и <code>state</code> снаружи выглядели одинаково<a class="cite" href="#src-27">27</a>. В спецификации этого требования нет, но как практика оно полезно: если сервер восстанавливает чекпойнт, снапшот перед прерыванием гарантирует, что клиент видит то же состояние, от которого сервер будет продолжать.</p>
+
+<h3>Кто проверяет ответы</h3>
+
+<p>На той же странице <code>concepts/interrupts</code> есть строгий список правил для агента: вход без <code>resume</code> на треде с открытыми прерываниями — это <code>RunError</code>, просроченный ответ — <code>RunError</code>, частичный ответ не поддерживается<a class="cite" href="#src-27">27</a>. Эта страница старше 1.0: в её примере <code>expiresAt</code> стоит 20 апреля 2026 года, что совпадает с апрельским PR #1569, который впервые принёс прерывания в ядро SDK<a class="cite" href="#src-16">16</a>.</p>
+
+<p>Нормативный текст 1.0 распределяет обязанности иначе<a class="cite" href="#src-26">26</a>. Покрытие всех прерываний — правило, которое проверяет потребитель; продюсер не обязан его проверять и может ничего не хранить от прерванного прогона, оставаясь конформным. Срок годности тоже оценивает потребитель. Незнакомую запись в <code>resume</code> продюсеру следует пропустить с предупреждением. Если же продюсер знает о прерывании, на которое ответа нет, прерванное действие выполнять нельзя. Он может отклонить запрос до <code>RUN_STARTED</code> или прервать прогон заново, но завершить его успехом не может.</p>
+
+<p>Эта правка появилась во время публичного обсуждения черновика. Её предложили в ревью Pydantic AI, и 14 сентября 2026 года мейнтейнер ответил в Discussion #2608: <q>only the consumer is responsible for enforcing interrupt responses</q><a class="cite" href="#src-14">14</a>. Смысл понятен: сервер, который ничего не помнит между прогонами, иначе не мог бы соответствовать спецификации.</p>
+
+<div class="note debate"><p>Концептуальная страница и спецификация расходятся, и спорить тут есть о чём. За версию спецификации — стейтлесс-серверы и простые мосты. За старую версию — то, что потребитель в вебе и есть недоверенная сторона. Делай по спецификации, но помни, что согласие в AG-UI защищает от ошибки модели, а не от злонамеренного клиента: <code>"approved": true</code> присылает тот же браузер, который присылает историю. Если действие опасно само по себе, право на него проверяй на сервере по аутентифицированному пользователю, а не по полю в <code>resume</code>.</p></div>
+
+<p>Из списка на концептуальной странице одно правило стоит взять себе, хотя нормативный текст его не повторяет: <q>A resume with the same <code>(threadId, interruptId, status, payload)</code> must be safe to replay</q><a class="cite" href="#src-27">27</a>. Сервер без состояния отличить ответ от его повтора не может. Сетевой ретрай клиента, двойной клик по кнопке «Одобрить» или подделанный запрос пришлют тот же <code>resume[]</code>, и <code>hitl_server.py</code> из трассы выполнит действие второй раз. Для удаления файла это безвредно, для перевода денег или отправки письма нет. Защита — ключ идемпотентности <code>(threadId, interruptId)</code> в долговечном хранилище, которое видят все реплики, или идемпотентный сам инструмент, если внешний API принимает такой ключ. Набросок из этого раздела в нынешнем виде годится только для действий, которые можно повторять.</p>
+
+<h3>Что умеют интеграции на 30 сентября 2026 года</h3>
+
+<p>Самый неожиданный факт раздела касается LangGraph. Мост <code>ag-ui-langgraph</code> (0.0.45) принимает <code>resume[]</code> и превращает его в один <code>Command(resume=...)</code>: единственный одобренный ответ <code>interrupt()</code> вернёт как есть, единственная отмена придёт служебным объектом <code>{"__agui_cancelled__": true, "interrupt_id": "..."}</code>, несколько ответов — словарём под ключом <code>__agui_resume_map__</code><a class="cite" href="#src-25">25</a>. Но по умолчанию, с <code>emit_interrupt_outcome=False</code>, прерванный прогон кончается обычным <code>RUN_FINISHED</code> без <code>outcome</code> плюс старым событием <code>CUSTOM</code> с именем <code>on_interrupt</code>. Отсутствующий <code>outcome</code> по спецификации означает успех, а продюсер не вправе выдавать прерванный прогон за успешный. <mark>Мост LangGraph в настройках по умолчанию нарушает MUST спецификации 1.0.</mark></p>
+
+<p>Причина в совместимости. README объясняет, что хук <code>useLangGraphInterrupt</code> в CopilotKit версий 1.60.x перестаёт отправлять команду продолжения, как только видит структурированный <code>outcome</code><a class="cite" href="#src-25">25</a>. Включишь новое поведение со старым фронтендом — сломаешь продолжение. Если фронтенд у тебя свой или обновлённый, включай явно:</p>
+
+<script type="text/plain" class="code" data-lang="python" data-title="LangGraph: прерывания по спецификации 1.0">
+agent = LangGraphAgent(name="my-agent", graph=graph, emit_interrupt_outcome=True)
+</script>
+
+<p>Pydantic AI делает прерывание из инструмента с <code>requires_approval=True</code>, с идентификатором <code>int-{tool_call_id}</code>; сервер в предыдущем наброске по той же схеме выводит <code>toolCallId</code> из <code>interruptId</code> и потому может ничего не помнить. Ответ ожидается с булевым полем <code>approved</code> и необязательными <code>editedArgs</code> и <code>reason</code>; <code>editedArgs</code> целиком заменяет аргументы, отмена превращается в <code>ToolDenied("Cancelled by user.")</code><a class="cite" href="#src-23">23</a>.</p>
+
+<script type="text/plain" class="code" data-lang="python" data-title="Pydantic AI: инструмент с одобрением (из документации)" data-hl="10,13,20">
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.routing import Route
+
+from pydantic_ai import Agent
+from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai.ui.ag_ui import AGUIAdapter
+
+agent = Agent('openai:gpt-5.2', output_type=[str, DeferredToolRequests])
+
+
+@agent.tool_plain(requires_approval=True)
+def delete_file(path: str) -> str:
+    """Delete a file. Pauses on a `RUN_FINISHED` interrupt outcome until the user approves."""
+    return f'deleted {path}'
+
+
+async def run_agent(request: Request) -> Response:
+    return await AGUIAdapter.dispatch_request(request, agent=agent)
+
+
+app = Starlette(routes=[Route('/', run_agent, methods=['POST'])])
+</script>
+
+<p>Здесь две оговорки. На старых установках, по словам той же документации, адаптер <q>silently falls back to emitting a bare <code>RUN_FINISHED</code></q>, а <code>resume[]</code> игнорирует. И <code>pydantic-ai-slim[ag-ui]</code> 2.52.0 от 30 сентября 2026 года требует <code>ag-ui-protocol&lt;1</code><a class="cite" href="#src-17">17</a>, а документация всё ещё пишет, что исхода cancelled в AG-UI нет. Прерывания в Pydantic AI работают на ветке 0.1.x протокола, где они появились в версии 0.1.19 от 2 июня 2026 года.</p>
+
+<p>Mastra в версии 1.1.5, вышедшей 30 сентября 2026 года, превращает свои одобрения инструментов в прерывания с <code>reason: "mastra:tool_approval"</code> и решает судьбу продолжения по <code>status</code> записи, а не по содержимому <code>payload</code><a class="cite" href="#src-16">16</a>. AWS Strands передаёт свои прерывания через <code>outcome</code> напрямую<a class="cite" href="#src-27">27</a>. На клиенте TypeScript-пакет <code>@ag-ui/client</code> 1.0.1 от 29 сентября исправил <code>connectAgent()</code>, который падал при переподключении к треду с открытыми прерываниями: <q>connects now read thread history without requiring resume answers</q><a class="cite" href="#src-16">16</a>.</p>
+
+<p>В React-API CopilotKit v2 для этого два хука с похожими описаниями. <code>useInterrupt</code> обрабатывает прерывание, начатое агентом, и продолжает выполнение, когда пользователь ответит. Про <code>useHumanInTheLoop</code> сказано: <q>Pause the agent on a tool call and wait for the user to approve, edit, or supply input</q><a class="cite" href="#src-7">7</a>. Каким механизмом протокола сделан второй, документация не говорит. Прежде чем строить на нём подтверждение опасных действий, открой вкладку сети и посмотри, чем кончается прогон: исходом interrupt или успехом с неотвеченным вызовом инструмента фронтенда.</p>
+
+<div class="note field"><blockquote>ADK middleware re-executes already-answered messages when run with &gt;1 replica (processed-message ledger is process-local)
+<footer>— заголовок issue #2603, <a href="https://github.com/ag-ui-protocol/ag-ui/issues/2603">GitHub, 2 сентября 2026</a></footer></blockquote>
+<p>Мост Google ADK хранит журнал обработанных сообщений в памяти процесса. На двух репликах второй экземпляр этого журнала не видит и выполняет уже отвеченное повторно<a class="cite" href="#src-16">16</a>. Спецификация разрешает продюсеру ничего не помнить, и раз <code>messages</code> приходит целиком, безопасная конструкция — выводить всё из входа, как в наброске выше, а журнал выполненного, если он нужен для идемпотентности, держать в хранилище, общем для всех реплик. Проверь свой мост на двух репликах за балансировщиком до продакшена.</p></div>
+</section>
+
+<section id="state">
+<h2>Общее состояние без обратного канала</h2>
+
+<p>В описаниях AG-UI часто встречается «двусторонняя синхронизация состояния в реальном времени». Если проверить по спецификации, половина этой фразы неверна. Внутри прогона состояние течёт только от агента к клиенту, событиями <code>STATE_SNAPSHOT</code> и <code>STATE_DELTA</code>. Всё, что пользователь поменял в интерфейсе, агент увидит только в поле <code>state</code> следующего <code>RunAgentInput</code>. В тексте о прерываниях так и написано: <q>The protocol has no mid-run channel from the consumer</q><a class="cite" href="#src-26">26</a>. Синхронизация двусторонняя, но по очереди, а не одновременно.</p>
+
+<p>Механика простая. <code>STATE_SNAPSHOT</code> заменяет документ целиком. <code>STATE_DELTA</code> несёт массив операций JSON Patch по RFC 6902<a class="cite" href="#src-28">28</a>: <code>add</code>, <code>remove</code>, <code>replace</code>, <code>move</code>, <code>copy</code>, <code>test</code>, с путями в формате JSON Pointer. Пока в прогоне не было ни одного снапшота, дельты считаются от <code>state</code>, который пришёл во входе<a class="cite" href="#src-2">2</a>. Патч применяется атомарно: либо весь, либо никак.</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="STATE_DELTA: операции из документации AG-UI">
+{
+  "type": "STATE_DELTA",
+  "delta": [
+    { "op": "add", "path": "/user/preferences", "value": { "theme": "dark" } },
+    { "op": "replace", "path": "/conversation_state", "value": "paused" }
+  ]
+}
+</script>
+
+<p>Интереснее, что происходит, когда патч не применяется: путь не существует, операция <code>test</code> не прошла, пришла незнакомая операция. Потребитель пишет предупреждение и оставляет прежнее значение, половину патча применённой не держит никогда. Незнакомую операцию выбрасывает с предупреждением. Продюсеру в таком случае следует прислать свежий снапшот, <q>SHOULD resynchronise with a snapshot</q><a class="cite" href="#src-29">29</a>. Вот только продюсер о сбое не узнает: обратного канала нет. Поэтому снапшот нужно слать не по сигналу об ошибке, а по расписанию. Разумные точки — начало прогона, границы шагов и момент перед прерыванием, где снапшот советует и концептуальная страница о прерываниях.</p>
+
+<figure class="fig wide" id="fig-state">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant A as Приложение
+  participant P as Агент
+  A->>P: RunAgentInput state {tasks: [a]}
+  P-->>A: STATE_DELTA add /tasks/- b
+  Note over A: tasks = [a, b]
+  P-->>A: STATE_DELTA replace /tasks/5
+  Note over A: путь не найден, патч отброшен целиком
+  Note over P: агент считает, что tasks[5] обновлён
+  P-->>A: STATE_SNAPSHOT (на границе шага)
+  Note over A: копии снова совпадают
+  P-->>A: RUN_FINISHED
+  Note over A: пользователь вычёркивает задачу b
+  A->>P: RunAgentInput r2, state {tasks: [a]}
+</script>
+<figcaption>Дельта, которая не легла. Приложение молча остаётся при старом значении, агент об этом не знает, и расхождение живёт до следующего снапшота. Правка пользователя доходит до агента только следующим прогоном.</figcaption>
+</figure>
+
+<p>Эталонный клиент на TypeScript применяет патч через <code>fast-json-patch</code> вызовом <code>applyPatch(state, delta, true, false)</code> и при исключении пишет в консоль и не меняет состояние<a class="cite" href="#src-27">27</a>. На стороне React в CopilotKit v2 состояние читается и пишется через хук <code>useAgent()</code>: <code>agent.state</code> и <code>agent.setState</code><a class="cite" href="#src-7">7</a>. <code>setState</code> меняет локальную копию, которая уедет агенту со следующим прогоном.</p>
+
+<script type="text/plain" class="code" data-lang="typescript" data-title="Общее состояние в CopilotKit v2 (из документации)">
+import { useAgent } from "@copilotkit/react-core/v2";
+
+function TaskBoard() {
+  const { agent } = useAgent();
+  const tasks = (agent.state.tasks as any[]) ?? [];
+  ...
+}
+</script>
+
+<p>Без CopilotKit то же делает голый клиент из <code>@ag-ui/client</code>. Историю он держит в <code>agent.messages</code>, состояние в <code>agent.state</code>, а подписчик получает и сырые события, и уже собранные значения<a class="cite" href="#src-22">22</a>. Вот зеркало Python-клиента из начала главы, набросок по документации SDK, который не запускался:</p>
+
+<script type="text/plain" class="code" data-lang="typescript" data-title="Набросок, не запускался: client.ts на @ag-ui/client">
+import { HttpAgent, randomUUID } from "@ag-ui/client";
+
+const agent = new HttpAgent({ url: "http://127.0.0.1:8765/agent" });
+agent.messages.push({ id: randomUUID(), role: "user", content: "hi" });
+
+await agent.runAgent({}, {
+  onTextMessageContentEvent: ({ event }) => { process.stdout.write(event.delta); },
+  onToolCallEndEvent: ({ toolCallName, toolCallArgs }) => {
+    console.log("\ntool call ready:", toolCallName, toolCallArgs);
+  },
+  onStateChanged: ({ state }) => console.log("state:", state),
+  onRunFinishedEvent: ({ event }) => console.log("finished:", event.outcome),
+  onRunErrorEvent: ({ event }) => console.error("run error:", event.message),
+});
+</script>
+
+<p>Склеивать аргументы и применять патчи здесь не нужно, это делает SDK, а <code>onToolCallEndEvent</code> получает уже разобранные аргументы. Ошибка прогона не отвергает промис <code>runAgent()</code>, её видно только в <code>onRunErrorEvent</code>. Если нужна своя валидация, учти, что в 1.0 zod-схемы событий переехали в подпуть <code>@ag-ui/core/schemas</code>, а сам zod стал необязательной peer-зависимостью<a class="cite" href="#src-10">10</a>.</p>
+
+<h3>Как состояние видит модель</h3>
+
+<p>Протокол описывает, как состояние доезжает до сервера, но не как оно попадает в модель. Это решает мост. Мост к Claude Agent SDK дописывает <code>state</code> и <code>context</code> в конец системного промпта, а не в сообщение пользователя, и даёт модели инструмент <code>ag_ui_update_state</code><a class="cite" href="#src-12">12</a>. Когда модель его вызывает, мост поверхностно сливает обновление с прежним состоянием треда и, если что-то изменилось, выпускает полный <code>STATE_SNAPSHOT</code>. Дельт этот мост не шлёт вообще. Для состояния в пару килобайт это разумно, для таблицы на тысячу строк нет: каждое обновление гонит по сети весь документ, а сам документ в каждом прогоне занимает место в системном промпте. Во что обходится такое место в окне контекста, разобрано в <a href="../02-context-engineering/index.html">главе 2</a>.</p>
+
+<p>С историей сообщений похожая механика. <code>MESSAGES_SNAPSHOT</code> заменяет историю на клиенте, причём для ролей <code>activity</code> и <code>reasoning</code> действует правило «всё или ничего»: если в снапшоте есть хоть одно сообщение этой роли, он авторитетен для всей роли, и отсутствующие сообщения удаляются; если нет ни одного, существующие не трогаются<a class="cite" href="#src-4">4</a>. Microsoft Agent Framework по умолчанию шлёт завершающий <code>MESSAGES_SNAPSHOT</code> в каждом прогоне. Если историю ведёт твоё приложение, выключи его флагом <code>emit_messages_snapshot=False</code>, иначе каждый прогон будет переписывать транскрипт на клиенте<a class="cite" href="#src-30">30</a>.</p>
+
+<h3>Данные текут в обе стороны</h3>
+
+<p>Раздел спецификации о безопасности называется прямо: <q>Data flows both ways</q><a class="cite" href="#src-3">3</a>. Состояние и история проходят через клиента туда и обратно, поэтому секретов в них быть не должно. Спецификация не говорит, но из этого следует: раз <code>messages</code> присылает клиент, он может прислать любую историю, в том числе вызовы инструментов, которых модель не делала, и результаты, которых инструменты не возвращали. Документация Pydantic AI формулирует это точнее всех:</p>
+
+<div class="note field"><blockquote>Validating it proves shape, not identity: who the user is, what tenant they're in, and what they're allowed to do come from authenticated server state.
+<footer>— документация Pydantic AI, <a href="https://github.com/pydantic/pydantic-ai/blob/main/docs/ui/ag-ui.md">раздел про AG-UI, сентябрь 2026</a></footer></blockquote>
+<p>Валидация <code>RunAgentInput</code> по схеме доказывает, что запрос правильной формы, и больше ничего<a class="cite" href="#src-23">23</a>. Кто пользователь, в каком он арендаторе и что ему можно, сервер берёт из своей аутентифицированной сессии. Чем это грозит, если история из браузера попадает прямо в контекст модели, — в <a href="../16-security/index.html">главе 16</a>.</p></div>
+</section>
+
+<section id="subagents">
+<h2>Сабагенты и параллельные ветки</h2>
+
+<div class="note field"><blockquote>One honest caveat: with parallel branches the steps interleave…
+<footer>— автор инспектора событий для LangGraph, <a href="https://reddit.com/r/LangGraph/comments/1wrntdu/">r/LangGraph, 27 сентября 2026</a></footer></blockquote>
+<p>Автор треда собрал локальную песочницу, которая разговаривает с агентом на LangGraph по AG-UI и A2A и показывает каждое событие. В версии 0.2.3 ему пришлось вручную группировать события, потому что <q>a flat timeline stops scaling</q>. <code>STEP_STARTED</code> и <code>STEP_FINISHED</code> несут имя узла, у вызовов есть <code>parentMessageId</code>, но когда ветки графа идут параллельно, их события перемешиваются, и из потока не видно, какой узел что выпустил. Второй участник треда попросил того же для своего инструмента: связей «родитель — потомок» для каждого вызова и каждой дельты состояния<a class="cite" href="#src-31">31</a>.</p></div>
+
+<p>Для явных сабагентов версия 1.0 эту задачу решает. У большинства событий есть необязательное поле <code>subagentRunId</code>, а жизненный цикл описывают три события: <code>SUBAGENT_STARTED</code> с полями <code>subagentRunId</code>, <code>name</code>, <code>parentSubagentRunId</code>, <code>parentToolCallId</code> и <code>parentMessageId</code>, затем <code>SUBAGENT_FINISHED</code> с исходом <code>success</code> или <code>suspended</code>, либо <code>SUBAGENT_ERROR</code><a class="cite" href="#src-8">8</a>. Поля <code>parentToolCallId</code> и <code>parentMessageId</code> нужны для схемы «агент как инструмент»: интерфейс рисует вывод сабагента внутри карточки вызова, который его породил.</p>
+
+<script type="text/plain" class="code" data-lang="json" data-title="Атрибуция сабагента (пример из поста о 1.0)">
+{ "type": "SUBAGENT_STARTED", "subagentRunId": "sub-1", "name": "flight-search" }
+{ "type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "subagentRunId": "sub-1", "delta": "Found 3 flights..." }
+{ "type": "SUBAGENT_FINISHED", "subagentRunId": "sub-1" }
+</script>
+
+<figure class="fig wide" id="fig-subagents">
+<svg class="diagram" viewBox="0 0 1000 340" role="img" aria-label="Перемешанный поток событий родительского прогона и двух сабагентов">
+  <text class="t-title" x="170" y="30" text-anchor="middle">родительский прогон</text>
+  <text class="t-title" x="495" y="30" text-anchor="middle">sub-1 · flight-search</text>
+  <text class="t-title" x="820" y="30" text-anchor="middle">sub-2 · hotel-search</text>
+  <path class="line" d="M332,42 L332,322"/>
+  <path class="line" d="M657,42 L657,322"/>
+  <rect class="box" x="20" y="50" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="32" y="65">TOOL_CALL_START tc-1</text>
+  <rect class="box" x="20" y="78" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="32" y="93">TOOL_CALL_START tc-2</text>
+  <rect class="box--soft" x="345" y="106" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="357" y="121">SUBAGENT_STARTED, parent tc-1</text>
+  <rect class="box--violet" x="670" y="134" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="682" y="149">SUBAGENT_STARTED, parent tc-2</text>
+  <rect class="box--soft" x="345" y="162" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="357" y="177">TEXT_MESSAGE_CONTENT "3 рейса"</text>
+  <rect class="box--violet" x="670" y="190" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="682" y="205">TEXT_MESSAGE_CONTENT "2 отеля"</text>
+  <rect class="box--accent" x="345" y="218" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="357" y="233">STATE_DELTA /flights → общий state</text>
+  <rect class="box--soft" x="345" y="246" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="357" y="261">SUBAGENT_FINISHED</text>
+  <rect class="box--violet" x="670" y="274" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="682" y="289">SUBAGENT_FINISHED</text>
+  <rect class="box" x="20" y="302" width="300" height="22" rx="4"/>
+  <text class="t-mono" x="32" y="317">TOOL_CALL_RESULT tc-1, tc-2</text>
+  <path class="arrow arrow--dash" d="M320,61 L326,61 L326,117 L343,117"/>
+  <path class="arrow arrow--dash" d="M320,89 L651,89 L651,145 L668,145"/>
+</svg>
+<figcaption>Один поток, сверху вниз в порядке прихода, разложенный по дорожкам по <code>subagentRunId</code>. Пунктир — связь через <code>parentToolCallId</code>. Дельта от sub-1 правит общий документ состояния прогона: своего состояния у сабагента нет.</figcaption>
+</figure>
+
+<p>Одно различие спецификация оговаривает отдельно. <code>subagentRunId</code> называет вызов, а не определение сабагента: <q>run the same subagent twice and you get two different values</q>. Если нужно «какой это сабагент», бери <code>name</code><a class="cite" href="#src-8">8</a>. Атрибуция указывает происхождение, а не владение. <code>STATE_DELTA</code> от сабагента применяется к тому же единственному документу состояния прогона, отдельного состояния у сабагента нет.</p>
+
+<p>Параллельные сабагенты ломают короткую форму <code>*_CHUNK</code>. Чанк без идентификатора и без атрибуции клиент относит к открытому потоку родителя, а если его нет, к единственному открытому потоку этого вида. Если претендентов несколько, клиент отвергает чанк, а не гадает. Документация советует: <q>When streaming concurrently, attribute every chunk, or repeat the id</q><a class="cite" href="#src-8">8</a>.</p>
+
+<h3>Почему по умолчанию сабагентов не видно</h3>
+
+<p>Незнакомое поле старый клиент выбросит и не заметит. Незнакомый тип события — другое дело: старый клиент на TypeScript, по словам документации, падает на <code>SUBAGENT_*</code> ещё при декодировании, до того как управление дойдёт до кода приложения, и отфильтровать их на клиенте невозможно<a class="cite" href="#src-8">8</a>. Проверка <code>TypeAdapter(Event)</code> в <a href="#python">разделе про Python</a> показывает то же самое для Python-клиента. Поэтому продюсеры включают новые события флагом. У моста LangGraph это <code>subagent_visibility</code> с тремя значениями: <code>"inline"</code> по умолчанию, поведение до 1.0 без всякой атрибуции; <code>"attributed"</code> с полной атрибуцией и событиями жизненного цикла; <code>"hidden"</code>, когда клиент видит только порождающий вызов и его результат.</p>
+
+<script type="text/plain" class="code" data-lang="python" data-title="LangGraph: включить атрибуцию сабагентов">
+agent = LangGraphAgent(name="my-agent", graph=graph, subagent_visibility="attributed")
+</script>
+
+<p>Клиентская поддержка пока неполная. assistant-ui вкладывает вывод сабагента под породивший его вызов, склеивая по <code>parentToolCallId</code>, но в README перечислены два ограничения: <q>Nested structure does not survive a reload</q> и <q>Nested human-in-the-loop is not wired up</q>, то есть у приостановленного сабагента нет пути продолжения<a class="cite" href="#src-32">32</a>. .NET-привязка при переводе в сообщения <code>Microsoft.Extensions.AI</code> склеивает подряд идущие вызовы инструментов в одно сообщение, и из параллельных вызовов разных сабагентов атрибуция остаётся только у первого<a class="cite" href="#src-8">8</a>. А обычные параллельные ветки внутри одного графа, как в отчёте с r/LangGraph, 1.0 не коррелирует вовсе: атрибуция есть только у того, что продюсер явно объявил сабагентом.</p>
+
+<div class="note practice"><p>Та же задача решена в Claude Code. В выводе <code>stream-json</code> сообщения сабагентов приходят с полем <code>parent_tool_use_id</code>, равным идентификатору вызова инструмента Agent, который их породил, а у основного разговора в этом поле <code>null</code>; с флагом <code>--forward-subagent-text</code> (v2.1.211 и новее) в поток попадают и тексты сабагентов<a class="cite" href="#src-20">20</a>. Если будешь писать мост из Claude Code в AG-UI, <code>parent_tool_use_id</code> естественно ложится на <code>parentToolCallId</code>.</p></div>
+</section>
+
+<section id="transports">
+<h2>SSE обязателен, protobuf по желанию, WebSocket — твоя забота</h2>
+
+<p>Страница «Architecture» в документации AG-UI пишет, что протокол поддерживает <q>various transport mechanisms including Server-Sent Events (SSE), webhooks, WebSockets, and more</q>, а вводная страница — что он работает поверх HTTP и WebSockets<a class="cite" href="#src-21">21</a>. Нормативная спецификация 1.0 определяет ровно две привязки: HTTP+SSE, обязательную для любой HTTP-реализации, и HTTP+Protobuf, необязательную. Всё остальное, WebSocket в том числе, — «пользовательский транспорт»<a class="cite" href="#src-1">1</a>. В спорных местах верь спецификации и JSON Schema, а не концептуальным страницам.</p>
+
+<p>Путаница старая. В день запуска на Hacker News, 13 мая 2025 года, в трекере появилась issue #3: <q>trying to find websockets transport for ag-ui… I also couldn't find the exact spec of the protocol from the website</q>. Её закрыли ответом, что отдельного WebSocket-транспорта не планируется<a class="cite" href="#src-16">16</a>. Спецификации тогда действительно не было: её написали к 1.0, а до того поведение определял код клиента на TypeScript.</p>
+
+<figure class="fig wide" id="fig-framing">
+<svg class="diagram" viewBox="0 0 1000 250" role="img" aria-label="Кадрирование событий в SSE и в protobuf">
+  <text class="t-title" x="20" y="30">HTTP + SSE, Content-Type: text/event-stream</text>
+  <rect class="box--soft" x="20" y="44" width="90" height="36" rx="4"/>
+  <text class="t-mono" x="65" y="67" text-anchor="middle">data: </text>
+  <rect class="box" x="110" y="44" width="600" height="36" rx="4"/>
+  <text class="t-mono" x="122" y="67">{"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"Hi"}</text>
+  <rect class="box--soft" x="710" y="44" width="70" height="36" rx="4"/>
+  <text class="t-mono" x="745" y="67" text-anchor="middle">\n\n</text>
+  <rect class="box--ghost" x="800" y="44" width="180" height="36" rx="4"/>
+  <text class="t-mono t-mute" x="890" y="67" text-anchor="middle">data: …</text>
+  <text class="t-sub" x="20" y="104">одно событие на одну запись data:, целиком, без склейки; концы строк только LF</text>
+  <text class="t-title" x="20" y="146">HTTP + Protobuf, Accept: application/vnd.ag-ui.event+proto</text>
+  <rect class="box--accent" x="20" y="160" width="160" height="36" rx="4"/>
+  <text class="t-mono" x="100" y="183" text-anchor="middle">len = N</text>
+  <rect class="box" x="180" y="160" width="400" height="36" rx="4"/>
+  <text class="t-mono" x="380" y="183" text-anchor="middle">N байт protobuf-сообщения</text>
+  <rect class="box--accent" x="600" y="160" width="160" height="36" rx="4"/>
+  <text class="t-mono" x="680" y="183" text-anchor="middle">len = M</text>
+  <rect class="box--ghost" x="760" y="160" width="220" height="36" rx="4"/>
+  <text class="t-mono t-mute" x="870" y="183" text-anchor="middle">M байт …</text>
+  <text class="t-sub" x="20" y="220">4 байта длины, big-endian, без разделителей; кадр может прийти разрезанным на куски</text>
+  <text class="t-red" x="20" y="242">сообщений нет: TOOL_CALL_RESULT, ACTIVITY_*, REASONING_*</text>
+</svg>
+<figcaption>Одно и то же событие в двух стандартных привязках. В SSE границу задаёт пустая строка, в protobuf — префикс длины. Семантика у привязок общая, но у части событий protobuf-представления нет вовсе.</figcaption>
+</figure>
+
+<h3>HTTP + SSE</h3>
+
+<p>Клиент отправляет <code>POST</code> с JSON и заголовками <code>Content-Type: application/json</code> и <code>Accept: text/event-stream</code>. Сервер отвечает <code>200</code> с <code>text/event-stream</code>. Каждая запись <code>data:</code> содержит ровно один JSON-объект события: событие нельзя ни разрезать на несколько записей, ни склеить с соседним. Продюсер пишет концы строк только как LF. Потребитель игнорирует поля SSE, кроме <code>data</code>, и переживает строки-комментарии, которыми прокси держат соединение живым<a class="cite" href="#src-1">1</a>. Механизма возобновления нет: <code>Last-Event-ID</code> не используется, и оборванный поток лечится только новым прогоном.</p>
+
+<h3>HTTP + Protobuf</h3>
+
+<p>Бинарная привязка использует тот же запрос. Клиент, который умеет её читать, добавляет в <code>Accept</code> тип <code>application/vnd.ag-ui.event+proto</code>. Каждый кадр ответа — четыре байта длины в порядке big-endian и ровно столько байт protobuf, без разделителей; сообщения генерируются из той же JSON Schema, а побайтовое совпадение между реализациями проверяется общим корпусом тестов<a class="cite" href="#src-1">1</a>.</p>
+
+<div class="note warn"><p>Согласие на protobuf выражается допуском типа в <code>Accept</code>, и шаблон <code>*/*</code> или <code>application/*</code> тоже его допускает; веса <code>q</code> между двумя типами не сравниваются<a class="cite" href="#src-1">1</a>. <code>curl</code>, httpx и <code>requests</code> по умолчанию шлют <code>Accept: */*</code>. Отладочный запрос без явного заголовка к TypeScript- или .NET-продюсеру с поддержкой protobuf может вернуть бинарный поток. Клиент, который не умеет декодировать protobuf, обязан явно написать <code>Accept: text/event-stream</code>.</p></div>
+
+<p>Бинарная привязка не полностью заменяет SSE. У результата инструмента, событий активности, рассуждений и выведенных <code>THINKING_*</code> protobuf-сообщения нет, и через эту привязку они пройти не могут: .NET-кодировщик их отвергает, TypeScript-кодировщик пишет пустое тело, на котором спотыкается декодер<a class="cite" href="#src-1">1</a>. Страница о сабагентах считает, что отображение в protobuf есть у 19 типов из 36<a class="cite" href="#src-8">8</a>. Числа в открытых объектах вроде <code>state</code> и <code>metadata</code> кодируются через <code>google.protobuf.Struct</code> как IEEE-754 double, так что целые больше 2<sup>53</sup> теряют точность. Protobuf есть в SDK на TypeScript (<code>@ag-ui/proto</code>) и .NET; Python-кодировщик пишет только SSE. Бери protobuf, только если измерил, что узкое место в размере потока, и твой поток не содержит перечисленных событий.</p>
+
+<h3>WebSocket и всё остальное</h3>
+
+<p>WebSocket, шины сообщений и вызовы внутри процесса спецификация разрешает, но как пользовательский транспорт. Он обязан сам выполнить контракт привязки: доставлять события по порядку и полностью, доставлять <code>RunAgentInput</code> раньше любых событий, отличать чистое завершение от обрыва и иметь внеполосный путь для ошибки отвергнутого входа. Кадрировать JSON ему следует так же, как SSE, по событию на кадр<a class="cite" href="#src-1">1</a>. Готовый пример — контракт Amazon Bedrock AgentCore: контейнер на <code>0.0.0.0:8080</code>, <code>POST /invocations</code> с SSE, <code>/ws</code> с WebSocket для интерактивных сессий и <code>/ping</code> для проверки здоровья<a class="cite" href="#src-24">24</a>. Формат кадров на <code>/ws</code> определяет AWS, а не AG-UI.</p>
+
+<h3>Переподключение и авторизация</h3>
+
+<p>Пользователь, который обновил страницу посреди длинного прогона, поток теряет. В схеме возможностей есть флаги <code>transport.resumable</code> и <code>transport.pushNotifications</code>, но механизма за ними спецификация не определяет; issue #2105 с вопросом, как это должно работать, открыта с 2 июля 2026 года<a class="cite" href="#src-16">16</a>. В клиенте есть <code>connectAgent()</code>, но по документации он работает, только если агент реализует метод <code>connect()</code>, а по умолчанию бросает <code>ConnectNotImplementedError</code><a class="cite" href="#src-22">22</a>. В эталонном стеке переподключение и догон пропущенного продаются: в таблице CopilotKit «открытая версия против Intelligence» пункт <q>AG-UI Streams with saved UI, resumable runs, and realtime sync</q> стоит в платной колонке<a class="cite" href="#src-7">7</a>. У Vercel AI SDK для сравнения есть <code>resume</code> в <code>useChat</code> и пакет <code>resumable-stream</code> на Redis<a class="cite" href="#src-33">33</a>.</p>
+
+<p>Авторизация вне протокола: <q>AG-UI defines no credential</q>, всё решает канал привязки<a class="cite" href="#src-1">1</a>. Для HTTP это заголовки.</p>
+
+<script type="text/plain" class="code" data-lang="typescript" data-title="HttpAgent с заголовком авторизации (из документации SDK)">
+const agent = new HttpAgent({
+  url: "https://api.example.com/v1/agent",
+  headers: {
+    Authorization: "Bearer your-api-key",
+  },
+})
+</script>
+
+<p>В документации по middleware есть пример <code>AuthMiddleware</code>, который кладёт токен в <code>forwardedProps</code>. Это демонстрация API middleware, а не рекомендация: <code>connectAgent()</code>, по той же документации, <q>currently calls <code>connect()</code> directly and does not run middleware</q><a class="cite" href="#src-22">22</a>. Авторизация через middleware молча пропадёт при переподключении, логирование тоже.</p>
+</section>
+
+<section id="versions">
+<h2>Версия 1.0: заморозка и прокладки совместимости</h2>
+
+<p>Полтора года у AG-UI не было письменного описания поведения: что правильно, определял код клиента на TypeScript. Python-пакет при этом жил в версиях 0.1.x, TypeScript в 0.0.x, и сопоставлять их приходилось по датам. Версия 1.0 — первая с нормативным текстом на языке MUST и SHOULD и JSON Schema, из которой генерируются все три первичных SDK<a class="cite" href="#src-10">10</a>. Схема решает вопросы структуры, текст спецификации — вопросы поведения. Вот как это происходило:</p>
+
+<ol class="timeline">
+  <li><time>7 мая 2025</time><p>Создан репозиторий <code>ag-ui-protocol/ag-ui</code>, первый коммит. Документация AG-UI датирует открытие 9 апреля, GitHub это не подтверждает<a class="cite" href="#src-16">16</a>.</p></li>
+  <li><time>2 июня 2025</time><p>Пост CopilotKit о первом месяце: 16 типов событий, формула «M×N → M+N»<a class="cite" href="#src-5">5</a>.</p></li>
+  <li><time>30 апреля 2026</time><p>PR #1569 приносит прерывания в ядро SDK на TypeScript и Python; на PyPI они попадают в <code>ag-ui-protocol</code> 0.1.19 2 июня<a class="cite" href="#src-16">16</a>.</p></li>
+  <li class="is-major"><time>2 сентября 2026</time><p>Черновик 1.0 выложен на публичное обсуждение, Discussion #2608.</p></li>
+  <li><time>9–14 сентября 2026</time><p>По итогам ревью Pydantic AI и инженера Anthropic в спецификацию добавляют проверку ответов на стороне потребителя, <code>usage</code>, <code>ContentPart[]</code> в результатах инструментов, исход <code>cancelled</code>, <code>pendingToolCallIds</code> и источник <code>file</code><a class="cite" href="#src-14">14</a>.</p></li>
+  <li class="is-major"><time>17 сентября 2026</time><p>1.0.0 для TypeScript, Python и .NET. <code>DEPRECATIONS.md</code> назначает всем прокладкам совместимости срок 17 сентября 2027 года<a class="cite" href="#src-34">34</a>.</p></li>
+  <li><time>18 сентября 2026</time><p>Мейнтейнеры объявляют, что 1.0 выпущена и заморожена, и благодарят <q>people building on AG-UI at Anthropic, Google, Microsoft, Pydantic, and TanStack</q><a class="cite" href="#src-14">14</a>.</p></li>
+  <li><time>29 сентября 2026</time><p>Пакеты TypeScript 1.0.1 с исправлением <code>connectAgent()</code>. Python остаётся на 1.0.0<a class="cite" href="#src-16">16</a>.</p></li>
+  <li><time>30 сентября 2026</time><p>Пост CopilotKit «Introducing AG-UI 1.0»<a class="cite" href="#src-13">13</a>.</p></li>
+</ol>
+
+<p>Датой выхода считай 17 сентября: в этот день опубликованы пакеты и <code>DEPRECATIONS.md</code>. Пост в блоге CopilotKit вышел почти на две недели позже, и материалы, которые датируют 1.0 тридцатым сентября, опираются на него. Обещание на будущее мейнтейнеры сформулировали так: текст 1.0 меняться не будет, любые изменения сначала проходят публичный черновик<a class="cite" href="#src-14">14</a>.</p>
+
+<h3>Как стороны договариваются о версии</h3>
+
+<p>Версия передаётся в самом обмене. Потребитель пишет свою в <code>RunAgentInput.protocolVersion</code>, продюсер — свою в <code>RUN_STARTED.protocolVersion</code>, и это его собственное значение, а не эхо клиентского. Формат <code>MAJOR.MINOR</code>. Запрос с более новым минором своей мажорной линии продюсер обязан обслужить; отказать он может только неизвестной мажорной версии, и только до <code>RUN_STARTED</code>. Отсутствие поля с любой стороны означает собеседника, который появился раньше версионирования<a class="cite" href="#src-35">35</a>.</p>
+
+<figure class="fig wide" id="fig-compat">
+<script type="text/x-mermaid">
+flowchart TD
+  req["RunAgentInput.protocolVersion:<br/>что прислал потребитель?"]
+  req -- "мой major, минор новее" --> serve["обслужить, в RUN_STARTED<br/>написать свою версию"]:::ok
+  req -- "неизвестный major" --> rej["отказ до RUN_STARTED"]:::warn
+  req -- "поля нет" --> old(["понижать поток<br/>для старого клиента?"])
+  old -- "без потерь" --> silent["можно молча:<br/>убрать subagentRunId"]
+  old -- "с потерями" --> loud["только с предупреждением:<br/>выброшено событие или часть"]:::accent
+</script>
+<figcaption>Решение продюсера по версии клиента. Понижение не вправе менять исход прогона, идентификаторы и порядок событий; понижение с потерями обязано предупреждать, и отключать такие предупреждения по умолчанию нельзя.</figcaption>
+</figure>
+
+<p>Понижение потока для старого собеседника спецификация описывает жёстко. Оно должно быть чистой трансформацией: не менять исход прогона, не трогать идентификаторы, не переставлять события. Понижение без потерь, например удаление <code>subagentRunId</code>, можно делать молча. С потерями, когда выбрасывается событие жизненного цикла или часть содержимого, — только с предупреждением, и глушить такие предупреждения по умолчанию запрещено. Ещё одно правило защищает от соблазна спрятать смысл в расширении: продюсер не должен класть в одно только расширение то, для чего в протоколе уже есть место<a class="cite" href="#src-35">35</a>. Исход, содержимое сообщения, имя инструмента и результат едут в полях схемы, даже если рядом дублируются в <code>metadata</code>.</p>
+
+<p>Прокладки совместимости живут только в клиенте на TypeScript. Это всегда включённый <code>CompatibilityBoundary</code> и три прокладки, включаемые по версии собеседника: <code>BackwardCompatibility_0_0_39</code> переписывает исходящий запрос, <code>_0_0_45</code> превращает полученные <code>THINKING_*</code> в <code>REASONING_*</code>, <code>_0_0_57</code> выбрасывает <code>SUBAGENT_*</code> и срезает <code>subagentRunId</code>. В <code>DEPRECATIONS.md</code> 22 строки, и у всех один срок, 17 сентября 2027 года. Переменная окружения <code>SUPPRESS_TRANSFORMATION_WARNINGS=true</code>, как там сказано, <q>silences the warnings, not the conversions</q><a class="cite" href="#src-34">34</a>. В Python-SDK никакой трансляции нет, классы <code>THINKING_*</code> из <code>ag_ui.core</code> в 1.0 просто удалены. Отсюда асимметрия: новый клиент на TypeScript умеет разговаривать со старым продюсером, но старый клиент о новых событиях ничего не знает, и защищать его приходится продюсеру, как делает флаг <code>subagent_visibility</code>.</p>
+
+<h3>Интеграции отстают</h3>
+
+<p>Состояние на 30 сентября 2026 года по данным PyPI и npm<a class="cite" href="#src-17">17</a><a class="cite" href="#src-36">36</a>:</p>
+
+<table class="wide">
+<thead><tr><th>Пакет</th><th>Версия и дата</th><th>Что с 1.0</th></tr></thead>
+<tbody>
+<tr><td><code>pydantic-ai-slim[ag-ui]</code></td><td>2.52.0, 30 сентября</td><td><span class="no">нет</span> требует <code>ag-ui-protocol&lt;1</code></td></tr>
+<tr><td><code>agent-framework-ag-ui</code> (MAF, Python)</td><td>1.4.0, 18 сентября</td><td><span class="no">нет</span> требует <code>ag-ui-protocol&lt;0.2</code></td></tr>
+<tr><td><code>@assistant-ui/react-ag-ui</code></td><td>0.0.62, 24 сентября</td><td><span class="no">нет</span> <code>@ag-ui/client ^0.0.59</code>, для версии 0.0.x это ровно 0.0.59</td></tr>
+<tr><td><code>ag-ui-langgraph</code></td><td>0.0.45, 9 сентября</td><td><span class="part">частично</span> исход interrupt только с флагом</td></tr>
+<tr><td><code>ag-ui-strands</code></td><td>0.4.1, 23 сентября</td><td><span class="part">частично</span> переименования 1.0 приняты, источники <code>file</code> выбрасываются, результаты инструментов сплющиваются в текст</td></tr>
+<tr><td><code>@ag-ui/mastra</code></td><td>1.1.5, 30 сентября</td><td><span class="yes">да</span> одобрения инструментов приходят прерываниями</td></tr>
+</tbody>
+</table>
+
+<p>На проводе это обычно не страшно: 1.0 добавляет, а не ломает, и старый продюсер остаётся конформным. Страшно в зависимостях. Из девяти проверенных Python-мостов два закрывают верхнюю границу ниже 1.0, и виртуальное окружение, где Pydantic AI живёт рядом с мостом, требующим 1.0, не соберётся<a class="cite" href="#src-17">17</a>.</p>
+
+<div class="note warn"><p>Документация AG-UI расходится со спецификацией минимум в пяти местах. Страница архитектуры перечисляет WebSocket и вебхуки как транспорты. Вводная страница числит .NET в community, хотя спецификация называет его одним из трёх первичных SDK, а NuGet-пакеты <code>AGUI.*</code> уже на 1.0.0. Концептуальная страница о прерываниях требует от продюсера <code>RunError</code> там, где спецификация возлагает проверку на потребителя. Обзор черновиков всё ещё числит рассуждения и прерывания черновиками. Страница «What's New» кончается записью от 9 апреля 2025 года об открытии репозиториев, хотя репозиторий на GitHub создан только 7 мая<a class="cite" href="#src-21">21</a><a class="cite" href="#src-16">16</a>. Спорный вопрос решай по <code>/spec/1.0/</code> и <code>schema.json</code>.</p></div>
+</section>
+
+<section id="ux">
+<h2>Что видит пользователь: стриминг и generative UI поверх</h2>
+
+<p>В CopilotKit v2 функция отрисовки вызова инструмента получает один из трёх объектов: <code>{status: "inProgress", parameters: Partial&lt;T&gt;}</code>, <code>{status: "executing", parameters: T}</code> или <code>{status: "complete", parameters: T, result: string}</code><a class="cite" href="#src-7">7</a>. За этими тремя статусами стоят события протокола. Документация CopilotKit соответствие явно не расписывает, но из правил спецификации оно выводится.</p>
+
+<figure class="fig" id="fig-render">
+<script type="text/x-mermaid">
+stateDiagram-v2
+  state "inProgress: копятся TOOL_CALL_ARGS" as P
+  state "executing: аргументы целиком" as E
+  state "complete: есть результат" as C
+  [*] --> P: TOOL_CALL_START
+  P --> E: TOOL_CALL_END
+  E --> C: TOOL_CALL_RESULT
+  C --> [*]
+  note right of P: показывать можно, действовать нельзя
+</script>
+<figcaption>Жизненный цикл карточки инструмента в интерфейсе. Частичные аргументы годятся для превью, например заголовка письма, которое модель ещё дописывает; кнопки, которые что-то делают, появляются только после <code>TOOL_CALL_END</code>.</figcaption>
+</figure>
+
+<p>Остальные приёмы стримингового интерфейса тоже раскладываются по семействам событий:</p>
+
+<table class="wide">
+<thead><tr><th>Что показать</th><th>События</th><th>На чём ошибаются</th></tr></thead>
+<tbody>
+<tr><td>Текст по мере генерации</td><td><code>TEXT_MESSAGE_*</code></td><td>Склеивать надо по <code>messageId</code>, сообщения и вызовы перемежаются</td></tr>
+<tr><td>Карточка инструмента с превью</td><td><code>TOOL_CALL_*</code></td><td>Действие по аргументам до <code>TOOL_CALL_END</code></td></tr>
+<tr><td>План или чеклист, который обновляется</td><td><code>ACTIVITY_SNAPSHOT</code>, <code>ACTIVITY_DELTA</code></td><td>Забыли вырезать activity-сообщения из <code>messages</code> перед отправкой</td></tr>
+<tr><td>«Думает…» со сводкой</td><td><code>REASONING_MESSAGE_*</code></td><td>Потеряли <code>REASONING_ENCRYPTED_VALUE</code>, который надо вернуть агенту</td></tr>
+<tr><td>Прогресс по этапам</td><td><code>STEP_STARTED</code>, <code>STEP_FINISHED</code></td><td>Этапы могут пересекаться, пары ищут по <code>stepName</code></td></tr>
+<tr><td>Живая доска, таблица, форма</td><td><code>STATE_SNAPSHOT</code>, <code>STATE_DELTA</code></td><td>Ждут, что правка пользователя дойдёт до агента посреди прогона</td></tr>
+<tr><td>Запрос на одобрение</td><td><code>outcome</code> interrupt</td><td>Не смотрят в <code>responseSchema</code>, редактор аргументов рисуют всегда или никогда</td></tr>
+<tr><td>Плавный вывод без дёрганья</td><td>все дельты и снапшоты</td><td>Перерисовывают интерфейс на каждое событие</td></tr>
+</tbody>
+</table>
+
+<p>Последнюю строку в монорепозитории AG-UI решает <code>event-throttle-middleware</code>. Он копит дельты текста и рассуждений, снапшоты состояния, сообщений и активности и события <code>RAW</code> в окне <code>intervalMs</code> (в комментарии к коду: <q>16 = ~60fps</q>), а всё остальное, включая жизненный цикл, пропускает сразу. Список того, что можно придержать, белый, и в комментарии объяснено почему: новый тип события, добавленный в протокол, по умолчанию пройдёт без задержки, и это <q>the safer failure mode</q><a class="cite" href="#src-37">37</a>. На npm пакета на 30 сентября нет, так что это образец для своего middleware, а не зависимость. Прореживать стоит на клиенте, а не на продюсере: продюсер не знает, как часто конкретный интерфейс способен перерисовываться.</p>
+
+<p>Есть и способ спросить агента, что он умеет. Схема 1.0 описывает <code>AgentCapabilities</code> с группами <code>transport</code>, <code>tools</code>, <code>state</code>, <code>reasoning</code>, <code>multimodal</code>, <code>humanInTheLoop</code> и другими. Правило чтения одно: отсутствие поля значит «не объявлено», а не «не поддерживается», и включать функцию интерфейса можно только по явному <code>true</code>. Декларации информативны: прогон с событиями рассуждений при <code>reasoning: {supported: false}</code> — повод пожаловаться на продюсера, а не отвергнуть поток. Как клиенту получить декларацию, спецификация не определяет: это <q>deliberately left to the implementation</q><a class="cite" href="#src-4">4</a>. В TypeScript у <code>AbstractAgent</code> есть необязательный <code>getCapabilities()</code>, мосты LangGraph и ADK его реализуют, голый <code>HttpAgent</code> — нет.</p>
+
+<h3>Как едет generative UI</h3>
+
+<p>Описывать интерфейсы, которые генерирует агент, AG-UI не берётся: этим заняты A2UI, MCP Apps и другие форматы из <a href="../09-a2ui-generative-ui/index.html">главы 9</a>. AG-UI их перевозит. В монорепозитории протокола для этого есть два middleware на TypeScript, и оба устроены на уже знакомых механизмах: подмешанный в запрос инструмент и событие активности.</p>
+
+<p><code>@ag-ui/a2ui-middleware</code> (0.0.11 от 30 сентября 2026 года) добавляет агенту инструмент <code>render_a2ui</code> с описанием <q>Render a dynamic A2UI v0.9 surface with structured parameters</q> и кладёт в <code>context</code> схему доступных компонентов<a class="cite" href="#src-37">37</a>. Когда модель вызывает этот инструмент, middleware читает <code>TOOL_CALL_ARGS</code> по мере прихода и выпускает <code>ACTIVITY_SNAPSHOT</code> с типом <code>a2ui-surface</code>. Пока поверхность не готова, снапшот несёт только статус сборки; готовая поверхность приходит в том же <code>messageId</code> с <code>replace: true</code> и полем <code>a2ui_operations</code>. Скелет заменяется готовым интерфейсом на месте, а не рисуется второй раз. Все операции одной поверхности идут в одном снапшоте: комментарий в коде объясняет, что частичный набор операций ломает привязку данных.</p>
+
+<figure class="fig wide" id="fig-a2ui">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Интерфейс
+  participant M as a2ui-middleware
+  participant P as Агент
+  M->>P: tools + render_a2ui, context + схема компонентов
+  P-->>M: TOOL_CALL_START render_a2ui
+  M-->>U: ACTIVITY_SNAPSHOT a2ui-surface, status building
+  P-->>M: TOOL_CALL_ARGS (куски операций)
+  M-->>U: ACTIVITY_SNAPSHOT replace, a2ui_operations
+  Note over U: скелет заменён поверхностью
+  P-->>M: RUN_FINISHED
+  U->>M: клик: новый прогон, forwardedProps.a2uiAction
+  M->>P: messages + вызов log_a2ui_event и его результат
+</script>
+<figcaption>A2UI поверх AG-UI. Поверхность приходит событием активности, которое модель никогда не увидит; клик возвращается следующим прогоном и превращается в вызов инструмента, будто модель сама записала событие интерфейса.</figcaption>
+</figure>
+
+<p>Обратный путь интереснее. Клик по кнопке на поверхности отправляет новый прогон с <code>forwardedProps.a2uiAction.userAction</code>, где лежат имя действия, <code>surfaceId</code>, <code>sourceComponentId</code> и контекст. Middleware дописывает в <code>messages</code> синтетическое сообщение ассистента с вызовом <code>log_a2ui_event</code> и результат этого вызова. Идентификаторы он получает хешем SHA-256 от <code>runId</code>, чтобы повтор того же прогона давал те же идентификаторы. Модель видит клик как вызов инструмента в своей истории, а протокол не получил ни одного нового типа события.</p>
+
+<p><code>@ag-ui/mcp-apps-middleware</code> (0.1.1) опирается на правило об инструментах фронтенда. Он находит на MCP-серверах инструменты, у которых объявлен UI-ресурс, и добавляет их агенту. Агент вызывает такой инструмент и, как положено, на вызов не отвечает. Middleware придерживает <code>RUN_FINISHED</code>, находит вызовы без результата, сам выполняет их на MCP-сервере, выпускает <code>TOOL_CALL_RESULT</code> и <code>ACTIVITY_SNAPSHOT</code> с типом <code>mcp-apps</code>, где лежат результат, <code>resourceUri</code> и аргументы, и только потом отпускает <code>RUN_FINISHED</code><a class="cite" href="#src-37">37</a>. Интерфейс загружает ресурс по <code>resourceUri</code> через проксированный запрос к MCP-серверу.</p>
+
+<div class="note key"><p>Generative UI вокруг AG-UI сегодня живёт в TypeScript-слое между агентом и браузером: оба middleware подключаются к <code>AbstractAgent</code> вызовом <code>.use()</code>. Если твой агент на Python, а фронтенд ходит к нему напрямую, этого слоя у тебя нет, и A2UI придётся собирать по тем же правилам самому или поднимать TypeScript-посредника с этими middleware.</p></div>
+
+<p>Собственный черновик AG-UI о генеративном интерфейсе, где агенту предлагается фронтенд-инструмент для генерации UI, остаётся черновиком и в 1.0 не вошёл. Страница AG-UI о форматах генеративного UI приписывает MCP-UI и MCP Apps компаниям Microsoft и Shopify. Для MCP Apps это неверно: расширение SEP-1865 от 21 ноября 2025 года написали мейнтейнеры MCP из OpenAI и Anthropic вместе с авторами MCP-UI<a class="cite" href="#src-38">38</a>.</p>
+</section>
+
+<section id="landscape">
+<h2>MCP, A2A, AG-UI — и ещё ACP</h2>
+
+<p>Когда Claude Code работает внутри Zed как внешний агент, редактор разговаривает с ним не по AG-UI. Для этого есть Agent Client Protocol, ACP: <q>standardizes communication between code editors … and coding agents</q>. Zed завёл его репозиторий 23 июня 2025 года, теперь он живёт в организации <code>agentclientprotocol</code>, стабильная версия протокола — 1<a class="cite" href="#src-39">39</a>. Устроен он иначе. Сообщения — JSON-RPC 2.0, основной транспорт — stdio: редактор запускает агента дочерним процессом и пишет ему в stdin, агент отвечает в stdout и шлёт уведомления <code>session/update</code>. В спецификации есть отдельные разделы о доступе агента к файловой системе и терминалу редактора. Claude Code подключается к ACP-клиентам через адаптер <code>claude-agent-acp</code>, <q>Use Claude Agent SDK from any ACP client</q>.</p>
+
+<p>Схема «треугольника протоколов», которую рисует документация AG-UI, выглядит так: MCP соединяет агента с инструментами и данными, A2A — с другими агентами, AG-UI — с приложением пользователя. Документация LangChain честнее: она ставит рядом четыре протокола, добавляя ACP для редакторов и IDE<a class="cite" href="#src-40">40</a>.</p>
+
+<figure class="fig wide" id="fig-landscape">
+<script type="text/x-mermaid">
+flowchart TD
+  web["Веб-приложение<br/>CopilotKit, assistant-ui"] -- "AG-UI: HTTP + SSE" --> mw["TS-слой клиента:<br/>a2a- и mcp-apps-middleware"]:::mute
+  ide["Редактор<br/>Zed и другие ACP-клиенты"] -- "ACP: JSON-RPC, stdio" --> agent["Агент"]:::accent
+  mw -- "AG-UI" --> agent
+  agent -- "MCP" --> tools[("Инструменты<br/>и данные")]:::ok
+  agent -- "A2A" --> peers["Другие агенты"]:::violet
+  mw -. "A2A" .-> peers
+  mw -. "MCP, UI-ресурсы" .-> tools
+</script>
+<figcaption>Четыре протокола вокруг одного агента. AG-UI и ACP оба смотрят в сторону человека, но на разных концах: веб-приложение по сети против редактора, который запускает агента у себя. Пунктир — middleware AG-UI в TypeScript-слое клиента: через них веб-приложение дотягивается до A2A-агентов и UI-ресурсов MCP, само не говоря на этих протоколах.</figcaption>
+</figure>
+
+<p>Два протокола в сторону человека друг друга не дублируют, условия у них разные. ACP-агент — локальный процесс рядом с кодом, с живым двунаправленным каналом, и редактор даёт ему файлы и терминал. AG-UI-агент — удалённый сервис, к которому браузер приходит по HTTP с одним запросом на прогон, и все сведения о клиенте едут в этом запросе. Если ты пишешь плагин к редактору, смотри на ACP. Если веб-продукт, на AG-UI. MCP и A2A разобраны в <a href="../05-mcp/index.html">главе 5</a> и <a href="../07-a2a/index.html">главе 7</a>.</p>
+
+<h3>Альтернативы на том же участке</h3>
+
+<p>У AG-UI есть прямые конкуренты, и выбор между ними зависит от того, где уже живёт твой код. Проще всего сравнить их на одном сценарии: ответ текстом, вызов инструмента, запрос на одобрение.</p>
+
+<figure class="fig wide" id="fig-wires">
+<div class="versus">
+  <div data-tone="accent"><h4>AG-UI</h4><ul><li><code>RUN_STARTED</code></li><li><code>TEXT_MESSAGE_START</code>, <code>CONTENT</code>, <code>END</code></li><li><code>TOOL_CALL_START</code>, <code>ARGS</code>, <code>END</code></li><li><code>RUN_FINISHED</code> с исходом interrupt</li><li>новый POST с <code>resume[]</code></li><li><code>TOOL_CALL_RESULT</code>, <code>RUN_FINISHED</code></li></ul></div>
+  <div><h4>Vercel UI Message Stream</h4><ul><li><code>start</code></li><li><code>text-start</code>, <code>text-delta</code>, <code>text-end</code></li><li><code>tool-input-start</code>, <code>tool-input-delta</code>, <code>tool-input-available</code></li><li><code>tool-approval-request</code>, затем <code>tool-approval-response</code></li><li><code>tool-output-available</code></li><li><code>finish</code>, <code>data: [DONE]</code></li></ul></div>
+  <div data-tone="mute"><h4>OpenAI ChatKit</h4><ul><li>запрос <code>threads.add_user_message</code></li><li><code>thread.item.added</code></li><li><code>thread.item.updated</code> по мере генерации</li><li><code>thread.item.done</code></li><li>результат инструмента клиента — отдельный запрос <code>threads.add_client_tool_output</code></li><li>тред и элементы хранит сервер</li></ul></div>
+</div>
+<figcaption>Один сценарий в трёх форматах. AG-UI и Vercel описывают поток событий с одинаковой грамматикой «начало, дельты, конец»; ChatKit описывает операции над элементами треда, который хранится на сервере.</figcaption>
+</figure>
+
+<p>Ближе всех к AG-UI протокол UI Message Stream из Vercel AI SDK. Тоже SSE, заголовок <code>x-vercel-ai-ui-message-stream: v1</code>, в конце <code>data: [DONE]</code><a class="cite" href="#src-33">33</a>. Грамматика частей похожа на AG-UI: <code>text-start</code>, <code>text-delta</code>, <code>text-end</code>, отдельные части для рассуждений, ввода и вывода инструментов, <code>start-step</code> и <code>finish-step</code>, <code>abort</code>. Одобрение инструмента выражено парой частей <code>tool-approval-request</code> и <code>tool-approval-response</code>, а не концом прогона. Общего состояния со снапшотами и патчами нет; вместо него типизированные части <code>data-*</code>. Зато возобновление потока встроено: <code>resume</code> в <code>useChat</code> и пакет <code>resumable-stream</code>. Описание протокола — список частей с примерами, без нормативных правил порядка и версионирования. Седьмая версия SDK вышла 25 июня 2026 года<a class="cite" href="#src-36">36</a>, а переписанный под неё мост AG-UI на 30 сентября всё ещё открытый PR<a class="cite" href="#src-16">16</a>.</p>
+
+<p>LangGraph можно стримить и без посредников. На бэкенде <code>graph.stream_events(..., version="v3")</code>, с версии 1.2 это рекомендуемый способ стриминга, на фронтенде хук <code>useStream</code> из <code>@langchain/react</code> и его аналоги для Vue, Svelte и Angular. Он умеет переподключаться к идущему прогону, ходить по истории и ветвить разговор<a class="cite" href="#src-40">40</a>. С долговечными тредами эта связка работает лучше AG-UI, но только внутри LangGraph. Для выхода за его пределы документация LangChain сама отправляет к <code>@ag-ui/langgraph</code>.</p>
+
+<p>OpenAI ChatKit устроен иначе: это не поток прогона, а протокол треда и его элементов. Запросы там вроде <code>threads.create</code>, <code>threads.add_user_message</code>, <code>threads.add_client_tool_output</code>, <code>threads.custom_action</code>, в ответ приходят события <code>thread.item.added</code>, <code>thread.item.updated</code>, <code>thread.item.done</code>, <code>thread.item.replaced</code> и служебные. Историю хранит сервер<a class="cite" href="#src-41">41</a>. Python-пакет <code>openai-chatkit</code> 1.6.5 вышел 19 мая 2026 года, и к концу сентября новых релизов не было. Второй продукт OpenAI на этом участке, Apps SDK, решает другую задачу: он встраивает приложения на MCP внутрь ChatGPT и вместе с MCP-UI лёг в основу расширения MCP Apps<a class="cite" href="#src-38">38</a>. Это модель «виджет в чужом хосте», а не поток прогона твоего агента в твой интерфейс, и такие виджеты AG-UI сам перевозит через <code>mcp-apps-middleware</code>. В выборе формата провода Apps SDK поэтому не участвует; подробнее о нём в <a href="../09-a2ui-generative-ui/index.html">главе 9</a>.</p>
+
+<p>assistant-ui в этом ряду стоит особняком: это не протокол, а набор React-компонентов для чата. К AG-UI он подключается пакетом <code>@assistant-ui/react-ag-ui</code> через <code>useAgUiRuntime({ agent })</code>, а рядом лежат адаптеры для A2A, LangGraph, AI SDK и Google ADK<a class="cite" href="#src-32">32</a>. Похожим образом Pydantic AI реализует и AG-UI, и протокол Vercel: <code>AGUIAdapter</code> и <code>VercelAIAdapter</code> наследуют один <code>UIAdapter</code><a class="cite" href="#src-23">23</a>. Протоколы на этом участке похожи настолько, что библиотеки поддерживают несколько сразу.</p>
+
+<table class="wide">
+<thead><tr><th></th><th>AG-UI</th><th>Vercel UI Message Stream</th><th>LangGraph <code>useStream</code></th><th>ChatKit</th></tr></thead>
+<tbody>
+<tr><th>Бэкенды</th><td>Любой фреймворк через мост</td><td>AI SDK, Pydantic AI</td><td>LangGraph</td><td>Свой сервер на <code>openai-chatkit</code></td></tr>
+<tr><th>Общее состояние</th><td><span class="yes">да</span> снапшот и JSON Patch</td><td><span class="part">частично</span> части <code>data-*</code></td><td><span class="yes">да</span> состояние графа</td><td><span class="no">нет</span></td></tr>
+<tr><th>Одобрение</th><td>Конец прогона и <code>resume[]</code></td><td>Части запроса и ответа</td><td>Прерывания LangGraph</td><td>Отдельного события нет</td></tr>
+<tr><th>Возобновление потока</th><td><span class="no">нет</span> в OSS</td><td><span class="yes">да</span></td><td><span class="yes">да</span></td><td>История на сервере</td></tr>
+<tr><th>Нормативная спецификация</th><td><span class="yes">да</span> 1.0</td><td><span class="no">нет</span></td><td><span class="no">нет</span></td><td><span class="no">нет</span></td></tr>
+</tbody>
+</table>
+
+<div class="note key"><p>Если весь стек на Next.js и AI SDK, бери протокол Vercel: AG-UI добавит слой без выигрыша. Если всё на LangGraph и так останется, <code>useStream</code> даст больше. AG-UI окупается, когда за одним интерфейсом стоят агенты на разных фреймворках, когда бэкенд на Python (Pydantic AI, ADK, Microsoft Agent Framework, CrewAI), а фронтенд на React, и когда одобрения должны переживать перезапуск сервера. Оценка изменится, если Vercel добавит общее состояние, а AG-UI вынесет возобновление потока из платной части CopilotKit в спецификацию.</p></div>
+</section>
+
+<section id="maturity">
+<h2>Кто этим пользуется и за что критикуют</h2>
+
+<p>За 30 дней по 28 сентября 2026 года пакет <code>@ag-ui/core</code> скачали 8 222 341 раз<a class="cite" href="#src-36">36</a>. Цифра выглядит внушительно, пока не поставишь её рядом с соседями и не вспомнишь, что npm считает и установки в CI, и транзитивные зависимости. <code>@ag-ui/core</code> тянут за собой клиент, кодировщик и мосты, поэтому он и обгоняет <code>@ag-ui/client</code> в полтора раза.</p>
+
+<figure class="fig" id="fig-npm">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Загрузки с npm за 30 дней", "subtitle": "30 августа — 28 сентября 2026", "unit": "млн", "decimals": 1, "emphasis": ["@ag-ui/core", "@ag-ui/client"],
+ "rows": [["@modelcontextprotocol/sdk", 220.0], ["ai (Vercel AI SDK)", 100.5], ["@ai-sdk/react", 33.3], ["@langchain/langgraph-sdk", 14.6], ["@a2a-js/sdk", 11.2], ["@ag-ui/core", 8.2], ["@assistant-ui/react", 7.0], ["@ag-ui/client", 5.3], ["@copilotkit/react-core", 1.8], ["@langchain/react", 0.27], ["@openai/chatkit-react", 0.27]],
+ "note": "npm downloads API, включая CI и транзитивные установки."}
+</script>
+<figcaption>AG-UI на фоне соседей по стеку. Протокол для интерфейсов скачивают в 12 раз реже, чем AI SDK от Vercel, и в 27 раз реже, чем SDK для MCP. Эталонный клиент CopilotKit — 1,8 млн, у ChatKit и <code>@langchain/react</code> по четверти миллиона.</figcaption>
+</figure>
+
+<p>На PyPI картина похожая. <code>ag-ui-protocol</code> за последний месяц скачали 6 788 299 раз, но в основном он приезжает зависимостью от extras фреймворков<a class="cite" href="#src-17">17</a>. Показательнее мосты: они ставятся, только когда кто-то действительно подключает AG-UI к конкретному фреймворку.</p>
+
+<figure class="fig" id="fig-pypi">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Загрузки Python-мостов AG-UI за месяц", "subtitle": "pypistats, запрос 30 сентября 2026", "unit": "тыс.", "emphasis": ["ag-ui-langgraph"],
+ "rows": [["ag-ui-langgraph", 456], ["agent-framework-ag-ui", 243, "Microsoft"], ["ag-ui-adk", 172, "Google"], ["ag-ui-strands", 112, "AWS"], ["ag-ui-crewai", 11]],
+ "note": "Включая зеркала и CI. ag-ui-protocol (6,8 млн) не показан: его тянут extras фреймворков."}
+</script>
+<figcaption>LangGraph остаётся главным фреймворком за AG-UI с большим отрывом, за ним мосты трёх облачных вендоров. CrewAI, партнёр запуска 2025 года, отстаёт на порядок.</figcaption>
+</figure>
+
+<p>Внимание разработчиков скромное. Show HN о запуске AG-UI 13 мая 2025 года собрал 36 очков и 5 комментариев, новость о том, что Microsoft поддержала протокол, 20 ноября 2025 года — 7 очков. Для сравнения, запуск OpenAI ChatKit 6 октября 2025 года — 201 очко, Channels SDK от CopilotKit в августе 2026-го — 121<a class="cite" href="#src-42">42</a>. О выходе 1.0 на Hacker News к 30 сентября не нашлось ни одной публикации. Распространение идёт через партнёрства с фреймворками, а не через энтузиазм снизу. У репозитория <code>ag-ui-protocol/ag-ui</code> на ту же дату 16 132 звезды, 1 464 форка, около 166 участников и 40 релизных сборок с 27 мая по 30 сентября 2026 года<a class="cite" href="#src-16">16</a>.</p>
+
+<h3>Кто поддерживает</h3>
+
+<p>Таблица интеграций в документации делит фреймворки на уровни<a class="cite" href="#src-21">21</a>. Партнёрства — LangGraph и CrewAI, первые и самые глубокие. Первичная поддержка — Microsoft Agent Framework, Google ADK, AWS Strands, Amazon Bedrock AgentCore, Mastra, Pydantic AI, Agno, LlamaIndex, AG2. В community-разряде Claude Agent SDK, Claude Managed Agents, Langroid, мост к Vercel AI SDK и watsonx. OpenAI Agents SDK пост о выходе 1.0 перечисляет среди фреймворков, с которыми AG-UI <q>works with</q><a class="cite" href="#src-13">13</a>, но в таблице документации он «In Progress», а PR #2210 с интеграцией для Python открыт с 19 июля 2026 года<a class="cite" href="#src-16">16</a>. Первичных SDK три: TypeScript, Python и .NET. SDK на Kotlin, Go, Dart, Java, Rust, Ruby и C++ поддерживает сообщество, и публичных заявлений о соответствии 1.0 ни у одного из них пока нет.</p>
+
+<p>Подключение у Python-мостов устроено одинаково: агент фреймворка оборачивается в адаптер, адаптер вешается на FastAPI одной функцией. Различаются имена и то, как мост выражает одобрения.</p>
+
+<table class="wide">
+<thead><tr><th>Фреймворк</th><th>Пакет</th><th>Точка входа</th><th>Одобрения</th></tr></thead>
+<tbody>
+<tr><td>LangGraph</td><td><code>ag-ui-langgraph</code>; для деплоя на TS <code>@ag-ui/langgraph</code></td><td><code>add_langgraph_fastapi_endpoint</code>; на TS <code>new LangGraphAgent({ graphId, deploymentUrl })</code></td><td><code>interrupt()</code>, исход interrupt только с <code>emit_interrupt_outcome=True</code></td></tr>
+<tr><td>Google ADK</td><td><code>ag_ui_adk</code></td><td><code>ADKAgent</code> и <code>add_adk_fastapi_endpoint</code>; инструменты фронтенда через <code>AGUIToolset()</code></td><td><code>ADKAgent.from_app()</code> с <code>ResumabilityConfig</code>; исход interrupt тоже за флагом <code>emit_interrupt_outcome</code></td></tr>
+<tr><td>Microsoft Agent Framework</td><td><code>agent-framework-ag-ui</code>, пакеты для .NET и Go</td><td><code>add_agent_framework_fastapi_endpoint</code>; .NET <code>MapAGUIServer</code>; Go <code>aguiprovider.NewJSONHTTPHandler</code></td><td>tool approval mode</td></tr>
+<tr><td>CrewAI</td><td><code>ag-ui-crewai</code> 0.3.0</td><td><code>add_crewai_flow_fastapi_endpoint(app, flow, path)</code>, для Conversational Flows с <code>conversational=True</code></td><td>прерывания, начиная с CrewAI 1.8</td></tr>
+<tr><td>Pydantic AI</td><td><code>pydantic-ai-slim[ag-ui]</code></td><td><code>AGUIAdapter.dispatch_request</code></td><td><code>requires_approval=True</code>, только на протоколе 0.1.x</td></tr>
+</tbody>
+</table>
+
+<p>Таблица собрана по README мостов, документации Pydantic AI, Microsoft и LangChain и посту о CrewAI<a class="cite" href="#src-16">16</a><a class="cite" href="#src-23">23</a><a class="cite" href="#src-25">25</a><a class="cite" href="#src-30">30</a><a class="cite" href="#src-40">40</a><a class="cite" href="#src-43">43</a>. У ADK, как и у LangGraph, исход interrupt по умолчанию выключен: README объясняет это тем, что включать его стоит только с фронтендом, который продолжает через <code>RunAgentInput.resume</code>. У CrewAI в посте о 0.3.0 честно описана ловушка: граф Flow собирается из атрибутов самого подкласса, поэтому подкласс, в котором выставлен только <code>conversational = True</code>, не наследует методы <code>@start</code> и <code>@listen</code> базового Flow и молча прогоняет пустой граф<a class="cite" href="#src-43">43</a>.</p>
+
+<h3>Протокол или продукт</h3>
+
+<p>Самая долгая жалоба на AG-UI адресована не протоколу, а компании, которая его написала. Клиент CopilotKit долго требовал собственный GraphQL-«рантайм» посередине, и те, кто пытался подключить React-приложение напрямую к FastAPI, принимали это за ограничение протокола. Issue #291 «Use agi-ui without next.js» открыта в августе 2025 года:</p>
+
+<div class="note field"><blockquote>CopilotKit seems to want to speak GraphQL with the backend, but the backend is REST/SSE. It's currently quite unclear what the GraphQL bit is…
+<footer>— jagregory, <a href="https://github.com/ag-ui-protocol/ag-ui/issues/291#issuecomment-3349622338">GitHub issue #291, 30 сентября 2025</a></footer></blockquote>
+<p>У автора комментария был React-интерфейс на CopilotKit и бэкенд на Pydantic AI, и непонятно ему было, откуда между ними взялся GraphQL. Через четыре недели, 27 октября, представитель CopilotKit объяснил в том же треде корень: AG-UI был внутренним инструментом, выпускать протокол не планировали, и отделение от продукта идёт по ходу дела. Только 23 июня 2026 года в треде подтвердили, что GraphQL-слоя больше нет и можно работать с клиентским SDK на TypeScript напрямую<a class="cite" href="#src-6">6</a>. Больше десяти месяцев от открытия issue на вопрос, который снаружи выглядел мелким.</p></div>
+
+<p>Вторая тема — что открыто, а что продаётся. В мае 2026 года CopilotKit привлёк 27 млн долларов в раунде A под «Agentic FrontEnd Stack», а генеральный директор рассказал TechCrunch о «миллионах установок в неделю»; это слова вендора<a class="cite" href="#src-44">44</a>. Переподключение к потоку и сохранённые треды находятся в платной CopilotKit Intelligence. На Hacker News это обсуждают без восторга:</p>
+
+<div class="note field"><blockquote>even with AG-UI, CopilotKit is a paid service. Everyone's trying to do vendor lock in, it's really annoying.
+<footer>— peab, <a href="https://news.ycombinator.com/item?id=45493718">Hacker News, тред о ChatKit, 6 октября 2025</a></footer></blockquote>
+<p>В том же треде основатель assistant-ui подчеркнул, что его проект <q>MIT and no proprietary cloud/proxy service</q>. На запуске Channels SDK в августе 2026-го другой комментатор написал, что открыт только клиент, а сервис, который всё запускает, закрыт; инженер CopilotKit ответил, что это <q>just a maturity problem on our end right now</q><a class="cite" href="#src-42">42</a>.</p></div>
+
+<p>Та же двойственность видна в самых заметных проектах поверх AG-UI за пределами веб-чата. Channels SDK доставляет AG-UI-агентов в Slack и Microsoft Teams<a class="cite" href="#src-42">42</a>. OpenBot, который CopilotKit открыл в августе 2026 года под MIT, — платформа «ИИ-коллег» для самостоятельного хостинга: любой AG-UI-агент получает свой браузер, файлы и shell, а каждое действие проходит через шлюз с политиками на CEL и попадает в журнал аудита. На 30 сентября у репозитория около 5,8 тыс. звёзд, и это хороший довод, что на протоколе строят не только чат-виджеты. Но обзор на dev.to от 18 сентября называет проект альфой, <q>great velocity and poor stability</q>, и отмечает, что долговечные треды и память требуют CopilotKit Intelligence: у неё есть бесплатный план и вариант для своего сервера, но обойтись без неё нельзя<a class="cite" href="#src-45">45</a>.</p>
+
+<p>Сам протокол открыт, под MIT, с нормативной спецификацией и публичным процессом изменений, где правки 1.0 внесли по ревью Pydantic AI и инженера Anthropic. Эталонная реализация клиента и всё, что касается долговечности потока, принадлежат одной компании, которой нужно зарабатывать. Для тебя это значит, что переподключение и хранение тредов стоит проектировать самому, а не рассчитывать на то, что протокол их когда-нибудь даст.</p>
+
+<h3>Что бы сделал на твоём месте</h3>
+
+<p>Если сегодня нужен веб-интерфейс к Python-агенту и фронтенд на React, бери AG-UI 1.0 как формат провода. Сервер на FastAPI из этой главы пишется за вечер, и держать собственного продюсера проще, чем ждать, пока мост твоего фреймворка догонит 1.0; если мост нужен, сначала проверь его ограничения версий в <code>pyproject.toml</code>. Подтверждения делай на прерываниях, а не на инструментах фронтенда, и проверь, что сервер переживает две реплики и повтор того же <code>resume[]</code>. Снапшот состояния отправляй по расписанию, а права на опасные действия проверяй на сервере. Переподключение после обрыва проектируй сам. Если весь твой стек на Vercel, всё это тебе не нужно, и протокол AI SDK проще. Пересмотреть решение стоит через полгода: к весне 2027 года станет видно, догнали ли 1.0 Pydantic AI и Microsoft Agent Framework и появилось ли в спецификации возобновление потока.</p>
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>Пользователь закрыл вкладку посреди прогона. Что клиент должен записать об этом прогоне, и почему нельзя дописать за продюсера <code>RUN_FINISHED</code>?</summary><p>Прогон обрезан: поток кончился без завершающего события, исхода у него нет. Достроенный <code>RUN_FINISHED</code> без <code>outcome</code> означал бы успех, то есть клиент выдал бы за удачу прогон, про который ничего не известно. Продолжить обрезанный прогон нельзя, SSE не поддерживает возобновление; нужен новый прогон с новым <code>runId</code>.</p></details>
+<details><summary>Почему подтверждение удаления файла не стоит делать инструментом фронтенда, хотя в интерфейсе это выглядит так же, как прерывание?</summary><p>Прогон с инструментом фронтенда заканчивается успехом, и продюсер не знает, ждёт ли он чего-то. У прерывания есть свой исход, <code>responseSchema</code>, срок годности и контракт на ответ через <code>resume[]</code> с проверкой покрытия. Инструмент фронтенда подходит для действий, которые выполняет браузер, а не для разрешения на действие бэкенда.</p></details>
+<details><summary>Сервер без состояния получил <code>resume[]</code> с незнакомым <code>interruptId</code>. Что ему делать? А если он знает о прерывании, на которое ответа нет?</summary><p>Незнакомую запись по спецификации 1.0 следует пропустить с предупреждением. Если же продюсер знает о неотвеченном прерывании, прерванное действие выполнять нельзя: он может отклонить запрос до <code>RUN_STARTED</code> или прервать прогон заново, но не завершить его успехом. Проверку покрытия и сроков спецификация возлагает на потребителя.</p></details>
+<details><summary>Пока агент работает, пользователь переименовал задачу на доске. Когда агент узнает об этом?</summary><p>Только в следующем прогоне, из поля <code>state</code> в <code>RunAgentInput</code>. Канала от клиента к агенту посреди прогона в протоколе нет, и если агент в том же прогоне пришлёт дельту по этой задаче, правка пользователя может быть перезаписана.</p></details>
+<details><summary><code>STATE_DELTA</code> не применился на клиенте. Что увидит пользователь и как продюсер должен это исправить, если о сбое он не узнает?</summary><p>Клиент выбросит патч целиком с предупреждением и останется при прежнем значении, поэтому пользователь увидит устаревшее состояние. Обратного канала нет, так что продюсер не может отреагировать на сбой; единственное лечение — периодические <code>STATE_SNAPSHOT</code>, например на границах шагов и перед прерыванием.</p></details>
+<details><summary>Твой React-клиент на <code>@ag-ui/client</code> 1.0 работает с мостом LangGraph в настройках по умолчанию. Что он увидит, когда граф вызовет <code>interrupt()</code>?</summary><p>Обычный <code>RUN_FINISHED</code> без <code>outcome</code>, то есть успех, плюс событие <code>CUSTOM</code> с именем <code>on_interrupt</code>. Клиент, который смотрит только на исход, решит, что прогон завершён. Нужно включить <code>emit_interrupt_outcome=True</code>, и тогда же проверить, что фронтенд не полагается на старый <code>useLangGraphInterrupt</code>.</p></details>
+<details><summary>Отладочный <code>curl</code> к TypeScript-продюсеру вернул бинарный мусор вместо SSE. Что произошло?</summary><p><code>curl</code> по умолчанию шлёт <code>Accept: */*</code>, а в AG-UI шаблон допускает и protobuf, и продюсер вправе его выбрать. Клиент, который не читает protobuf, обязан прислать явный <code>Accept: text/event-stream</code>.</p></details>
+<details><summary>Почему старый клиент переживает незнакомое поле в событии, но падает на <code>SUBAGENT_STARTED</code>? Кто должен его защитить?</summary><p>Незнакомое поле выбрасывается с предупреждением, а незнакомый тип события ломает декодирование ещё до кода приложения. Отфильтровать его на клиенте нельзя, поэтому защищает продюсер: включает новые события флагом, как <code>subagent_visibility</code> у моста LangGraph.</p></details>
+<details><summary>В <code>usage</code> пришло <code>inputTokens: 1200</code> и <code>cachedInputTokens: 800</code>. Сколько входных токенов было всего и сколько из них не из кеша?</summary><p>Всего 1200: кешированные — часть входных, а не добавка к ним. Не из кеша 400. Отсутствующий счётчик не равен нулю, продюсер вообще не должен присылать ноль, если данных нет.</p></details>
+<details><summary>В одном ответе после <code>RUN_FINISHED</code> пришёл <code>RUN_STARTED</code> с другим <code>runId</code>. Это ошибка продюсера?</summary><p>Нет, если прошлый прогон закрыт: поток вправе нести несколько прогонов подряд, обычно так продюсер проигрывает историю треда. Ошибкой был бы новый <code>RUN_STARTED</code> при открытом прогоне. Уже известную клиенту историю продюсер обязан переизлагать снапшотами, а не тройками <code>TEXT_MESSAGE_*</code>, иначе текст задвоится.</p></details>
+<details><summary>Почему в клиентском конвейере middleware стоит раньше этапа, который выбрасывает незнакомое?</summary><p>Чтобы трансляция успела переписать старые или будущие формы в понятные до того, как enforcement их отбросит. Иначе прокладка совместимости или твой middleware получали бы уже урезанный поток.</p></details>
+<details><summary>Можно ли считать <code>"approved": true</code> в <code>resume</code> проверкой прав пользователя на действие?</summary><p>Нет. <code>resume</code>, как и история сообщений, приходит от клиента и может быть подделан. Прерывание защищает от ошибки модели и даёт человеку шанс вмешаться, а права проверяются на сервере по аутентифицированной сессии.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу руками собрать <code>RunAgentInput</code>, прогнать его через <code>curl -N</code> с явным <code>Accept</code> и прочитать поток глазами</li>
+  <li>Поднимал продюсер на FastAPI и <code>ag-ui-protocol</code> 1.0 и Python-клиент на httpx, который пропускает незнакомые типы событий с предупреждением</li>
+  <li>Писал обработчик концовок прогона, который по сырому потоку различает четыре исхода и обрыв и для каждого собирает правильный следующий <code>RunAgentInput</code></li>
+  <li>Реализовывал подтверждение действия через <code>outcome</code> interrupt и <code>resume[]</code> на сервере, который ничего не хранит между прогонами</li>
+  <li>Проверял сценарий с прерыванием на двух репликах за балансировщиком и повторял один и тот же <code>resume[]</code> дважды, чтобы убедиться, что действие не выполняется второй раз</li>
+  <li>Отвечаю на вызовы инструментов фронтенда tool-сообщениями в следующем прогоне, с <code>error</code> при отказе</li>
+  <li>Шлю снапшоты состояния на границах шагов и перед прерыванием, а не только в начале прогона</li>
+  <li>Включал <code>emit_interrupt_outcome</code> и <code>subagent_visibility</code> в мосте LangGraph и знаю, что при этом ломается у старого фронтенда</li>
+  <li>Перед обновлением смотрю, какие версии <code>ag-ui-protocol</code> разрешают мосты в моих зависимостях</li>
+  <li>Сопоставлял поток <code>claude -p --output-format stream-json</code> с событиями AG-UI</li>
+  <li>Для своего стека письменно сравнивал AG-UI, протокол Vercel AI SDK и <code>useStream</code> LangGraph по возобновлению, общему состоянию и одобрениям и выбирал один</li>
+  <li>Записываю пары «вход прогона и ответные события» и прогоняю их в регрессионных тестах клиента</li>
+  <li>Не кладу секреты в <code>state</code> и <code>messages</code> и проверяю права по серверной сессии, а не по полям запроса</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://docs.ag-ui.com/spec/1.0/basic/transports/index">AG-UI Specification 1.0: Transports</a>, а также <a href="https://docs.ag-ui.com/spec/1.0/basic/transports/http-sse">HTTP + Server-Sent Events</a> и <a href="https://docs.ag-ui.com/spec/1.0/basic/transports/http-protobuf">HTTP + Protobuf</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-2"><a href="https://docs.ag-ui.com/spec/1.0/basic/run-input">AG-UI Specification 1.0: Run Input</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-3"><a href="https://docs.ag-ui.com/spec/1.0/index">AG-UI Specification 1.0</a> (обзор, Security and Trust &amp; Safety, Scope), а также <a href="https://docs.ag-ui.com/spec/1.0/architecture">Architecture</a> и <a href="https://docs.ag-ui.com/spec/1.0/basic/processing">Processing model</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-4"><a href="https://docs.ag-ui.com/spec/1.0/basic">AG-UI Specification 1.0: Base Protocol, the event model</a>, а также <a href="https://docs.ag-ui.com/spec/1.0/events">Event Streams</a> и <a href="https://docs.ag-ui.com/spec/1.0/basic/capabilities">Capabilities</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-5">Uli Barkai. <a href="https://www.copilotkit.ai/blog/big-updates-on-ag-ui">Big Updates on AG-UI: Massive Traction and Adoption</a>. CopilotKit Blog, 2 июня 2025.</li>
+  <li id="src-6"><a href="https://github.com/ag-ui-protocol/ag-ui/issues/291">Issue #291 «Use agi-ui without next.js»</a>. ag-ui-protocol/ag-ui, открыта 11 августа 2025, комментарии по 23 июня 2026.</li>
+  <li id="src-7">CopilotKit docs (v2): <a href="https://docs.copilotkit.ai/concepts/which-hook">Which Hook for Which Job</a>, <a href="https://docs.copilotkit.ai/shared-state">Shared State</a>, <a href="https://docs.copilotkit.ai/frontend-tools">Frontend Tools</a>, <a href="https://docs.copilotkit.ai/reference/hooks/useRenderTool">useRenderTool</a>, <a href="https://docs.copilotkit.ai/concepts/oss-vs-enterprise">Open source vs Intelligence</a>. Без даты, прочитано 30 сентября 2026.</li>
+  <li id="src-8"><a href="https://docs.ag-ui.com/concepts/subagents">AG-UI docs: Subagents</a>. Без даты, прочитано 30 сентября 2026.</li>
+  <li id="src-9"><a href="https://docs.ag-ui.com/spec/1.0/schema.json">AG-UI 1.0 JSON Schema</a> (draft 2020-12). ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-10"><a href="https://docs.ag-ui.com/spec/1.0/changelog">AG-UI Specification 1.0: Key Changes</a> и <a href="https://docs.ag-ui.com/migrating-to-1-0">Migrating to 1.0</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-11"><a href="https://docs.ag-ui.com/spec/1.0/events/tool-calls">AG-UI Specification 1.0: Tool Calls</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-12"><a href="https://github.com/ag-ui-protocol/ag-ui/tree/main/integrations/claude-agent-sdk/python">ag-ui-claude-sdk: интеграция Claude Agent SDK для Python</a> (README, <code>adapter.py</code>, <code>config.py</code>, ветка main, 30 сентября 2026); пакет <a href="https://pypi.org/project/ag-ui-claude-sdk/">ag-ui-claude-sdk 0.1.5</a> на PyPI, 5 июня 2026.</li>
+  <li id="src-13">Anmol Baranwal, Eli Berman. <a href="https://www.copilotkit.ai/blog/ag-ui-1.0">Introducing AG-UI 1.0: a stable spec for connecting any agent to any application</a>. CopilotKit Blog, 30 сентября 2026.</li>
+  <li id="src-14">GitHub Discussions <a href="https://github.com/ag-ui-protocol/ag-ui/discussions/2608">#2608 «AG-UI is heading to 1.0 - the draft specification is live»</a> (2 сентября 2026, комментарии 9–14 сентября) и <a href="https://github.com/ag-ui-protocol/ag-ui/discussions/2792">#2792 «AG-UI 1.0 is officially released»</a> (18 сентября 2026).</li>
+  <li id="src-15"><a href="https://docs.ag-ui.com/spec/1.0/events/lifecycle">AG-UI Specification 1.0: Runs and Steps</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-16">Репозиторий <a href="https://github.com/ag-ui-protocol/ag-ui">ag-ui-protocol/ag-ui</a>: <a href="https://github.com/ag-ui-protocol/ag-ui/releases">релизы release/2026-05-27 … release/2026-09-30</a>, <a href="https://github.com/ag-ui-protocol/ag-ui/issues/3">issue #3</a> (13 мая 2025), <a href="https://github.com/ag-ui-protocol/ag-ui/issues/126">issue #126</a> (25 июня 2025), <a href="https://github.com/ag-ui-protocol/ag-ui/issues/280">issue #280</a> (8 августа 2025), <a href="https://github.com/ag-ui-protocol/ag-ui/issues/2105">issue #2105</a> (2 июля 2026), <a href="https://github.com/ag-ui-protocol/ag-ui/issues/2603">issue #2603</a> (2 сентября 2026), <a href="https://github.com/ag-ui-protocol/ag-ui/pull/1569">PR #1569</a> (слит 30 апреля 2026), <a href="https://github.com/ag-ui-protocol/ag-ui/pull/2210">PR #2210</a> (открыт с 19 июля 2026), <a href="https://github.com/ag-ui-protocol/ag-ui/pull/1626">PR #1626</a>, <a href="https://github.com/ag-ui-protocol/ag-ui/blob/main/integrations/adk-middleware/python/README.md">README моста ADK</a>. Метаданные по GitHub API на 30 сентября 2026.</li>
+  <li id="src-17">PyPI: <a href="https://pypi.org/project/ag-ui-protocol/">ag-ui-protocol</a>, <a href="https://pypi.org/project/pydantic-ai-slim/">pydantic-ai-slim</a>, <a href="https://pypi.org/project/agent-framework-ag-ui/">agent-framework-ag-ui</a>, <a href="https://pypi.org/project/ag-ui-langgraph/">ag-ui-langgraph</a>, <a href="https://pypi.org/project/ag-ui-strands/">ag-ui-strands</a>, <a href="https://pypi.org/project/openai-chatkit/">openai-chatkit</a> и другие; загрузки — <a href="https://pypistats.org/packages/ag-ui-protocol">pypistats</a>. Данные на 30 сентября 2026.</li>
+  <li id="src-18"><a href="https://docs.ag-ui.com/quickstart/server">AG-UI docs: Server quickstart</a>. Без даты, прочитано 30 сентября 2026.</li>
+  <li id="src-19"><a href="https://github.com/ag-ui-protocol/ag-ui/blob/main/sdks/python/ag_ui/encoder/encoder.py">sdks/python/ag_ui/encoder/encoder.py</a>. ag-ui-protocol/ag-ui, ветка main, 30 сентября 2026.</li>
+  <li id="src-20"><a href="https://code.claude.com/docs/en/headless">Run Claude Code programmatically</a>. Документация Claude Code, Anthropic, прочитано 30 сентября 2026.</li>
+  <li id="src-21">Справочные страницы документации AG-UI: <a href="https://docs.ag-ui.com/introduction">Introduction</a> (таблицы интеграций и SDK), <a href="https://docs.ag-ui.com/concepts/architecture">Architecture</a>, <a href="https://docs.ag-ui.com/drafts/overview">Drafts overview</a>, <a href="https://docs.ag-ui.com/development/updates">What's New</a>. Без дат, прочитано 30 сентября 2026.</li>
+  <li id="src-22">AG-UI JS SDK: <a href="https://docs.ag-ui.com/sdk/js/client/http-agent">HttpAgent</a>, <a href="https://docs.ag-ui.com/sdk/js/client/abstract-agent">AbstractAgent</a>, <a href="https://docs.ag-ui.com/sdk/js/client/middleware">Middleware</a>, <a href="https://docs.ag-ui.com/sdk/js/client/subscriber">AgentSubscriber</a>, <a href="https://docs.ag-ui.com/sdk/js/client/compaction">Stream Compaction</a>. Без даты, прочитано 30 сентября 2026.</li>
+  <li id="src-23"><a href="https://github.com/pydantic/pydantic-ai/blob/main/docs/ui/ag-ui.md">Pydantic AI: Agent-User Interaction (AG-UI) Protocol</a> (последний коммит 28 сентября 2026) и <a href="https://github.com/pydantic/pydantic-ai/blob/main/docs/ui/overview.md">UI Event Streams</a>.</li>
+  <li id="src-24"><a href="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-agui-protocol-contract.html">AG-UI protocol contract</a>. Amazon Bedrock AgentCore Developer Guide, без даты, прочитано 30 сентября 2026.</li>
+  <li id="src-25"><a href="https://github.com/ag-ui-protocol/ag-ui/blob/main/integrations/langgraph/python/README.md">ag-ui-langgraph: README</a>. ag-ui-protocol/ag-ui, ветка main; версия 0.0.45 от 9 сентября 2026.</li>
+  <li id="src-26"><a href="https://docs.ag-ui.com/spec/1.0/basic/patterns/interrupt-resume">AG-UI Specification 1.0: Interrupts and Resume</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-27">Концептуальные страницы документации AG-UI: <a href="https://docs.ag-ui.com/concepts/interrupts">Interrupts</a>, <a href="https://docs.ag-ui.com/concepts/state">State Management</a>, <a href="https://docs.ag-ui.com/concepts/events">Events</a>. Без дат, прочитано 30 сентября 2026.</li>
+  <li id="src-28"><a href="https://www.rfc-editor.org/rfc/rfc6902">RFC 6902: JavaScript Object Notation (JSON) Patch</a>. IETF, апрель 2013.</li>
+  <li id="src-29"><a href="https://docs.ag-ui.com/spec/1.0/basic/patterns/snapshots">AG-UI Specification 1.0: Snapshots and Deltas</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-30"><a href="https://learn.microsoft.com/en-us/agent-framework/integrations/ag-ui/">AG-UI Integration with Agent Framework</a>. Microsoft Learn, 8 сентября 2026, обновлено 15 сентября 2026.</li>
+  <li id="src-31"><a href="https://reddit.com/r/LangGraph/comments/1wrntdu/">I built a local sandbox to chat with your LangGraph agent over AG-UI / A2A, with a full event inspector</a>. r/LangGraph, 27 сентября 2026.</li>
+  <li id="src-32"><a href="https://github.com/assistant-ui/assistant-ui/tree/main/packages/react-ag-ui">@assistant-ui/react-ag-ui: README</a>; версия 0.0.62 на npm, 24 сентября 2026.</li>
+  <li id="src-33">Vercel AI SDK: <a href="https://github.com/vercel/ai/blob/main/content/docs/04-ai-sdk-ui/50-stream-protocol.mdx">Stream Protocols</a> (последний коммит 29 сентября 2026) и <a href="https://github.com/vercel/ai/blob/main/content/docs/04-ai-sdk-ui/03-chatbot-resume-streams.mdx">Chatbot Resume Streams</a>.</li>
+  <li id="src-34"><a href="https://github.com/ag-ui-protocol/ag-ui/blob/main/DEPRECATIONS.md">DEPRECATIONS.md</a>. ag-ui-protocol/ag-ui, ветка main, 30 сентября 2026.</li>
+  <li id="src-35"><a href="https://docs.ag-ui.com/spec/1.0/basic/versioning">AG-UI Specification 1.0: Versioning and compatibility</a>. ag-ui-protocol, 17 сентября 2026.</li>
+  <li id="src-36">npm: <a href="https://www.npmjs.com/package/@ag-ui/core">@ag-ui/core</a> и другие пакеты, <a href="https://api.npmjs.org/downloads/point/last-month/@ag-ui/core">downloads API</a> (окно 30 августа — 28 сентября 2026); NuGet: <a href="https://www.nuget.org/packages/AGUI.Abstractions">AGUI.Abstractions</a>. Данные на 30 сентября 2026.</li>
+  <li id="src-37"><a href="https://github.com/ag-ui-protocol/ag-ui/tree/main/middlewares/a2ui-middleware">@ag-ui/a2ui-middleware</a> и <a href="https://github.com/ag-ui-protocol/ag-ui/tree/main/middlewares/mcp-apps-middleware">@ag-ui/mcp-apps-middleware</a>, <a href="https://github.com/ag-ui-protocol/ag-ui/blob/main/middlewares/event-throttle-middleware/src/index.ts">event-throttle-middleware</a>: исходный код и README. ag-ui-protocol/ag-ui, ветка main, 30 сентября 2026.</li>
+  <li id="src-38"><a href="https://blog.modelcontextprotocol.io/posts/2025-11-21-mcp-apps/">MCP Apps: Extending servers with interactive user interfaces</a> (SEP-1865). MCP Blog, 21 ноября 2025.</li>
+  <li id="src-39"><a href="https://github.com/agentclientprotocol/agent-client-protocol">Agent Client Protocol</a> (README, раздел <a href="https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/protocol/v1/transports.mdx">Transports</a>) и <a href="https://github.com/agentclientprotocol/claude-agent-acp">claude-agent-acp</a>. Прочитано 30 сентября 2026.</li>
+  <li id="src-40">Документация LangChain: <a href="https://docs.langchain.com/oss/python/langgraph/event-streaming">LangGraph Event streaming</a>, <a href="https://docs.langchain.com/oss/python/langchain/frontend/overview">Frontend overview (useStream)</a>, <a href="https://docs.langchain.com/oss/python/deepagents/ag-ui">Deep Agents: AG-UI</a>. Без дат, прочитано 30 сентября 2026.</li>
+  <li id="src-41"><a href="https://github.com/openai/chatkit-python/blob/main/chatkit/types.py">openai/chatkit-python: chatkit/types.py</a>. Ветка main; пакет openai-chatkit 1.6.5 от 19 мая 2026.</li>
+  <li id="src-42">Hacker News: <a href="https://news.ycombinator.com/item?id=43974484">Show HN: AG-UI Protocol</a> (13 мая 2025), <a href="https://news.ycombinator.com/item?id=45994035">Microsoft Embraces AG-UI Protocol for Agent UI</a> (20 ноября 2025), <a href="https://news.ycombinator.com/item?id=45493718">OpenAI ChatKit</a> (6 октября 2025), <a href="https://news.ycombinator.com/item?id=49198583">Show HN: The Channels SDK</a> (6 августа 2026).</li>
+  <li id="src-43">Jerel Velarde, Eli Berman. <a href="https://www.copilotkit.ai/blog/crewai-is-fully-agui-compatible">CrewAI is now fully AG-UI compatible</a>. CopilotKit Blog, 18 августа 2026.</li>
+  <li id="src-44"><a href="https://techcrunch.com/2026/05/05/copilotkit-raises-27m-to-help-devs-deploy-app-native-ai-agents/">CopilotKit raises $27M to help devs deploy app-native AI agents</a>. TechCrunch, 5 мая 2026.</li>
+  <li id="src-45">andrew-ooo. <a href="https://dev.to/andrew-ooo/openbot-review-copilotkits-governed-ai-coworkers-3505">OpenBot Review: CopilotKit's Governed AI Coworkers</a>. DEV Community, 18 сентября 2026; репозиторий <a href="https://github.com/CopilotKit/OpenBot">CopilotKit/OpenBot</a>, метаданные GitHub API на 30 сентября 2026.</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>

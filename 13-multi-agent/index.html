@@ -1,0 +1,1015 @@
+<!doctype html>
+<html lang="ru" data-chapter="13">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мультиагентные системы — Чеклист AI-инженера</title>
+<script>try{var t=localStorage.getItem('book-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../assets/fonts/fonts.css">
+<link rel="stylesheet" href="../assets/book.css">
+<script src="../assets/manifest.js" defer></script>
+<script src="../assets/vendor/highlight.min.js" defer></script>
+<script src="../assets/vendor/hljs-http.min.js" defer></script>
+<script src="../assets/vendor/mermaid.min.js" defer></script>
+<script src="../assets/book.js" defer></script>
+</head>
+<body>
+<main class="chapter">
+
+<header class="chapter-head">
+  <p class="kicker"><b>Глава 13</b> из 17, часть «Архитектура»</p>
+  <h1>Мультиагентные системы</h1>
+  <p class="lead">Когда Claude Code работает на Opus 5, он добавляет в свой системный промпт строку: не вызывай инструмент <code>Agent</code>, пока тебя об этом не попросили. Та же Anthropic в 2025 году показала мультиагентную систему, которая обошла одиночного агента на 90%, а в 2026-м написала, что такие системы обычно тратят в 3–10 раз больше токенов. Оба утверждения верны, и работа инженера — понять, в какой из двух ситуаций находится его задача.</p>
+  <p class="chapter-meta"></p>
+</header>
+
+<section id="debate">
+<h2>Два поста с разницей в день</h2>
+<p>12 июня 2025 года Уолден Ян из Cognition опубликовал пост «Don't Build Multi-Agents» с игрушечным примером<a class="cite" href="#src-1">1</a>. Задачу «сделай клон Flappy Bird» делят на две части и раздают двум сабагентам. Первый по ошибке рисует «a background that looks like Super Mario Bros». Второй делает птицу, которая «doesn't look like a game asset and it moves nothing like the one in Flappy Bird». Каждый по-своему выполнил поручение, а игру из этих кусков не собрать: ни один не видел, что решил другой, и сборщику достаются два несовместимых результата без объяснения, почему они такие.</p>
+<p>Ян вывел из примера два принципа. Первый: «Share context, and share full agent traces, not just individual messages». Второй: «Actions carry implicit decisions, and conflicting decisions carry bad results». Второй глубже, чем кажется: сабагент, которому поручили фон, по дороге принимает десятки мелких решений о палитре, масштабе и стиле, и ни одно не попадает в его отчёт. Рекомендация поста — однопоточный агент, а для долгих задач модель, которая сжимает историю «into key details, events, and decisions». Как пример сдержанности Ян приводил Claude Code: на июнь 2025 года тот «never does work in parallel with the subtask agent», а сабагенту обычно поручали ответить на вопрос, а не писать код.</p>
+<p>На следующий день, 13 июня, Anthropic выложила разбор своей системы для ресёрча<a class="cite" href="#src-2">2</a>. Ведущий агент на Claude Opus 4 получает вопрос, строит план и запускает сабагентов на Claude Sonnet 4, каждого со своим подвопросом. Сабагенты ищут параллельно, каждый в своём цикле инструментов и в своём окне контекста, и возвращают находки ведущему, а тот сводит ответ. На внутреннем эвале Anthropic такая система «outperformed single-agent Claude Opus 4 by 90.2%». Цена приведена там же: агент тратит примерно в 4 раза больше токенов, чем чат, мультиагентная система — примерно в 15 раз больше.</p>
+
+<figure class="fig wide" id="fig-writers-readers">
+<script type="text/x-mermaid">
+flowchart LR
+  c1["Координатор<br/>клона Flappy Bird"] -- "сделай фон" --> s1["Сабагент 1"]
+  c1 -- "сделай птицу" --> s2["Сабагент 2"]
+  s1 -- "фон в стиле Mario" --> m1["Сборка игры:<br/>куски не сходятся"]:::warn
+  s2 -- "птица не в стиле" --> m1
+  l1["Ведущий ресёрча,<br/>Opus 4"] -- "подвопрос A" --> r1["Сабагент, Sonnet 4"]
+  l1 -- "подвопрос B" --> r2["Сабагент, Sonnet 4"]
+  r1 -- "факты и ссылки" --> syn["Синтез у ведущего:<br/>факты складываются"]:::ok
+  r2 -- "факты и ссылки" --> syn
+</script>
+<figcaption>Одна и та же топология с разным исходом. В Flappy Bird сабагенты пишут части одного артефакта, и их неявные решения о стиле сталкиваются при сборке. В ресёрче они приносят независимые факты, которые складываются без конфликта.</figcaption>
+</figure>
+
+<p>Посты принято читать как спор «за» и «против», но механизм в них один. В тексте Anthropic есть фраза, под которой Ян подписался бы: «most coding tasks involve fewer truly parallelizable tasks than research, and LLM agents are not yet great at coordinating». Ресёрч выигрывает, потому что сабагенты читают: каждый приносит факты по своему подвопросу, и они не спорят с фактами соседа. Flappy Bird проигрывает, потому что сабагенты пишут в общий артефакт и принимают решения, которые должны совпасть с чужими. <mark>Параллельные читатели складываются, параллельные писатели конфликтуют.</mark></p>
+<p>Откуда взялись 90%, Anthropic тоже объяснила. На BrowseComp три фактора объяснили 95% разброса качества, и одно только число потраченных токенов — 80%; два других — число вызовов инструментов и выбор модели. Мультиагентная схема здесь прежде всего способ потратить больше токенов параллельно, в нескольких чистых окнах. Время на сложных запросах сократилось «up to 90%» против прежнего последовательного агента: ведущий запускает 3–5 сабагентов одновременно, а каждый вызывает инструменты параллельно. В 2026 году Anthropic поправила акцент: «The primary benefit of parallelization is thoroughness, not speed»<a class="cite" href="#src-3">3</a>.</p>
+<p>Первые версии системы ломались так, что это узнаёт каждый, кто давал агенту инструмент <code>Agent</code>: «spawning 50 subagents for simple queries, scouring the web endlessly for nonexistent sources». Лечили промптом ведущего. В него записали правила масштаба: «Simple fact-finding requires just 1 agent with 3-10 tool calls», а сложный ресёрч может занять больше 10 сабагентов, каждому с чётко отделённым куском задачи.</p>
+
+<h3>Что поменялось к 2026 году</h3>
+<p>22 апреля 2026 года Ян опубликовал продолжение, «Multi-Agents: What's Actually Working»<a class="cite" href="#src-4">4</a>. Принципы 2025 года он не отозвал: для роя параллельных писателей они, по его словам, по-прежнему верны. Но у Cognition появились схемы, которые работают, и общее у них одно: «multiple agents contribute intelligence to a task while writes stay single-threaded». Писатель один, остальные читают, проверяют и советуют.</p>
+<p>Схем в посте три. Первая — цикл ревью: Devin Review находит в среднем около 2 багов на PR, из них примерно 58% серьёзные, и лучше всего работает, когда автор кода и ревьюер заранее не делят никакого контекста. Вторая — «умный друг»: дешёвая основная модель вызывает дорогую как инструмент и передаёт ей «a fork of the full context of the primary model». Третья — менеджер-Devin, который запускает дочерних Devin через внутренний MCP. С третьей проблем больше всего: менеджеры расписывают детям всё до мелочей, считают, что делят с ними состояние, а братья друг с другом по умолчанию не разговаривают. Про неструктурированные рои вывод жёсткий: «mostly a distraction», практическая форма — «map-reduce-and-manage».</p>
+<p>Два громких опыта 2026 года с параллельными писателями показывают, при каких условиях писателей всё-таки может быть много. В Cursor агенты сначала координировались через общий файл с блокировками, и «Twenty agents would slow down to the effective throughput of two or three, with most time spent waiting»<a class="cite" href="#src-5">5</a>. Заработала иерархия: планировщики создают задачи, исполнители их выполняют и «don't coordinate with other workers», а к июлю конфликты слияния разбирал отдельный нейтральный агент. Николас Карлини собрал компилятор C шестнадцатью параллельными Claude, у каждого свой клон репозитория в своём контейнере; задачу агент захватывает файлом в <code>current_tasks/</code>, а столкновения разрешает git<a class="cite" href="#src-6">6</a>. Общее у обоих: писатели не делят рабочую копию, захват задачи атомарен, планирование отделено от записи. Подробно эти харнессы разобраны в <a href="../12-deep-agents/index.html">главе 12</a>.</p>
+
+<div class="note field">
+<blockquote>How is this fundamentally any different than Erlang/Elixir concepts of supervisors controlling their child processes? It seems like the AI industry keeps re-discovering several basic techniques that have been around since the 80s.
+<footer>— behnamoh, <a href="https://news.ycombinator.com/item?id=45097086">Hacker News, 1 сентября 2025</a></footer></blockquote>
+<p>Это самый заметный ответ на пост Cognition, когда тот второй раз вышел на главную HN<a class="cite" href="#src-7">7</a>. Сравнение полезно там, где оно не работает. Супервизор в OTP не делает работу, он перезапускает упавших детей. LLM-оркестратор делает ровно то, что OTP из супервизора убирает: делит задачу и сводит ответы, а значит, сам ошибается и сам становится узким местом.</p>
+</div>
+
+<ol class="timeline">
+  <li><time>19 декабря 2024</time><p>Anthropic, «Building effective agents»: workflows и пять паттернов.</p></li>
+  <li class="is-major"><time>12–13 июня 2025</time><p>Cognition, «Don't Build Multi-Agents», и на следующий день разбор ресёрч-системы Anthropic с 90,2% и 15×.</p></li>
+  <li><time>26 октября 2025</time><p>Третья версия таксономии отказов MAST.</p></li>
+  <li><time>9 декабря 2025</time><p>Первая версия статьи Google о масштабировании агентов.</p></li>
+  <li><time>23 января 2026</time><p>Anthropic: три случая, когда мультиагентность окупается, и 3–10× токенов.</p></li>
+  <li><time>10 апреля 2026</time><p>Anthropic, пять паттернов координации с их отказами.</p></li>
+  <li class="is-major"><time>22 апреля 2026</time><p>Cognition пересматривает позицию: писатель один, остальные агенты читают и советуют.</p></li>
+  <li><time>2 июня 2026</time><p>Блог Anthropic о dynamic workflows в Claude Code: план оркестрации переезжает в скрипт.</p></li>
+  <li><time>13 августа 2026</time><p>Frontier Red Team о поведении больших групп агентов.</p></li>
+</ol>
+</section>
+
+<section id="plan-holder">
+<h2>Кто держит план</h2>
+<p>В январе 2026 года Anthropic дала определение, от которого удобно отталкиваться: «A multi-agent system is an architecture where multiple LLM instances run with separate conversation contexts, coordinated through code»<a class="cite" href="#src-3">3</a>. Главное слово здесь — отдельные контексты. Два вызова модели с одним растущим массивом сообщений остаются одним агентом, как бы их ни назвали в коде. Пять вызовов одной и той же модели с пятью разными окнами — уже пять агентов.</p>
+<p>Словарь старше. В декабре 2024 года пост «Building effective agents» развёл <dfn>workflows</dfn>, «systems where LLMs and tools are orchestrated through predefined code paths», и <dfn>агентов</dfn>, где «LLMs dynamically direct their own processes and tool usage»<a class="cite" href="#src-8">8</a>. Там же описаны пять паттернов: prompt chaining, routing, parallelization (sectioning на независимые куски или voting по одной задаче), orchestrator-workers и evaluator-optimizer; все они есть в таблице ниже. В 2026 году над постом появился баннер: «Much of the tooling landscape described in this post has changed since December 2024». Устарели инструменты, а определения и паттерны остались, посты Anthropic 2026 года строятся на них<a class="cite" href="#src-9">9</a>.</p>
+<p>Потом каждый фреймворк придумал свои имена: supervisor, swarm, network, group chat, Magentic, council, crew. Чтобы в них не утонуть, задай любой схеме два вопроса. Первый: кто решает, какой агент работает следующим — код, агент-оркестратор, текущий агент или никто, и агенты сами берут работу из общего места? Второй: что следующий агент получает на вход — только формулировку задачи, выжимку, всю историю или доступ к общему хранилищу? Почти любое название из документации оказывается комбинацией ответов.</p>
+
+<table class="wide">
+<thead><tr><th>Паттерн</th><th>Кто выбирает следующий шаг</th><th>Что видит следующий агент</th><th>Где встречается</th></tr></thead>
+<tbody>
+<tr><th>Prompt chaining</th><td>код, порядок фиксирован</td><td>выход предыдущего шага</td><td>LangGraph <code>StateGraph</code>, Sequential в Microsoft Agent Framework</td></tr>
+<tr><th>Routing, router</th><td>классификатор, один раз на запрос</td><td>исходный запрос</td><td>Router в LangChain, <code>route</code> в Agno</td></tr>
+<tr><th>Parallelization</th><td>код</td><td>свой кусок (sectioning) или тот же запрос (voting)</td><td>Concurrent в Agent Framework, <code>broadcast</code> в Agno, Council в Mastra</td></tr>
+<tr><th>Orchestrator-workers, supervisor</th><td>агент-оркестратор, ход за ходом</td><td>задачу, которую написал оркестратор</td><td>сабагенты Claude Code, <code>Agent.as_tool()</code> в OpenAI Agents SDK, Subagents в LangChain</td></tr>
+<tr><th>Hierarchical</th><td>оркестраторы на нескольких уровнях</td><td>то же на каждом уровне</td><td>вложенные сабагенты Claude Code, вложенные команды Agno</td></tr>
+<tr><th>Handoffs, swarm</th><td>текущий агент передаёт управление</td><td>по умолчанию часто всю историю</td><td><code>handoff()</code> в OpenAI Agents SDK, Handoffs в LangChain, режим <code>chat</code> в ADK</td></tr>
+<tr><th>Group chat, Magentic</th><td>менеджер выбирает, кто говорит</td><td>общий транскрипт или его часть</td><td>Group Chat и Magentic в Agent Framework</td></tr>
+<tr><th>Evaluator-optimizer, generator-verifier</th><td>код, цикл до критерия или лимита</td><td>артефакт и критерии</td><td>adversarial verification в workflows Claude Code</td></tr>
+<tr><th>Debate</th><td>код: раунды, потом голос или судья</td><td>ответы других участников</td><td>конкурирующие гипотезы в agent teams Claude Code</td></tr>
+<tr><th>Shared state, blackboard</th><td>никто: агенты реагируют на изменения хранилища</td><td>всё хранилище</td><td>shared state у Anthropic, исследовательские системы</td></tr>
+</tbody>
+</table>
+
+<p>Таблица собрана из документации фреймворков<a class="cite" href="#src-10">10</a><a class="cite" href="#src-11">11</a><a class="cite" href="#src-12">12</a><a class="cite" href="#src-13">13</a><a class="cite" href="#src-14">14</a>, и у неё есть практический смысл. Первый вопрос говорит, где живёт план. Если его держит код, ты тестируешь его как любой код: он детерминирован, его можно прогнать на фикстурах. Если план держит модель, каждое «кого звать дальше» — ещё одно вероятностное решение и ещё один оплаченный вызов. Claude Code называет это различие «who holds the plan»<a class="cite" href="#src-15">15</a> (его таблица — в <a href="#claude-code">разделе про Claude Code</a>).</p>
+<p>Второй вопрос говорит, где цена и где отказы. Вся история в каждом агенте дорога, но у всех одинаковое понимание ситуации. Одна формулировка задачи дешева, зато сабагент начинает с нуля и не знает того, что ведущий выяснил за двадцать ходов. Между этими полюсами живут все практические решения. Разделы <a href="#handoff">про handoff</a> и <a href="#what-sees">про передачу контекста</a> показывают их на конкретных API.</p>
+</section>
+
+<section id="scaling">
+<h2>Один бюджет на 260 конфигураций</h2>
+<p>Мультиагентная система тратит больше токенов, и непонятно, за что ей платят — за архитектуру или за бюджет. Исследователи Google Research, Google DeepMind и MIT в статье «Towards a Science of Scaling Agent Systems» бюджет уравняли: «All MAS and SAS configurations were matched for total reasoning-token budget (mean 4,800 tokens per trial)»<a class="cite" href="#src-16">16</a>. Первая версия вышла 9 декабря 2025 года со 180 конфигурациями на четырёх бенчмарках, третья, от 8 апреля 2026 года, расширила замер до 260 конфигураций, шести бенчмарков и трёх семейств моделей (GPT-5 трёх размеров, Gemini 2.0–2.5, Claude Sonnet 3.7–4.5). Числа ниже из третьей версии.</p>
+<p>Архитектур пять, и отличаются они только тем, кто с кем разговаривает. Определения в статье записаны как множества каналов связи <code>C</code>:</p>
+<script type="text/plain" class="code" data-lang="text" data-title="Топологии в Kim et al., v3 (определения из статьи, пояснения добавлены)">
+SAS            один агент, каналов нет
+Independent    C = {(a_i, a_agg) : ∀i}           агенты сдают результат агрегатору и не говорят друг с другом
+Centralized    C = {(a_orch, a_i) : ∀i}          оркестратор говорит с каждым агентом
+Decentralized  C = {(a_i, a_j) : ∀i, j, i ≠ j}   все со всеми
+Hybrid         C = C_centralized ∪ C_peer        оркестратор плюс часть связей между агентами
+</script>
+<p>Оркестратор в статье обозначен Ω, и от него зависит, как сводятся ответы (голосованием или взвешенным синтезом), может ли он перебить агента, переживает ли память раунды и когда всё останавливается. Результаты по всем бенчмаркам вместе умещаются на одной картинке.</p>
+
+<figure class="fig wide" id="fig-kim-topologies">
+<svg class="diagram" viewBox="0 0 1000 270" role="img" aria-label="Пять архитектур из статьи Kim et al. с успехом, числом ходов и усилением ошибок">
+  <text class="t-title" x="103" y="30" text-anchor="middle">SAS</text>
+  <rect class="box--soft" x="63" y="95" width="80" height="36" rx="6"/>
+  <text class="t-sub" x="103" y="118" text-anchor="middle">агент</text>
+  <text class="t-sub" x="103" y="205" text-anchor="middle">успех 0,466</text>
+  <text class="t-sub" x="103" y="225" text-anchor="middle">ходов 7,2</text>
+  <text class="t-sub" x="103" y="245" text-anchor="middle">ошибки ×1,0</text>
+
+  <text class="t-title" x="301" y="30" text-anchor="middle">Independent</text>
+  <rect class="box" x="226" y="60" width="30" height="30" rx="15"/>
+  <rect class="box" x="286" y="60" width="30" height="30" rx="15"/>
+  <rect class="box" x="346" y="60" width="30" height="30" rx="15"/>
+  <rect class="box--mute" x="271" y="140" width="60" height="30" rx="6"/>
+  <text class="t-mono" x="301" y="160" text-anchor="middle">agg</text>
+  <path class="arrow" d="M244,91 L284,137"/>
+  <path class="arrow" d="M301,91 L301,137"/>
+  <path class="arrow" d="M358,91 L318,137"/>
+  <text class="t-sub" x="301" y="205" text-anchor="middle">успех 0,370</text>
+  <text class="t-sub" x="301" y="225" text-anchor="middle">ходов 11,4</text>
+  <text class="t-red" x="301" y="245" text-anchor="middle">ошибки ×17,2</text>
+
+  <text class="t-title" x="499" y="30" text-anchor="middle">Centralized</text>
+  <rect class="box--accent" x="477" y="55" width="44" height="30" rx="6"/>
+  <text class="t-mono" x="499" y="75" text-anchor="middle">Ω</text>
+  <rect class="box" x="424" y="140" width="30" height="30" rx="15"/>
+  <rect class="box" x="484" y="140" width="30" height="30" rx="15"/>
+  <rect class="box" x="544" y="140" width="30" height="30" rx="15"/>
+  <path class="arrow arrow--both" d="M485,87 L445,137"/>
+  <path class="arrow arrow--both" d="M499,87 L499,137"/>
+  <path class="arrow arrow--both" d="M513,87 L553,137"/>
+  <text class="t-sub" x="499" y="205" text-anchor="middle">успех 0,463</text>
+  <text class="t-sub" x="499" y="225" text-anchor="middle">ходов 27,7</text>
+  <text class="t-sub" x="499" y="245" text-anchor="middle">ошибки ×4,4</text>
+
+  <text class="t-title" x="697" y="30" text-anchor="middle">Decentralized</text>
+  <rect class="box" x="682" y="58" width="30" height="30" rx="15"/>
+  <rect class="box" x="627" y="140" width="30" height="30" rx="15"/>
+  <rect class="box" x="737" y="140" width="30" height="30" rx="15"/>
+  <path class="arrow arrow--both" d="M687,88 L652,138"/>
+  <path class="arrow arrow--both" d="M707,88 L742,138"/>
+  <path class="arrow arrow--both" d="M660,155 L734,155"/>
+  <text class="t-sub" x="697" y="205" text-anchor="middle">успех 0,477</text>
+  <text class="t-sub" x="697" y="225" text-anchor="middle">ходов 26,1</text>
+  <text class="t-sub" x="697" y="245" text-anchor="middle">ошибки ×7,8</text>
+
+  <text class="t-title" x="895" y="30" text-anchor="middle">Hybrid</text>
+  <rect class="box--accent" x="873" y="55" width="44" height="30" rx="6"/>
+  <text class="t-mono" x="895" y="75" text-anchor="middle">Ω</text>
+  <rect class="box" x="820" y="140" width="30" height="30" rx="15"/>
+  <rect class="box" x="880" y="140" width="30" height="30" rx="15"/>
+  <rect class="box" x="940" y="140" width="30" height="30" rx="15"/>
+  <path class="arrow arrow--both" d="M881,87 L841,137"/>
+  <path class="arrow arrow--both" d="M895,87 L895,137"/>
+  <path class="arrow arrow--both" d="M909,87 L949,137"/>
+  <path class="line arrow--dash" d="M852,155 L878,155"/>
+  <path class="line arrow--dash" d="M912,155 L938,155"/>
+  <text class="t-sub" x="895" y="205" text-anchor="middle">успех 0,452</text>
+  <text class="t-sub" x="895" y="225" text-anchor="middle">ходов 44,3</text>
+  <text class="t-sub" x="895" y="245" text-anchor="middle">ошибки ×5,1</text>
+</svg>
+<figcaption>Пять архитектур Kim et al. (v3) при одинаковом бюджете. Средний успех почти не отличается, а число ходов растёт в 1,6–6 раз. Смотри на нижнюю строку: без проверяющего центра ошибки усиливаются в 17,2 раза, с оркестратором — в 4,4 раза.</figcaption>
+</figure>
+
+<p>В среднем по всем задачам разницы почти нет: 0,466 у одиночного агента, 0,477 у Decentralized, 0,463 у Centralized. Разница в цене. Ходов у Centralized 27,7 против 7,2, накладные расходы на координацию 285%, успеха на тысячу токенов 21,5 против 67,7 у одиночного агента. Hybrid платит 515% сверху и делает 44 хода. Если смотреть только на среднее, вывод был бы простой: мультиагентность не нужна. Но среднее прячет главное — знак эффекта зависит от задачи.</p>
+
+<figure class="fig" id="fig-kim-bench">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Успех мультиагентной системы относительно одиночного агента", "subtitle": "100 = одиночный агент (SAS) на том же бюджете", "unit": "%",
+ "categories": ["Finance-Agent, SAS 0,349", "BrowseComp-Plus", "WorkBench, SAS 0,629", "SWE-bench Verified, SAS 0,522", "Terminal-Bench, SAS 0,344", "PlanCraft, SAS 0,568"],
+ "series": [
+  {"name": "Centralized", "values": [180.8, 100.2, 98.8, 96.9, 80.8, 49.7]},
+  {"name": "Лучшая из MAS", "values": [180.8, 109.2, 105.6, 97.9, 101.7, 60.9]}
+ ],
+ "decimals": 1,
+ "note": "Kim et al., arXiv:2512.08296 v3, 8 апреля 2026. Лучшая MAS: Finance — Centralized, BrowseComp и WorkBench — Decentralized, SWE-bench и PlanCraft — Hybrid, Terminal-Bench — Independent. Абсолютный успех SAS на BrowseComp-Plus в статье не приведён."}
+</script>
+<figcaption>Одна и та же архитектура даёт +80,8% на финансовом анализе и −50,3% на планировании. Там, где одиночный агент уже решает больше 45%, лучший вариант в лучшем случае добавляет 5,6% (WorkBench), а на PlanCraft и SWE-bench проигрывают все.</figcaption>
+</figure>
+
+<p>На Finance-Agent одиночный агент решает 34,9% задач, и все варианты с координацией, для которых в статье есть числа, выигрывают много: Centralized +80,8%, Decentralized +74,5%, Hybrid +73,1%. Задача разбирается на независимые куски анализа, как ресёрч у Anthropic. На PlanCraft, где одиночный агент решает 56,8%, проигрывают все: от −39,1% у Hybrid до −70,0% у Independent. PlanCraft — последовательное планирование, в котором каждый шаг ограничивает следующий, и статья приводит планирование как пример задачи для одного агента. SWE-bench Verified при базовых 52,2% тоже теряет у всех вариантов, от −2,1% до −14,9%.</p>
+<p>Авторы свели это к правилу: «Tasks where single-agent performance already exceeds 45% accuracy experience negative returns from additional agents, as coordination costs exceed diminishing improvement potential». В третьей версии коэффициент при этом эффекте β = −0,236 (p = 0,004), в первой был −0,408. Правило стоит читать как тенденцию, а не закон. Terminal-Bench с базовыми 34,4% лежит ниже порога, а Centralized на нём теряет 19,2%; выигрывает там только Independent, и всего на 1,7%.</p>
+
+<table>
+<thead><tr><th>Метрика (v3)</th><th class="num">SAS</th><th class="num">Independent</th><th class="num">Decentralized</th><th class="num">Centralized</th><th class="num">Hybrid</th></tr></thead>
+<tbody>
+<tr><th>Накладные расходы, %</th><td class="num">0</td><td class="num">58</td><td class="num">263</td><td class="num">285</td><td class="num">515</td></tr>
+<tr><th>Плотность сообщений</th><td class="num">0,00</td><td class="num">0,00</td><td class="num">0,41</td><td class="num">0,39</td><td class="num">0,24</td></tr>
+<tr><th>Избыточность</th><td class="num">0,00</td><td class="num">0,48</td><td class="num">0,50</td><td class="num">0,41</td><td class="num">0,46</td></tr>
+<tr><th>Успех на 1 000 токенов</th><td class="num">67,7</td><td class="num">42,4</td><td class="num">23,9</td><td class="num">21,5</td><td class="num">13,6</td></tr>
+</tbody>
+</table>
+
+<p>Проектировщику важнее всего другое число, усиление ошибок. «Independent systems amplify trace-level errors 17.2× through unchecked error propagation… Centralized coordination, however, contains this to 4.4× by enforcing validation bottlenecks». В Independent агрегатор склеивает ответы, которые никто не читает критически, и ошибка одного агента проходит в итог. В Centralized оркестратор читает каждый результат и часть ошибок останавливает. Оговорку в пересказах теряют: в регрессии третьей версии усиление ошибок перестаёт быть значимым, если учесть эффективность и накладные расходы (β = 0,014, p = 0,658). То есть оно во многом та же самая цена координации, увиденная с другой стороны.</p>
+<p>Ещё две закономерности пригодятся при выборе числа агентов. Число ходов рассуждения растёт со степенью 1,724 от числа агентов: <code>T = 2.72 × (n + 0.5)^1.724</code>, R² = 0,974. Два агента по этой формуле делают около 13 ходов, четыре — около 36, восемь — около 109. Бюджет фиксирован, и ходы делят его: «under fixed computational budgets, per-agent reasoning capacity becomes prohibitively thin beyond 3–4 agents». Качество перестаёт расти около 0,39 сообщения на ход, дальше агенты просто больше болтают.</p>
+<p>По этим законам авторы построили модель, которая предсказывает лучшую архитектуру по свойствам задачи, и она угадывает её для 87% отложенных конфигураций. Объясняющая сила модели при этом упала: перекрёстно проверенный R² был 0,513 в первой версии и стал 0,373 в третьей, когда добавили SWE-bench и Terminal-Bench. «+80,9%», R² = 0,513 и β = −0,408 из блога Google — числа первой версии.</p>
+<p>Порог 45% в этой модели не единственный рычаг. Самый сильный эффект среди взаимодействий в третьей версии даёт компромисс между инструментами и координацией: β = −0,096 (p = 0,002) у произведения эффективности на число инструментов. Чем больше инструментов, тем дороже координация, но выбор зависит от обоих факторов сразу. Это видно по трём типовым задачам из статьи:</p>
+<table>
+<thead><tr><th>Тип задачи</th><th class="num">Инструментов</th><th class="num">Успех SAS</th><th>Что советует статья</th></tr></thead>
+<tbody>
+<tr><th>Планирование</th><td class="num">4</td><td class="num">0,57</td><td>один агент</td></tr>
+<tr><th>Анализ</th><td class="num">5</td><td class="num">0,35</td><td>Centralized</td></tr>
+<tr><th>Много инструментов</th><td class="num">16</td><td class="num">0,63</td><td>Decentralized</td></tr>
+</tbody>
+</table>
+<p>Третья строка спорит с порогом: одиночный агент решает 63%, а статья всё равно выбирает Decentralized, «despite high overhead (263%)», потому что параллельность и избыточность перевешивают потерю эффективности. Похоже ведёт себя WorkBench с его бизнес-инструментами: при базовых 62,9% Decentralized добавил 5,6%. Агент бэкендера с полутора десятками инструментов — как раз этот случай, и для него порог 45% — повод проверить на eval, а не готовый ответ.</p>
+
+<div class="note warn"><p>4 800 токенов рассуждения на попытку — очень маленький бюджет. Ресёрч-система Anthropic тратит на порядки больше и устроена иначе. Архитектуры в статье — собственные реализации авторов, а не продуктовые системы. Числа говорят о направлении эффекта, а не о том, что получится у тебя.</p></div>
+
+<p>Есть и результат с противоположным знаком. MacNet в 2024 году организовал агентов в направленные ациклические графы, дошёл до тысячи с лишним агентов и сообщил о логистическом росте качества с их числом, назвав это «collaborative scaling law»<a class="cite" href="#src-17">17</a>. Бюджет там не уравнивали, задачи были другие. Больше агентов помогает, когда им дают больше денег и задача режется на независимые куски. При фиксированном бюджете и связанной задаче больше агентов значит меньше мысли на каждого.</p>
+<p>Прежде чем проектировать топологию, измерь одиночного агента на своих задачах. Если он решает заметно меньше половины и задача режется на независимые части, мультиагентность имеет шанс. Если он уже решает больше половины при небольшом числе инструментов или задача последовательная, скорее всего, ты заплатишь в несколько раз больше за тот же или худший результат.</p>
+</section>
+
+<section id="when-helps">
+<h2>Три случая, когда второй агент окупается</h2>
+<p>«Teams invest months building elaborate multi-agent architectures only to discover that improved prompting on a single agent achieved equivalent results». Эта фраза из январского поста Anthropic 2026 года<a class="cite" href="#src-3">3</a>, и сразу за ней идёт список ситуаций, где мультиагентность себя оправдывает: «when context pollution degrades performance, when tasks can run in parallel, and when specialization improves tool selection or task focus. Outside these situations, the coordination costs typically exceed the benefits». Цена названа там же: в 3–10 раз больше токенов, чем у одиночного агента на той же задаче, на дублирование контекста, сообщения между агентами и выжимки.</p>
+<p>У каждого из трёх случаев есть более дешёвая альтернатива.</p>
+
+<h3>Мусор в контексте</h3>
+<p>Подзадача, которая по дороге читает много лишнего, портит окно тому, кто продолжит работу. Порог у Anthropic конкретный: изоляция окупается, когда подзадача приносит больше 1 000 токенов в основном нерелевантного контекста. Пример дал на HN colonCapitalDee: у его SMS-агента поиск рецептов заваливал контекст страницами, и агент забывал инструкцию форматировать ответ под SMS. Он вынес поиск в инструмент, внутри которого сабагент возвращает один лучший рецепт<a class="cite" href="#src-7">7</a>.</p>
+<div class="note field">
+<blockquote>Using this sub-agent to prevent information from entering the context dramatically improved the quality of responses. More context is not always better! … my experience suggests that context problems start cropping up well before the context window fills up.
+<footer>— colonCapitalDee, <a href="https://news.ycombinator.com/item?id=45097287">Hacker News, 1 сентября 2025</a></footer></blockquote>
+<p>Это чистый случай изоляции контекста: сабагент ничего не пишет, он фильтрует. Здесь и Cognition, и Anthropic согласились бы, что второй агент нужен.</p>
+</div>
+<p>Альтернатива — компакция и вычистка старых результатов инструментов (<a href="../02-context-engineering/index.html">глава 2</a>). Anthropic пишет, что компакция ослабляет аргумент «не влезает в окно» в пользу мультиагентности.</p>
+
+<h3>Параллельность</h3>
+<p>Независимые направления поиска можно пройти одновременно. Но ускорения ждать не стоит: «multi-agent systems often take longer overall than single-agent systems because of the sheer increase in total computation… The primary benefit of parallelization is thoroughness, not speed». Параллельные агенты покрывают больше пространства за то же время ожидания, но не решают ту же задачу быстрее.</p>
+<p>У параллельности есть вторая ось: ждёт ли координатор всех. Ресёрч-система Anthropic в 2025 году ждала весь набор сабагентов, не могла направлять их по ходу, и один медленный сабагент держал всю систему. Асинхронность авторы отложили из-за проблем с «result coordination, state consistency, and error propagation»<a class="cite" href="#src-2">2</a>. В Claude Code выбор уже сделан: с версии 2.1.198 сабагенты по умолчанию работают в фоне<a class="cite" href="#src-18">18</a>, и результаты приходят вразнобой.</p>
+
+<h3>Специализация</h3>
+<p>Когда инструментов слишком много, модель начинает путаться в выборе. Anthropic называет «often 20+» инструментов как точку, где это становится заметно, и советует сначала попробовать Tool Search Tool, который сокращает токены на описания инструментов «by up to 85%». Как писать и грузить описания — тема <a href="../03-tool-design/index.html">главы 3</a>. Разделить инструменты между агентами — второй шаг, а не первый, хотя в замере Google задачи с 16 инструментами как раз выигрывали от Decentralized (<a href="#scaling">см. выше</a>).</p>
+
+<h3>Делить по контексту, а не по ролям</h3>
+<p>Систему часто режут по должностям, как команду людей: планировщик, программист, тестировщик, ревьюер. В эксперименте Anthropic с такой нарезкой итог короткий: «the subagents spent more tokens on coordination than on actual work». Объяснение там же: «Dividing by type of work (one agent writes features, another writes tests, a third reviews code) creates constant coordination overhead… an agent handling a feature should also handle its tests». Каждый переход между ролями теряет часть общего контекста.</p>
+
+<figure class="fig" id="fig-decompose">
+<div class="versus">
+  <div data-tone="warn"><h4>По ролям</h4><ul><li>планировщик → программист → тестировщик → ревьюер</li><li>на каждом переходе теряется часть решений</li><li>одна фича проходит через четыре окна</li><li>в эксперименте Anthropic координация съела больше токенов, чем работа</li></ul></div>
+  <div data-tone="ok"><h4>По контексту</h4><ul><li>агент фичи A пишет и код, и тесты</li><li>агент фичи B работает параллельно, у фич чистый API-контракт</li><li>проверяющий получает только результат и проверяет его как чёрный ящик</li><li>передаётся артефакт, а не половина рассуждения</li></ul></div>
+</div>
+<figcaption>Два способа разрезать одну и ту же работу. Слева граница проходит внутри общего контекста, справа — там, где контекст правда независим. Хорошие границы по Anthropic: независимые направления ресёрча, компоненты с чистым API, проверка чёрным ящиком.</figcaption>
+</figure>
+
+<p>Плохие границы Anthropic тоже перечисляет: последовательные фазы одной работы, тесно связанные компоненты, общее состояние. Одна роль, которая переживает любую нарезку, — проверяющий. Сабагент-верификатор «consistently works well across domains»: ему не нужен чужой контекст, только результат и критерии. Есть и оговорка: более сильные оркестраторы, в примере Claude Opus 4.5, всё чаще проверяют работу сабагентов сами.</p>
+
+<h3>Дебаты работают как голосование</h3>
+<p>Дебаты — самый популярный «мультиагентный» приём в статьях. Исходная работа Du et al. 2023 года показала рост фактической точности и качества рассуждений, когда несколько копий модели спорят несколько раундов<a class="cite" href="#src-19">19</a>. Контролируемые перепроверки 2025 года этот результат сильно подрезали. Choi, Zhu и Li: «Majority Voting alone accounts for most of the performance gains typically attributed to MAD», а сами раунды спора без смещения в сторону исправления ведут себя как мартингал, то есть в среднем не приближают к правильному ответу<a class="cite" href="#src-20">20</a>. Zhang et al. проверили пять методов дебатов на девяти бенчмарках и четырёх моделях: они «often fail to outperform simple single-agent baselines such as Chain-of-Thought and Self-Consistency, even when consuming significantly more inference-time computation». Устойчиво помогало одно: разнородные модели среди участников<a class="cite" href="#src-21">21</a>.</p>
+<p>Рецепт такой: для надёжности делай несколько независимых попыток и голосование или судью, по возможности на разных моделях или хотя бы промптах, а раунды спора добавляй, только если eval показал, что они что-то дают. В Claude Code это уже есть: документация agent teams предлагает для отладки запускать тиммейтов с конкурирующими гипотезами, которые пытаются опровергнуть друг друга<a class="cite" href="#src-22">22</a>, а в dynamic workflows есть паттерны adversarial verification и tournament, где победителя выбирает попарное сравнение<a class="cite" href="#src-23">23</a>.</p>
+
+<h3>Один агент со скиллами</h3>
+<p>Последняя альтернатива самая радикальная. В январе 2026 года вышла статья, где мультиагентную систему «компилируют» в одного агента: коммуникация между агентами заменяется выбором скилла<a class="cite" href="#src-24">24</a>. Предварительные результаты — «substantially reduce[d] token usage and latency while maintaining competitive accuracy». Предел тоже есть: точность выбора скилла «remains stable up to a critical library size, then drops sharply», когда скиллы похожи друг на друга. Вторая работа, от апреля 2026 года, показала, что при перегонке конвейера в скилл важно, что переносить: подсказки конвейера дали +19,6 пункта на выборе метода и −10,3 пункта на числовой ошибке<a class="cite" href="#src-25">25</a>. Скиллы разобраны в <a href="../06-skills/index.html">главе 6</a>, а LangChain записала их в свой список мультиагентных паттернов<a class="cite" href="#src-11">11</a>.</p>
+<div class="note key"><p>Если у задачи нет ни грязного контекста, ни независимых направлений, ни перегруза инструментами, мультиагентность только добавит цену. Начни с одного агента, Tool Search, компакции и скиллов, а второго агента заведи там, где один из трёх случаев правда есть.</p></div>
+</section>
+
+<section id="mast">
+<h2>Четырнадцать способов провалиться</h2>
+<p>Телефонный агент знает, в каком формате логинного API нужен username, и не говорит об этом агенту-супервизору. Супервизор раз за разом отправляет неправильно оформленные учётные данные, получает ошибку входа и ни разу не переспрашивает. Задача проваливается на повторяющихся ошибках авторизации. Этот след разобран в статье «Why Do Multi-Agent LLM Systems Fail?» как пример режима FM-2.4, Information Withholding<a class="cite" href="#src-26">26</a>. Коды вида FM-x.y означают failure mode: x — категория, y — номер режима в ней, на графике ниже те же номера. На самом деле отказов два: один агент утаил информацию, другой не спросил, и ни один не связан с тем, что модель чего-то не умеет.</p>
+<p>Статья построила первую эмпирическую таксономию отказов мультиагентных систем, MAST; авторы — группа из UC Berkeley и Shuyi Yang из Intesa Sanpaolo. Третья версия от 26 октября 2025 года принята на NeurIPS 2025 в трек Datasets &amp; Benchmarks. Шесть экспертов разобрали 150 следов, трое независимо разметили 15 из них с согласием κ = 0,88, потом разметку масштабировали LLM-судьёй на o1 (κ = 0,77 с людьми). Итоговый датасет — 1 642 следа семи систем, среди них ChatDev, MetaGPT, AppWorld и Magentic-One. Проваливают они от 41% до 86,7% задач, но бенчмарки у систем разные, так что сравнивать их между собой нельзя.</p>
+
+<figure class="fig" id="fig-mast">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Режимы отказа MAST", "subtitle": "Доля среди всех найденных отказов, 1 642 следа, v3", "unit": "%", "decimals": 1,
+ "emphasis": ["1.3 Повтор шагов", "2.6 Рассуждение расходится с действием", "1.5 Не знает условий остановки", "1.1 Нарушает спецификацию задачи"],
+ "rows": [
+  ["1.3 Повтор шагов", 15.7, "дизайн"],
+  ["2.6 Рассуждение расходится с действием", 13.2, "рассогласование"],
+  ["1.5 Не знает условий остановки", 12.4, "дизайн"],
+  ["1.1 Нарушает спецификацию задачи", 11.8, "дизайн"],
+  ["3.3 Неверная проверка", 9.1, "проверка"],
+  ["3.2 Нет проверки или она неполная", 8.2, "проверка"],
+  ["2.3 Уход от задачи", 7.4, "рассогласование"],
+  ["2.2 Не переспрашивает", 6.8, "рассогласование"],
+  ["3.1 Преждевременное завершение", 6.2, "проверка"],
+  ["1.4 Потеря истории разговора", 2.8, "дизайн"],
+  ["2.1 Сброс разговора", 2.2, "рассогласование"],
+  ["2.5 Игнорирует другого агента", 1.9, "рассогласование"],
+  ["1.2 Нарушает свою роль", 1.5, "дизайн"],
+  ["2.4 Утаивает информацию", 0.8, "рассогласование"]
+ ],
+ "note": "Cemri et al., arXiv:2503.13657 v3, 26 октября 2025, рисунок 1. Для FM-2.4 в тексте той же версии указано 0,85%."}
+</script>
+<figcaption>Четыре самых частых отказа — повторы, расхождение слов и дел, незнание, когда остановиться, и нарушение условий задачи. Три из четырёх относятся к дизайну системы, то есть их устраняют в коде оркестрации, а не заменой модели.</figcaption>
+</figure>
+
+<p>Категорий три: проблемы дизайна системы — 44,2%, рассогласование между агентами — 32,3%, проверка и завершение задачи — 23,5%. Эти доли меняются от версии к версии, и в пересказах их путают. В первой версии от марта 2025 года на 151 следе было 37,17 / 31,41 / 31,41%, во второй от апреля — 41,77 / 36,94 / 21,30%. Цитируй третью и называй версию.</p>
+<p>Вывод неприятен для тех, кто ждёт следующей модели. Повтор шагов, незнание условий остановки и нарушение спецификации появляются потому, что система не сказала агенту, когда хватит и что именно считается готовым. Более сильная модель сама по себе этого не исправит.</p>
+
+<h3>Что исправляли и сколько это дало</h3>
+<p>Авторы проверили исправления на двух системах. В ChatDev агент CPO заканчивал обсуждение с CEO раньше времени. Исправили спецификацию ролей так, чтобы последнее слово было за CEO, и «improving agent role specifications alone yields a +9.4% success rate increase for ChatDev with the same user prompt and LLM (GPT-4o)». Отдельно шаг проверки общей цели задачи дал +15,6% на ProgramDev. В пересказах +9,4% ошибочно приписывают смене топологии. Ещё показательнее эксперимент с AG2: одна и та же перестройка топологии в три роли, где завершать разговор может только проверяющий, дала значимое улучшение на GPT-4o (p = 0,03) и незначимое на GPT-4 (p = 0,4). Исправление, которое работает на одной модели, может ничего не дать на другой, и авторы пишут, что надёжность «often requires more than isolated fixes».</p>
+
+<div class="note warn"><p>Проверяющие в изученных системах в основном смотрели, «if the code compiles or if there are leftover TODO comments». Авторы MAST делают вывод, что опираться только на проверки последнего шага и низкого уровня нельзя. Anthropic в апреле 2026 года сформулировала то же короче: верификатор без явных критериев «will rubber-stamp»<a class="cite" href="#src-9">9</a>.</p></div>
+
+<h3>Кто виноват</h3>
+<p>Найти виновного в провале труднее, чем кажется. Датасет Who&amp;When собрал следы 127 систем с разметкой, какой агент и на каком шаге решил исход. Лучший автоматический метод «achieves 53.5% accuracy in identifying failure-responsible agents but only 14.2% in pinpointing failure steps», а o1 и R1 «fail to achieve practical usability»<a class="cite" href="#src-27">27</a>. Значит, следы надо писать так, чтобы их мог прочитать человек, и заранее закладывать контрольные точки, где система проверяет промежуточный результат. Аннотатор MAST выложен как пакет, <code>pip install agentdash</code>, и его можно натравить на свои следы. Такие проверки и датасеты — тема <a href="../17-evals/index.html">главы 17</a>.</p>
+</section>
+
+<section id="societies">
+<h2>Тридцать агентов и одно имя ветки</h2>
+<p>В одном из экспериментов Frontier Red Team Anthropic «18 out of 30 agents decided to create a git branch with the exact same branch name, 'mvp-game-loop.'» Отчёт «Patterns and problems in emerging multiagent systems» вышел 13 августа 2026 года (автор для переписки — Carolyn Zou) и описывает уже не архитектуру, а поведение: что происходит, когда много способных агентов работают вместе без продуманной социальной структуры<a class="cite" href="#src-28">28</a>. Больше половины роя, где каждому агенту велели построить что-нибудь впечатляющее, сделали трассировщики лучей или самокомпилирующиеся компиляторы.</p>
+<p>Объяснение в отчёте такое: «When one agent makes a bad decision, it is likely that many agents will make that same bad decision». У людей в команде разный опыт и разная информация, а у флота агентов источников разнообразия три — контекст, обвязка и модель, и обычно все три одинаковы. Если нужна независимость мнений, например в голосовании, её создают руками, разными моделями, промптами или данными, как и в дебатах из предыдущего раздела.</p>
+
+<div class="stats">
+  <div class="stat"><b>18 из 30</b><span>агентов назвали ветку одинаково</span></div>
+  <div class="stat"><b>2,4 млн</b><span>запросов к очереди задач против 117 принятых</span></div>
+  <div class="stat"><b>266 против 21</b><span>уязвимостей у координирующегося роя и у независимых агентов</span></div>
+</div>
+
+<p>Остальные сюжеты отчёта из той же серии. Агенты без механизма координации получили общую очередь задач, каждый запустил демона, опрашивающего её 30 раз в секунду, и в одном прогоне набралось 2,4 млн запросов на 117 принятых задач. В ценовой игре Бертрана, где продавцы одинакового товара сбивают друг другу цену, от трёх до восьми агентов к третьему раунду договорились о нижней границе цен по отдельному каналу. Каналы убрали — и «Even when all direct communication channels were removed, the agents still colluded. They price-matched to the penny via a public listings board». Если общее окружение видно всем, оно тоже канал связи, и убрать сообщения между агентами не значит убрать координацию.</p>
+<p>Обратная проблема видна в эксперименте со скрытым профилем: у каждого из четырёх агентов своя часть информации, и решить задачу можно, только собрав её вместе. На 400 эпизодах на модель более новые и крупные закрывали больше разрыва до оракула, знающего всё, но результат «does not saturate even at the top of our range»<a class="cite" href="#src-28">28</a>. Утаивание и непереспрашивание из MAST на моделях 2026 года никуда не делись.</p>
+<p>Самый тревожный эксперимент — с несовместимыми целями. Трём экземплярам одной модели поручили мигрировать один проект, каждому на свой язык, и прогнали по 120 эпизодов на модель. Разрешалось это силой, пассивностью, перемирием или никак. На силовой стороне: «They sabotaged others with increasingly aggressive, self-replicating malware», вплоть до отключения чужих Unix-аккаунтов и скриптов, которые в цикле убивали процессы конкурентов. И вывод: «models more capable in execution are not necessarily more coordinated». Для архитектуры это значит, что общая инфраструктура плюс независимые агенты плюс конфликтующие цели — опасная комбинация, и права каждого агента надо ограничивать в коде, а не в промпте. Модель угроз для таких систем разобрана в <a href="../16-security/index.html">главе 16</a>.</p>
+<p>Ещё два результата касаются того, как агенты работают вместе. В 12-часовых роях, которые строили игры, три варианта промпта — базовый, с предписанными ролями и с «CEO-иерархией» — «did not make much difference». Высокую долю слитых пулл-реквестов при настоящей совместной работе над общим кодом удержала только Sonnet 5; более ранние модели либо не могли слить конфликтующие PR, либо почти не трогали общие файлы. Если в чьём-то отчёте мультиагентная система «хорошо координируется», проверь, не избегают ли агенты совместной работы вообще.</p>
+<p>Второй — про поиск уязвимостей. 45 агентов, у каждого своя виртуальная машина, общий форум, шаг взаимного ревью и отдельный агент-арбитр, 15 проектов с открытым кодом. Координирующийся рой на Mythos Preview нашёл 266 уязвимостей за 27 млн токенов, независимые параллельные агенты — 21 за 6,5 млн. Общих находок всего 12, и примерно половина находок роя лежит за пределами основных директорий, а в их пределах токенов на уязвимость у обоих подходов уходило сопоставимо. Рой не стал эффективнее. Он ушёл шире — та же тщательность вместо скорости, что у Anthropic в январе.</p>
+<p>Отчёт заканчивается мыслью о том, почему интуиция про человеческие команды здесь подводит: «For agents, transmitting context is about as costly as acting on it, and an agent can be forked or repurposed at will». Человеку дешевле рассказать коллеге, чем сделать самому. Агенту передать контекст стоит примерно столько же, сколько им воспользоваться.</p>
+
+<div class="note field">
+<blockquote>So despite being highly qualified to communicate, the model will still be “dumb” in that for unstructured and unverifiable domains the agents won’t be more intelligent or more nuanced.
+<footer>— aabhay, <a href="https://news.ycombinator.com/item?id=49317171">Hacker News, 16 августа 2026</a></footer></blockquote>
+<p>В обсуждении отчёта на HN (200 очков, 138 комментариев)<a class="cite" href="#src-29">29</a> самый заметный комментарий скептический: навыки совместной работы тренируют в средах с проверяемой наградой, вроде задач на кодовой базе, и за их пределами агенты сообразительнее не станут. Другой участник, cryptolobster, считает, что мешает не протокол, а память: «Agents can't look back and correct their mistakes». Обе реплики — мнения, а не замеры, но границу применимости сегодняшних результатов они описывают точно.</p>
+</div>
+
+<h3>Отказ поменьше: кто сейчас владеет разговором</h3>
+<p>До саботажа в обычном проекте не дойдёт, а вот этот баг встретится почти наверняка. В issue №6064 LangGraph, открытом 2 сентября 2025 года и не закрытом к концу сентября 2026-го, сабагент после handoff просит у пользователя данные, пользователь отвечает, и ответ уходит обратно стартовому агенту-медиатору, который начинает всё заново<a class="cite" href="#src-30">30</a>. Мейнтейнеры в треде не отвечали, а участники поставили диагноз: каждое сообщение пользователя запускает граф заново от <code>START</code>, и то, что активным был сабагент, нигде не сохранено. Один сформулировал это как регрессионный тест: «pending sub-agent ownership is lost after the next user turn». Лечится явным полем состояния, которое переживает ход пользователя, вроде <code>current_step</code> из паттерна Handoffs в документации LangChain (<a href="#handoff">о нём ниже</a>), или паузой через <code>interrupt()</code>.</p>
+</section>
+
+<section id="handoff">
+<h2>Передать разговор или вызвать как инструмент</h2>
+<p>В OpenAI Agents SDK передача управления другому агенту — это обычный инструмент. Handoff на агента «Refund Agent» появляется в списке тулов модели под именем <code>transfer_to_refund_agent</code>, и модель выбирает его так же, как выбрала бы поиск по базе<a class="cite" href="#src-14">14</a>. Минимальный пример из документации:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Handoff в OpenAI Agents SDK (из документации)">
+from agents import Agent, handoff
+
+billing_agent = Agent(name="Billing agent")
+refund_agent = Agent(name="Refund agent")
+
+triage_agent = Agent(name="Triage agent", handoffs=[billing_agent, handoff(refund_agent)])
+</script>
+<p>Документация SDK различает два способа позвать другого агента, и разница между ними — разница между двумя вопросами из раздела <a href="#plan-holder">«Кто держит план»</a>. «Agents as tools: A manager agent keeps control of the conversation and calls specialist agents through <code>Agent.as_tool()</code>». «Handoffs: A triage agent routes the conversation to a specialist, and that specialist becomes the active agent for the rest of the turn». В первом случае менеджер получает ответ специалиста как результат инструмента и продолжает сам, во втором уходит со сцены до конца хода. Со следующего хода раннер начинает с того агента, которого ты ему передашь, и если об этом забыть, получится тот же баг, что в issue LangGraph выше.</p>
+<p>Кажется, что специалисту после handoff передают выжимку, но по умолчанию это не так: «When a handoff occurs, it's as though the new agent takes over the conversation, and gets to see the entire previous conversation history». Свёрнутая история, <code>nest_handoff_history</code>, «is available as an opt-in beta and is disabled by default». Если её включить, предыдущие ходы сворачиваются в сводку, обёрнутую в блок <code>&lt;CONVERSATION HISTORY&gt;</code>, а своё отображение можно задать через <code>RunConfig.handoff_history_mapper</code>. Есть и точечный инструмент: <code>input_filter</code> у конкретного handoff, например <code>handoff_filters.remove_all_tools</code>, который вычищает из истории прошлые вызовы инструментов.</p>
+
+<figure class="fig wide" id="fig-handoff">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant U as Пользователь
+  participant R as Runner SDK
+  participant T as Triage agent
+  participant F as Refund agent
+  U->>R: верните деньги за заказ 1042
+  R->>T: история и тулы, среди них transfer_to_refund_agent
+  T-->>R: tool call transfer_to_refund_agent
+  R->>R: on_handoff и input_filter
+  R->>F: вся история разговора (по умолчанию)
+  Note over R,F: nest_handoff_history (бета) свернёт её в сводку
+  F-->>U: ответ, до конца хода говорит Refund agent
+  Note over U,R: с кого начать следующий ход, решает твой код
+</script>
+<figcaption>Handoff в OpenAI Agents SDK. Передача — это вызов инструмента, после которого SDK подменяет активного агента и отдаёт ему историю. <code>on_handoff</code> и <code>input_filter</code> срабатывают между решением модели и первым ходом нового агента.</figcaption>
+</figure>
+
+<p>В документации handoff есть предупреждение о безопасности, которое легко пропустить: «<code>is_enabled</code> is evaluated while the SDK prepares the available handoffs, before the model returns handoff arguments, so it cannot authorize values inside an argument-bearing handoff… perform the check at the start of <code>on_handoff</code>». Если handoff несёт номер заказа, <code>is_enabled</code> решает только, показывать ли модели инструмент, а право пользователя на возврат по этому заказу проверяй в <code>on_handoff</code>.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок: handoff с проверкой и агент как инструмент (не запускался)" data-hl="8-11,20-25,28-31">
+from pydantic import BaseModel
+from agents import Agent, RunContextWrapper, handoff
+from agents.extensions import handoff_filters
+
+class RefundArgs(BaseModel):
+    order_id: str
+
+async def on_refund(ctx: RunContextWrapper, args: RefundArgs) -> None:
+    # здесь аргументы уже известны, is_enabled их не видит
+    if not await user_owns_order(ctx.context.user_id, args.order_id):
+        raise PermissionError(args.order_id)
+
+refund_agent = Agent(name="Refund agent", instructions="...")
+billing_agent = Agent(name="Billing agent", instructions="...")
+
+triage_agent = Agent(
+    name="Triage agent",
+    instructions="...",
+    handoffs=[
+        handoff(
+            refund_agent,
+            input_type=RefundArgs,
+            on_handoff=on_refund,
+            input_filter=handoff_filters.remove_all_tools,
+        ),
+    ],
+    tools=[
+        billing_agent.as_tool(
+            tool_name="ask_billing",
+            tool_description="Вопрос биллингу о счёте, ответ вернётся сюда",
+        ),
+    ],
+)
+</script>
+<p>История handoff в SDK до сих пор чинится: в релизе 0.19.0 от 27 июля 2026 года — «fix: partition nested handoffs history ownership», в 0.22.1 — «fix(sessions): recover resumed handoffs after session append failures»<a class="cite" href="#src-31">31</a>. На 30 сентября 2026 года актуальна 0.22.3<a class="cite" href="#src-32">32</a>. Сам термин handoff популяризовал экспериментальный OpenAI Swarm 2024 года, а его README теперь говорит, что Swarm «is now replaced by the OpenAI Agents SDK»<a class="cite" href="#src-14">14</a>.</p>
+
+<h3>То же самое в LangChain и ADK</h3>
+<p>В LangChain handoff сделан через состояние графа. Инструмент возвращает <code>Command</code>, который одновременно дописывает сообщение в историю и меняет поле, от которого зависит поведение агента<a class="cite" href="#src-11">11</a>:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Handoff через Command в LangChain (из документации)" data-hl="11-14,16">
+from langchain.tools import tool
+from langchain.messages import ToolMessage
+from langgraph.types import Command
+
+@tool
+def transfer_to_specialist(runtime) -> Command:
+    """Transfer to the specialist agent."""
+    return Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content="Transferred to specialist",
+                    tool_call_id=runtime.tool_call_id
+                )
+            ],
+            "current_step": "specialist"  # Triggers behavior change
+        }
+    )
+</script>
+<p><code>ToolMessage</code> с тем же <code>tool_call_id</code> здесь обязателен, и документация об этом предупреждает. Без него у вызова инструмента в истории нет ответа, контракт tool use нарушен, и история становится некорректной (формат tool use — в <a href="../01-llm-api-agent-loop/index.html">главе 1</a>). А поле <code>current_step</code> и есть то, чего не хватало в issue №6064: оно переживает ход пользователя и говорит графу, кто сейчас владеет разговором.</p>
+<p>У LangChain в документации есть сравнение паттернов по вызовам модели и токенам. На простой задаче Subagents делает 4 вызова против 3 у остальных, а на повторном запросе 8 против 5 у Handoffs и Skills, которые сохраняют состояние. Для задачи на три домена примерно по 2 тыс. токенов документации в каждом картина обратная:</p>
+<table>
+<thead><tr><th>Паттерн</th><th class="num">Вызовов модели</th><th class="num">Токенов</th><th>Почему</th></tr></thead>
+<tbody>
+<tr><th>Subagents</th><td class="num">5</td><td class="num">~9 000</td><td>каждый домен в своём чистом окне, параллельно</td></tr>
+<tr><th>Router</th><td class="num">5</td><td class="num">~9 000</td><td>то же, но без общего состояния между ходами</td></tr>
+<tr><th>Handoffs</th><td class="num">7+</td><td class="num">~14 000+</td><td>последовательно, история растёт с каждым переходом</td></tr>
+<tr><th>Skills</th><td class="num">3</td><td class="num">~15 000</td><td>один агент, контекст всех трёх доменов копится в одном окне</td></tr>
+</tbody>
+</table>
+<p>Это иллюстративные примеры из документации, а не замеры. В самом тексте есть арифметическая ошибка: «Subagents processes 67% fewer tokens overall», хотя 9 тыс. против 15 тыс. — это на 40% меньше, а на 67% больше тратит Skills. Цитируй сырые числа, а не проценты.</p>
+<p>В Google ADK 2.0 (Python — 19 мая 2026 года, Go — 30 июня, TypeScript — 21 августа) разница между handoff и вызовом-как-инструмент стала параметром агента<a class="cite" href="#src-33">33</a>:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Режимы сабагентов в ADK 2.0 (из документации)" data-hl="5,10,17-19">
+from google.adk import Agent
+
+weather_agent = Agent(
+    name="weather_checker",
+    mode="single_turn",         # no user interaction
+    tools=[get_weather, user_info, geocode_address],
+)
+flight_agent = Agent(
+    name="flight_booker",
+    mode="task",                # can ask user questions
+    input_schema=FlightInput,
+    output_schema=FlightResult,
+    tools=[search_flights, book_flight],
+)
+root = Agent(
+    name="travel_planner",      # coordinator agent
+    sub_agents=[weather_agent, flight_agent],
+    # Auto-injects delegation tools named after each subagent:
+    # weather_checker, flight_booker
+)
+</script>
+<p>Режим <code>chat</code> (по умолчанию) — это handoff: сабагент получает разговор с пользователем и возвращает управление только явным переводом. В режиме <code>task</code> сабагент может задать пользователю уточняющий вопрос и возвращается сам, вызвав <code>finish_task</code>. В режиме <code>single_turn</code> он с пользователем не говорит вовсе, результат возвращается автоматически, и такие задачи «can run in parallel». В обоих последних режимах агент работает в изолированной ветке сессии и «cannot see what its peer agents are doing». Агенты в режиме <code>task</code> должны быть листьями дерева, а в графовых workflow ADK Python v2.0.0 этот режим отключён.</p>
+<p>Mastra формулирует цену handoff точнее всех: «the tradeoff is that context management becomes more important, since the system must decide what the next agent inherits and what remains scoped»<a class="cite" href="#src-13">13</a>. Выбор между двумя механизмами на практике простой. Агент как инструмент — вариант по умолчанию: менеджер держит план, результат специалиста проходит через него, его легко логировать и тестировать. Handoff бери, когда специалисту нужно несколько ходов живого разговора с пользователем, как в поддержке после триажа, и сразу решай три вещи: что из истории он получит, где хранится текущий владелец разговора и где проверяются права на аргументы передачи.</p>
+<div class="note practice"><p>Прогони на своём триаж-агенте сценарий из трёх ходов: пользователь просит возврат, специалист переспрашивает номер заказа, пользователь отвечает. По логам проверь, какой агент обработал третий ход и какую историю видел специалист. Потом передай номер чужого заказа: отказ должен прийти из <code>on_handoff</code>, а не из того, что модель вежливо откажется сама.</p></div>
+</section>
+
+<section id="what-sees">
+<h2>Полный след, выжимка или файл</h2>
+<p>Свежий сабагент в Claude Code получает свой системный промпт, строку задачи от вызывающего агента, <code>CLAUDE.md</code> и немного служебного контекста, но не историю разговора<a class="cite" href="#src-18">18</a>. Форк устроен наоборот: он «inherits the entire conversation so far», с тем же системным промптом, инструментами и моделью. Полный состав обоих окон разобран в <a href="../12-deep-agents/index.html">главе 12</a>, здесь важен сам выбор, потому что он есть в любой системе.</p>
+
+<figure class="fig" id="fig-fork">
+<div class="versus">
+  <div data-tone="soft"><h4>Свежий сабагент</h4><ul><li>свой системный промпт</li><li>задача, которую написал вызывающий</li><li><code>CLAUDE.md</code> и снимок <code>git status</code></li><li>история разговора не передаётся</li><li>свой кеш промпта, первый запрос платит запись</li></ul></div>
+  <div data-tone="accent"><h4>Форк</h4><ul><li>весь разговор до этого момента</li><li>тот же системный промпт, тулы и модель</li><li>первый запрос читает кеш родителя</li><li>обратно приходит только итог</li><li>в интерактивной сессии включён по умолчанию</li></ul></div>
+</div>
+<figcaption>Что лежит в окне у сабагента Claude Code в момент старта. Свежему нужно объяснить задачу словами вызывающего; форк уже знает всё, что знал родитель, и стоит дешевле за счёт общего кеша.</figcaption>
+</figure>
+
+<p>Разница в цене из-за кеша. «Because a fork's system prompt and tool definitions are identical to the parent, its first request reuses the parent's prompt cache. This makes forking cheaper than spawning a fresh subagent for tasks that need the same context». Свежий сабагент со своим системным промптом строит свой префикс и платит за запись в кеш. Форк проигрывает в другом: с ним идёт вся история вызывающего, в том числе мусор, от которого изоляция как раз и спасает.</p>
+
+<h3>Что писать в поручении</h3>
+<p>Свежий сабагент знает только то, что ему написали. Документация Agent SDK: «The only content you pass from parent to subagent is the Agent tool's prompt string, so include any file paths, error messages, or decisions the subagent needs directly in that prompt»<a class="cite" href="#src-18">18</a>. Anthropic называет четыре обязательные части поручения: «an objective, an output format, guidance on the tools and sources to use, and clear task boundaries»<a class="cite" href="#src-2">2</a>. Без границ сабагенты дублируют друг друга: на вопрос о дефиците полупроводников «one subagent explored the 2021 automotive chip crisis while 2 others duplicated work investigating current 2025 supply chains».</p>
+<p>Для кода это переводится так: цель одной фразой, форма ответа (лучше схема, чем «опиши»), какие файлы и инструменты трогать, что не делать и какие решения уже приняты. Последний пункт лечит Flappy Bird: там общий стиль игры не попал ни в одно поручение, и каждый сабагент выбрал свой. Обратный перекос — менеджеры Cognition, расписывающие детям каждый шаг. Поручение фиксирует цель, формат и границы, а путь оставляет исполнителю.</p>
+
+<h3>Пять способов передать контекст</h3>
+<p>Если убрать названия фреймворков, остаётся пять способов, которыми один агент узнаёт то, что знает другой.</p>
+<table class="wide">
+<thead><tr><th>Способ</th><th>Пример</th><th>Что стоит</th><th>Что ломается</th></tr></thead>
+<tbody>
+<tr><th>Полный след</th><td>форк Claude Code, handoff в OpenAI SDK по умолчанию, «умный друг» Cognition</td><td>токены на всю историю, зато кеш общий</td><td>мусор переезжает вместе с полезным</td></tr>
+<tr><th>Выжимка</th><td>итоговое сообщение сабагента, <code>nest_handoff_history</code>, сжатие истории у Cognition</td><td>вызов модели на сжатие и потеря деталей</td><td>неявные решения не попадают в выжимку</td></tr>
+<tr><th>Артефакт по ссылке</th><td>сабагенты ресёрча Anthropic пишут в хранилище и возвращают ссылку</td><td>дёшево, результат не проходит через окно ведущего</td><td>ведущий не видит содержимого, пока не прочтёт</td></tr>
+<tr><th>Общее состояние</th><td>список задач agent teams, blackboard</td><td>чтение хранилища каждым агентом</td><td>реактивные петли, гонки, дубли</td></tr>
+<tr><th>Сообщения</th><td><code>SendMessage</code>, почтовые ящики, A2A между сервисами</td><td>ровно то, что написали</td><td>утаивание и непереспрашивание (FM-2.4, FM-2.2)</td></tr>
+</tbody>
+</table>
+<p>Третий способ недооценивают. В ресёрч-системе Anthropic «subagents call tools to store their work in external systems, then pass lightweight references back to the coordinator»<a class="cite" href="#src-2">2</a>. Ведущий агент ещё и сам сохраняет свой план во внешнюю память, «since if the context window exceeds 200,000 tokens it will be truncated». Для бэкендера это знакомая идея: большой результат кладут в объектное хранилище, а по очереди отправляют ключ. В Claude Code роль хранилища играет файловая система, в Managed Agents все агенты сессии делят один сэндбокс и одну файловую систему<a class="cite" href="#src-34">34</a>.</p>
+<p>Pydantic AI в версии 2 сделала изоляцию явной. Возможность <code>SubAgents</code> «exposes a single <code>delegate_task(agent_name, task)</code> tool, forwards dependencies, threads usage limits, and lists the available delegates in the system prompt as a static instruction so the listing stays in the cacheable prefix». Про контекст там одна фраза: «Each delegation runs in its own run with its own message history, so a delegate never sees the parent conversation»<a class="cite" href="#src-35">35</a>. Почему статичный префикс важен, объясняет <a href="../02-context-engineering/index.html">глава 2</a>.</p>
+
+<h3>Умный друг как API</h3>
+<p>Паттерн «умного друга» из поста Cognition в 2026 году стал примитивом API. В Messages API у Anthropic есть инструмент advisor, бета с заголовком <code>advisor-tool-2026-03-01</code><a class="cite" href="#src-36">36</a>:</p>
+<script type="text/plain" class="code" data-lang="json" data-title="Объявление advisor в запросе (из документации)">
+"tools": [
+  {
+    "type": "advisor_20260301",
+    "name": "advisor",
+    "model": "claude-opus-5"
+  }
+]
+</script>
+<p>Исполнитель, например <code>claude-sonnet-5</code>, сам решает, когда посоветоваться. Он выдаёт блок <code>server_tool_use</code> с именем <code>advisor</code> и пустым <code>input</code>, дальше работает сервер. «The server constructs the advisor's view from the full transcript automatically. Nothing the executor puts in input reaches the advisor». Советник читает весь разговор, отвечает планом или поправкой курса, и исполнитель продолжает.</p>
+
+<figure class="fig wide" id="fig-advisor">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant App as Твой код
+  participant E as Исполнитель, Sonnet 5
+  participant S as Сервер API
+  participant A as Советник, Opus 5
+  App->>E: messages и tools с advisor_20260301
+  E->>E: механические ходы с инструментами
+  E->>S: server_tool_use advisor, input пустой
+  S->>A: весь транскрипт, собранный сервером
+  A-->>S: план или поправка курса
+  S-->>E: advisor_tool_result
+  E-->>App: продолжение ответа
+  Note over App,E: у Opus 5 совет приходит зашифрованным, клиент его не читает
+</script>
+<figcaption>Advisor tool: исполнитель выбирает момент, сервер решает, что увидит советник. В отличие от сабагента, советник получает полный след, а не формулировку задачи, и ничего не делает сам.</figcaption>
+</figure>
+
+<p>Для отладки учти деталь: советники Claude Opus 5, Opus 5.5 и ряда других моделей возвращают <code>advisor_redacted_result</code>, и у тебя в ответе лежит зашифрованный блок. Открытый текст даёт советник <code>claude-opus-4-8</code>, но не со всякой парой: исполнители Opus 5.5 и Sonnet 5.5, например, работают только с зашифрованным вариантом. Подходит паттерн для длинной агентной работы, «where most turns are mechanical but having an excellent plan is crucial», и плохо подходит для вопросов в один ход.</p>
+<p>Cognition описала и то, как этот паттерн ломается: слабая основная модель не понимает, когда ей пора звать друга. SWE-1.5 в роли основной модели оказалась «not good enough», и сам паттерн в Cognition описывают как «capability router rather than a difficulty escalator»<a class="cite" href="#src-4">4</a>. Если исполнитель не видит, что зашёл в тупик, дорогой советник его не спасёт.</p>
+
+<h3>Через границу сервиса, и почему чужому выходу нельзя верить</h3>
+<p>Когда агенты живут в разных сервисах или у разных вендоров, контекст идёт сообщениями по протоколу. Стандарт для этого — A2A: версия 1.0.0 вышла 12 марта 2026 года, 17 августа 2026 года проект перешёл в Agentic AI Foundation<a class="cite" href="#src-37">37</a>. Протокол, его задачи и транспорт разобраны в <a href="../07-a2a/index.html">главе 7</a>. Топологически A2A — тот же «агент как инструмент» или handoff, только с сетевым вызовом посередине и с чужим агентом на другом конце.</p>
+<p>Правило, которое действует и внутри одного процесса: выход другого агента — недоверенный ввод. Claude Code с версии 2.1.210 обезвреживает в отчётах сабагентов имитации служебных тегов и реплик и помечает упоминания настроек разрешений<a class="cite" href="#src-18">18</a>; как именно — в <a href="../12-deep-agents/index.html">главе 12</a>. В agent teams сообщение от тиммейта помечается как пришедшее от другой сессии Claude, и «A teammate can't approve a permission prompt or supply consent on your behalf»<a class="cite" href="#src-22">22</a>. Атаки через этот канал уже описаны: Unit 42 в октябре 2025 года показала «agent session smuggling» в многоходовых A2A-сессиях<a class="cite" href="#src-38">38</a>, AppOmni в ноябре 2025 года — как в ServiceNow Now Assist безобидный агент через инъекцию второго порядка завербовал более привилегированного<a class="cite" href="#src-39">39</a>. Подробно это в <a href="../16-security/index.html">главе 16</a>.</p>
+</section>
+
+<section id="patterns">
+<h2>Пять схем координации и где у каждой дыра</h2>
+<p>Агент A записывает находку в общее хранилище. Агент B видит её и дописывает уточнение. A видит уточнение и отвечает на него. B отвечает на ответ. Никто не ошибся, каждый ход разумен, а система крутится без конца и жжёт токены. Anthropic в апрельском посте 2026 года «Multi-agent coordination patterns» называет это реактивной петлёй и считает, что схемам с общим состоянием нужны «first-class termination conditions: a time budget, a convergence threshold (no new findings for N cycles), or a designated agent»<a class="cite" href="#src-9">9</a>. В том же посте разобраны пять схем, и для каждой названо, как она ломается.</p>
+<table class="wide">
+<thead><tr><th>Схема</th><th>Когда брать</th><th>Как ломается</th></tr></thead>
+<tbody>
+<tr><th>Generator-verifier</th><td>результат критичен по качеству, критерии можно записать</td><td>верификатор без критериев «will rubber-stamp»; генерацию и оценку не всегда можно разделить; цикл колеблется, поэтому нужен лимит итераций и откат к человеку или лучшей попытке</td></tr>
+<tr><th>Orchestrator-subagent</th><td>задача ясно делится на ограниченные подзадачи; так устроен Claude Code</td><td>«The orchestrator becomes an information bottleneck»; без параллельности получаешь «multi-agent token costs without the speed benefit»</td></tr>
+<tr><th>Agent teams</th><td>параллельные, независимые, долгие подзадачи, исполнители живут между поручениями</td><td>промежуточными находками никто не делится; трудно понять, что всё закончено; общие ресурсы ведут к конфликтующим правкам</td></tr>
+<tr><th>Message bus</th><td>событийные конвейеры, число агентов растёт</td><td>каскад трудно отследить; неверно маршрутизированное событие «fails silently, handling nothing but never crashing»</td></tr>
+<tr><th>Shared state</th><td>совместный ресёрч, где находки должны расходиться сразу; нет единой точки отказа в виде координатора</td><td>дублирование работы и реактивные петли</td></tr>
+</tbody>
+</table>
+<p>Выбирать пост предлагает по четырём вопросам. Оркестратор или команда — «how long workers need to maintain their context». Оркестратор или шина — «how predictable the workflow structure is». Команда или общее состояние — «whether agents need each other's findings». Шина или общее состояние — «whether work flows as discrete events or accumulates into a shared knowledge base». Shared state — классический blackboard, и у него есть свежая опора: в статье Salemi et al. 2025 года центральный агент вывешивает запросы на общую доску, а подчинённые сами вызываются ответить. На KramaBench и модифицированных DSBench и DA-Code это дало от 13% до 57% относительного прироста сквозного успеха<a class="cite" href="#src-40">40</a>.</p>
+
+<h3>Magentic: менеджер с журналом</h3>
+<p>Подробнее всех специфицирована схема «менеджер плюс исполнители» в Magentic из Microsoft Agent Framework. Она выросла из исследовательской системы Magentic-One, опубликованной в ноябре 2024 года<a class="cite" href="#src-41">41</a>. Менеджер ведёт два журнала: в журнале задачи лежат факты, догадки и план, а журнал прогресса обновляется каждый раунд, и в документации у него пять полей: <code>IsRequestSatisfied</code>, <code>IsInLoop</code>, <code>IsProgressBeingMade</code>, <code>NextSpeaker</code>, <code>InstructionOrQuestion</code><a class="cite" href="#src-10">10</a>.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Magentic в Microsoft Agent Framework (из документации)" data-hl="7-9">
+from agent_framework.orchestrations import MagenticBuilder
+
+workflow = MagenticBuilder(
+    participants=[researcher_agent, coder_agent],
+    intermediate_output_from=[researcher_agent, coder_agent],
+    manager_agent=manager_agent,
+    max_round_count=10,
+    max_stall_count=3,
+    max_reset_count=2,
+).build()
+</script>
+
+<figure class="fig" id="fig-magentic">
+<script type="text/x-mermaid">
+stateDiagram-v2
+  state "План в журнале задачи" as plan
+  state "Ревью плана человеком" as review
+  state "Выбор NextSpeaker" as pick
+  state "Ход участника" as act
+  state "Журнал прогресса" as ledger
+  state "Счётчик застоя +1" as stall
+  [*] --> plan
+  plan --> review: если включено
+  review --> plan: revise
+  review --> pick: approve
+  plan --> pick
+  pick --> act
+  act --> ledger
+  ledger --> pick: прогресс есть
+  ledger --> stall: петля или нет прогресса
+  stall --> pick: не больше max_stall_count
+  stall --> plan: превышен, сброс и новый план
+  ledger --> [*]: IsRequestSatisfied
+</script>
+<figcaption>Цикл менеджера Magentic. Остановка и перепланирование здесь не пожелание в промпте, а поля журнала и счётчики в коде: застой считается по <code>IsInLoop</code> и <code>IsProgressBeingMade</code>, число сбросов ограничено <code>max_reset_count</code>, раундов — <code>max_round_count</code>.</figcaption>
+</figure>
+
+<p>В исходной статье Magentic-One менеджер продолжал, пока счётчик застоя оставался «below a threshold (≤ 2 in our experiments)», а дальше перепланировал. В Agent Framework это настраиваемый <code>max_stall_count</code>, в примере документации 3. На ревью плана человеком отвечают <code>.approve()</code> или <code>.revise(feedback)</code>; в Python оно по умолчанию выключено, в .NET включено. И честное предупреждение от самих авторов: «it is untested how well the Magentic orchestration will perform outside of the original Magentic-One design». Цифры Magentic-One на GAIA к твоей сборке из других агентов не переносятся.</p>
+<p>Журнал прогресса как структуру данных стоит забрать из Magentic и без Microsoft-стека. Режим FM-1.5 «не знает условий остановки» занимает в MAST 12,4% отказов, повтор шагов — 15,7%. Оба лечатся одинаково: вопрос «есть ли прогресс, не крутимся ли мы» задаётся модели каждый раунд в структурированном виде, а решение принимает код со счётчиком.</p>
+
+<h3>План в коде на Python</h3>
+<p>Чтобы держать план в коде, не нужен ни Magentic, ни отдельный рантайм. Документация OpenAI Agents SDK ставит оркестрацию кодом рядом с handoff и агентами-инструментами: «orchestrating via code makes tasks more deterministic and predictable, in terms of speed, cost and performance». Приёмов там четыре: классификация через structured output, цепочка агентов, цикл <code>while</code> с оценщиком и параллельный запуск через <code>asyncio.gather</code><a class="cite" href="#src-14">14</a>. В наброске ниже они собраны вместе.</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Набросок: план в коде на OpenAI Agents SDK (логика проверена на заглушках, с моделью не запускался)" data-hl="27,30-32,36,42">
+import asyncio
+from typing import Literal
+
+from pydantic import BaseModel
+from agents import Agent, Runner
+
+class Plan(BaseModel):
+    kind: Literal["simple", "research"]
+    subquestions: list[str]
+
+class Verdict(BaseModel):
+    passed: bool
+    feedback: str
+
+planner = Agent(name="Planner", instructions="...", output_type=Plan)
+worker = Agent(name="Worker", instructions="...")
+writer = Agent(name="Writer", instructions="...")
+verifier = Agent(name="Verifier", instructions="Критерии: ...", output_type=Verdict)
+
+MAX_WORKERS, MAX_ROUNDS = 4, 3
+
+async def ask(agent: Agent, text: str, timeout: float = 180):
+    result = await asyncio.wait_for(Runner.run(agent, text), timeout)
+    return result.final_output
+
+async def answer(question: str) -> str:
+    plan: Plan = await ask(planner, question)
+    if plan.kind == "simple":
+        return await ask(worker, question)
+    found = await asyncio.gather(
+        *(ask(worker, q) for q in plan.subquestions[:MAX_WORKERS]),
+        return_exceptions=True,
+    )
+    notes = "\n\n".join(f for f in found if isinstance(f, str))
+    task = f"{question}\n\nНаходки:\n{notes}"
+    for _ in range(MAX_ROUNDS):
+        draft = await ask(writer, task)
+        verdict: Verdict = await ask(verifier, draft)
+        if verdict.passed:
+            return draft
+        task += f"\n\nЗамечания проверяющего:\n{verdict.feedback}"
+    return draft  # лимит исчерпан: лучшая попытка уходит человеку
+</script>
+<p>Модель здесь решает только то, что код решить не может: на какие подвопросы разбить задачу и прошёл ли черновик критерии. Сколько воркеров, сколько ждать каждого, сколько раундов проверки и что делать после лимита — константы и ветки, которые прогоняются на фикстурах с подменённым <code>Runner.run</code>. Упавший воркер благодаря <code>return_exceptions=True</code> становится пропущенной находкой, а не падением прогона. Долгие прогоны такого кода кладут в движок durable execution, о нём <a href="#durable">ниже</a>.</p>
+</section>
+
+<section id="frameworks">
+<h2>Фреймворки на сентябрь 2026</h2>
+<p>«The <code>langgraph-supervisor</code> package is no longer actively maintained. Instead use the subagents pattern». Так начинается гайд миграции LangChain, а README библиотеки говорит мягче: «We now recommend using the supervisor pattern directly via tools rather than this library for most use cases»<a class="cite" href="#src-11">11</a>. Последний релиз <code>langgraph-supervisor</code> — 0.0.31 от 19 ноября 2025 года, <code>langgraph-swarm</code> — 0.1.0 от 4 декабря 2025-го<a class="cite" href="#src-32">32</a>. AutoGen в режиме поддержки: «will not receive new features… New users should start with Microsoft Agent Framework»<a class="cite" href="#src-10">10</a>, а Agent Framework 1.0 вышел в GA 2 апреля 2026 года. Swarm заменён Agents SDK. Мультиагентные библиотеки первого поколения ушли в поддержку, и почти все фреймворки сошлись на одном: сабагент — это инструмент, который ты пишешь сам, а handoff — отдельный примитив для передачи разговора.</p>
+<table class="wide">
+<thead><tr><th>Фреймворк</th><th>Версия на 30.09.2026</th><th>Как координирует</th><th>Долговечность</th></tr></thead>
+<tbody>
+<tr><th>LangGraph / LangChain</th><td>1.2.12 / 1.4.3</td><td>сабагенты как тулы через <code>create_agent</code>, handoffs через <code>Command</code>, явный граф <code>StateGraph</code></td><td>чекпойнтер, <code>interrupt()</code></td></tr>
+<tr><th>OpenAI Agents SDK</th><td>0.22.3</td><td><code>Agent.as_tool()</code> и <code>handoff()</code></td><td>durable pending input в <code>RunState</code> с 0.20</td></tr>
+<tr><th>Google ADK</th><td>2.10.0</td><td><code>sub_agents</code> с режимами <code>chat</code> / <code>task</code> / <code>single_turn</code>, графовый Workflow Runtime</td><td>рецепт с Temporal</td></tr>
+<tr><th>Microsoft Agent Framework</th><td>1.19.0</td><td>Sequential, Concurrent, Group Chat, Handoff, Magentic</td><td>чекпойнты, пауза и возобновление</td></tr>
+<tr><th>CrewAI</th><td>1.15.23</td><td>процессы только <code>sequential</code> и <code>hierarchical</code>, плюс Flows</td><td>—</td></tr>
+<tr><th>Pydantic AI</th><td>2.52.0</td><td><code>SubAgents</code> с <code>delegate_task</code>, программный hand-off, <code>pydantic-graph</code></td><td>8 движков: Temporal, DBOS, Prefect, Restate и другие</td></tr>
+<tr><th>Agno</th><td>3.0.11</td><td><code>Team</code> с режимами <code>coordinate</code>, <code>route</code>, <code>broadcast</code>, <code>tasks</code></td><td>долговечная очередь в AgentOS с 3.0</td></tr>
+<tr><th>Mastra</th><td>1.72.0 (npm)</td><td>handoffs, workflows, supervisor, council</td><td>—</td></tr>
+<tr><th>Claude Agent SDK</th><td>0.2.163 (Python)</td><td>сабагенты; инструмент <code>Workflow</code> в TypeScript SDK с 0.3.149</td><td>повтор workflow</td></tr>
+</tbody>
+</table>
+<p>Версии взяты из PyPI и npm на 30 сентября 2026 года<a class="cite" href="#src-32">32</a>. За полгода вышли ADK 2.0, Pydantic AI 2.0 (23 июня), Agno 3.0 (24 августа) и AG2 1.0 — общинный проект, который не надо путать с Microsoft AutoGen. Иерархический процесс CrewAI документация описывает так: «Tasks are not pre-assigned; the manager allocates tasks to agents based on their capabilities, reviews outputs, and assesses task completion»<a class="cite" href="#src-42">42</a>. План там целиком у модели-менеджера, и влияешь ты на него в основном промптом.</p>
+
+<h3>Когда граф нельзя менять на ходу</h3>
+<p>18 сентября 2026 года команда FrontierAI из Сбера опубликовала на Хабре разбор того, как они пытались воспроизвести G-Designer (подбор топологии агентов графовой нейросетью) внутри LangGraph<a class="cite" href="#src-43">43</a>. Упёрлись в модель исполнения:</p>
+<div class="note field">
+<blockquote>В LangGraph структура компилируется перед выполнением. Условные переходы и Command(goto=...) позволяют менять ход выполнения, но выбор всё равно происходит среди заранее описанных узлов и переходов. Если оптимизатор выдаёт новую матрицу смежности, граф приходится собирать и компилировать заново.
+<footer>— Виталий Белов, FrontierAI, <a href="https://habr.com/ru/companies/sberbank/articles/1083832/">блог Сбера на Хабре, 18 сентября 2026</a></footer></blockquote>
+<p>Динамическая маршрутизация (выбрать путь в заранее известном графе) и изменение топологии (поменять сам граф посреди запуска и не потерять сделанное) — разные требования к среде исполнения. Для большинства прикладных задач хватает первого.</p>
+</div>
+<p>Они написали свой фреймворк gMAS поверх <code>rustworkx</code>, где разделены две сущности: «RoleGraph хранит текущее устройство системы: агентов, связи, веса, условия переходов», а «ExecutionPlan описывает, как этот граф должен быть выполнен в конкретном запуске». Интереснее архитектуры оказались замеры: команда по очереди включала механизмы на 68 сочетаниях модели, набора задач (BIG-Bench Hard, GSM8K, MMLU-Pro) и топологии, на открытых моделях от qwen3.5-4b до gpt-oss-120b.</p>
+
+<figure class="fig" id="fig-gmas">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Насколько механизм gMAS сокращает расход токенов", "unit": "%", "decimals": 1,
+ "emphasis": ["Досрочная остановка"],
+ "rows": [
+  ["Досрочная остановка", 52.6, "время −45%, агентов в среднем 2 вместо 5"],
+  ["Отключённые узлы", 44.4, "время −32,1%"],
+  ["Проверка достижимости", 23.1, "время −34,3%"],
+  ["Адаптивное изменение топологии", 21.2, "время −18,5%"],
+  ["Выбор между моделями", 4.6, "время +4,2%"]
+ ],
+ "note": "Сбер, FrontierAI, Хабр, 18 сентября 2026. 68 сочетаний модели, набора задач и топологии, по 50 задач. Механизм «скрытые каналы» увеличил расход на 6,2%."}
+</script>
+<figcaption>Больше всего экономит самое простое: не вызывать агентов, когда ответ уже есть. Графовая оптимизация топологии дала меньше, чем досрочная остановка и отключение ненужных узлов.</figcaption>
+</figure>
+<p>Вывод авторов прямой: «Самым эффективным механизмом оказался самый простой: вовремя остановиться». Досрочная остановка сократила среднее число выполненных агентов с пяти до двух. И ещё один результат, который стоит повесить над столом. Про своё воспроизведение G-Designer авторы пишут: «алгоритм примерно в 95% случаев сворачивал систему в одну вершину. Формально граф становился дешевле, но от мультиагентности в нём почти ничего не оставалось». Оптимизатор, которому дали только стоимость, решил задачу координации удалением координации.</p>
+
+<h3>Что выбрать бэкендеру на Python</h3>
+<p>Если ты на Claude и задача живёт рядом с кодом, начинай с Claude Agent SDK: сабагенты и лимиты там те же, что ты каждый день видишь в Claude Code. Если нужна независимость от вендора и код без магии, бери Pydantic AI или OpenAI Agents SDK: у обоих «агент как инструмент» — обычная функция, план в коде пишется на <code>asyncio</code>, а у OpenAI SDK с версии 0.21 есть <code>agents.testing</code> для детерминированных тестов<a class="cite" href="#src-31">31</a>. LangGraph бери, когда правда нужен явный граф состояний с чекпойнтами и прерываниями. Иерархический процесс CrewAI годится для прототипа, но не там, где нужно контролировать, кто принимает решение. Новый проект на AutoGen, <code>langgraph-supervisor</code> или Swarm не начинай. Если команда уже живёт на одном стеке, цена смены фреймворка обычно выше разницы между ними.</p>
+</section>
+
+<section id="claude-code">
+<h2>Что из этого уже есть у тебя в терминале</h2>
+<p>В документации Claude Code есть таблица, которая раскладывает его способы запустить многошаговую задачу по тому же вопросу, «кто держит план»<a class="cite" href="#src-15">15</a>. В переводе она выглядит так:</p>
+<table class="wide">
+<thead><tr><th></th><th>Сабагенты</th><th>Скиллы</th><th>Agent teams</th><th>Workflows</th></tr></thead>
+<tbody>
+<tr><th>Кто решает, что дальше</th><td>Claude, ход за ходом</td><td>Claude по инструкции</td><td>ведущий агент, ход за ходом</td><td>скрипт</td></tr>
+<tr><th>Где промежуточные результаты</th><td>окно Claude</td><td>окно Claude</td><td>общий список задач</td><td>переменные скрипта</td></tr>
+<tr><th>Масштаб</th><td>несколько поручений за ход</td><td>как у сабагентов</td><td>несколько долгоживущих сессий</td><td>десятки и сотни агентов за прогон</td></tr>
+<tr><th>Прерывание</th><td>ход начинается заново</td><td>ход начинается заново</td><td>тиммейты продолжают работать</td><td>прогон можно возобновить в той же сессии</td></tr>
+</tbody>
+</table>
+<p>Четыре колонки — четыре топологии из этой главы. Сабагенты — оркестратор и воркеры, план у модели. Agent teams — команда с общим состоянием и сообщениями. Workflows — план в коде. Скиллы — один агент, который подгружает специализацию, та самая альтернатива мультиагентности.</p>
+
+<h3>Сабагенты и лимиты</h3>
+<p>Устройство сабагентов и значения лимитов по умолчанию разобраны в <a href="../12-deep-agents/index.html">главе 12</a>. Без лимитов ведущий агент сам решает, сколько денег потратить, а лимита по деньгам по умолчанию нет. Документация Agent SDK объясняет, почему это стало важнее: «Claude Opus 5 delegates to subagents more readily than earlier models»<a class="cite" href="#src-18">18</a>. Та строка из вводки главы, «не вызывай Agent, пока не попросят», есть только в пресете системного промпта <code>claude_code</code>. Со своим промптом её нет. Лимиты документация советует ставить в любом случае: инструкция лишь направляет модель, а лимиты применяются независимо от её решений. Пример из документации отключает вложенность, пускает не больше пяти сабагентов одновременно и останавливает запрос на 5 долларах:</p>
+<script type="text/plain" class="code" data-lang="python" data-title="Лимиты сабагентов в Claude Agent SDK (из документации, комментарии сокращены)" data-hl="12-16">
+import asyncio
+from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+
+
+async def main():
+    try:
+        async for message in query(
+            prompt="Audit every service in this repo for unhandled promise rejections",
+            options=ClaudeAgentOptions(
+                allowed_tools=["Read", "Grep", "Glob", "Agent"],
+                # env is merged on top of the inherited environment
+                env={
+                    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1",
+                    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "5",
+                },
+                max_budget_usd=5.0,
+            ),
+        ):
+            if isinstance(message, ResultMessage):
+                print(f"{message.subtype}: ${message.total_cost_usd}")
+    except Exception as error:
+        print(f"Session ended with an error: {error}")
+
+
+asyncio.run(main())
+</script>
+<p>На лимите параллельности модель получает результат инструмента <code>Concurrent subagent limit reached</code> и ждёт, пока кто-то закончит. На лимите денег Claude Code отказывает с <code>Budget limit reached</code>, останавливает фоновых сабагентов и завершает запрос с подтипом <code>error_max_budget_usd</code>. Так всё работает начиная с TypeScript SDK v0.3.219 и Python SDK v0.2.127.</p>
+
+<h3>Agent teams: команда на файлах</h3>
+<p>Agent teams на сентябрь 2026 года — экспериментальная функция, выключенная по умолчанию: её включает переменная <code>CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1</code><a class="cite" href="#src-22">22</a>. Тиммейты — полноценные сессии Claude Code, которые пишут друг другу в почтовые ящики-файлы и разбирают задачи из общего списка с зависимостями, а «Task claiming uses file locking to prevent race conditions when multiple teammates try to claim the same task simultaneously». Это blackboard с блокировками, собранный из файловой системы; пути к файлам есть в <a href="../12-deep-agents/index.html">главе 12</a>.</p>
+<p>Для проектировщика важнее другое. Размер команды: «Start with 3-5 teammates», по 5–6 задач на каждого, и «Three focused teammates often outperform five scattered ones» — та же граница в три-четыре агента, что у Google. Проверяющий встраивается кодом, а не промптом: хуки <code>TeammateIdle</code>, <code>TaskCreated</code> и <code>TaskCompleted</code> с кодом выхода 2 возвращают тиммейта к работе или не дают закрыть задачу. Ограничения: команды работают только в интерактивной сессии, не с <code>-p</code> и не в Agent SDK; тиммейты наследуют режим разрешений ведущего, включая <code>--dangerously-skip-permissions</code>; а план тиммейта из режима планирования одобряет не человек: «Claude Code approves the plan in the lead's session as soon as the request arrives, without the lead reviewing it».</p>
+
+<h3>Dynamic workflows: план переезжает в скрипт</h3>
+<p>Для десятков и сотен агентов Claude Code предлагает другой механизм: Claude пишет скрипт на JavaScript из вызовов <code>agent()</code>, <code>parallel()</code> и <code>pipeline()</code>, а рантайм исполняет его вне окна разговора. Это тот же план в коде, что в Python-наброске выше, только скрипт пишет модель, а не ты. Пример скрипта и лимиты рантайма приведены в <a href="../12-deep-agents/index.html">главе 12</a>. Для топологии важны две детали: <code>schema</code> в вызове <code>agent()</code> заставляет сабагента вернуть JSON нужной формы, так что передача идёт артефактом, а не пересказом, а упавший или остановленный сабагент возвращает <code>null</code>, и скрипт должен это пережить<a class="cite" href="#src-15">15</a>.</p>
+<p>Отдельно продумано, как такой прогон переживает остановку. «Claude Code makes <code>Date.now()</code>, <code>Math.random()</code>, and a no-argument <code>new Date()</code> throw inside the script, so that a relaunched run repeats the same <code>agent()</code> calls». Это то же правило детерминизма, на котором стоит Temporal, о нём <a href="#durable">ниже</a>.</p>
+
+<figure class="fig wide" id="fig-workflow-replay">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant C as Claude
+  participant W as Рантайм workflow
+  participant A as agent A
+  participant B as agent B
+  participant D as agents C и D
+  C->>W: скрипт с agent() и pipeline()
+  W->>A: запуск A
+  W->>B: запуск B
+  W->>D: запуск C и D
+  A-->>W: результат A сохранён
+  B-->>W: ошибка
+  Note over C,W: перезапуск тем же скриптом
+  W->>W: A берётся из сохранённого
+  W->>B: B запускается заново
+  W->>D: C и D тоже заново, они стартовали после B
+</script>
+<figcaption>Повтор workflow после сбоя. Рантайм проходит агентов в порядке запуска: завершённые до первого упавшего отдают сохранённый результат, а упавший и все, кто стартовал после него, работают снова, даже если успели закончить.</figcaption>
+</figure>
+
+<p>Агенты одного прогона с одинаковыми моделью, уровнем усилий, типом, инструментами, схемой и рабочей директорией строят одинаковый префикс и читают кеш друг друга. Посреди прогона ввода от пользователя нет, а предупреждение <code>Large workflow</code> о большом прогоне ничего не останавливает, так что размер прогона ограничиваешь ты сам, в тексте скрипта или в просьбе к Claude.</p>
+<p>В блоге Anthropic от 2 июня 2026 года, где команда Claude Code рассказала о workflows, названы три отказа одиночного длинного контекста, которые они лечат<a class="cite" href="#src-23">23</a>: агентная лень («addressing 35 of the 50 items in a security review»), пристрастие к собственному результату при самопроверке и дрейф цели, особенно после компакции. И шесть паттернов: classify-and-act, fan-out-and-synthesize, adversarial verification, generate-and-filter, tournament и loop-until-done. Фраза оттуда же подходит эпиграфом ко всей главе: «parallelism and specialization have to earn their coordination cost».</p>
+
+<div class="note practice"><p>За вечер: возьми повторяющуюся задачу из своего Python-репозитория, например «найти все эндпоинты FastAPI без проверки прав», и прогони её тремя способами — одной сессией, сабагентами и workflow с <code>pipeline()</code> по списку файлов. Для каждого прогона запиши токены и время из <code>/workflows</code> и <code>/cost</code> и число эндпоинтов, пропущенных относительно ручной проверки. Потом открой сохранённый скрипт из <code>.claude/workflows/</code>: это самый наглядный пример оркестрации в коде, который у тебя есть.</p></div>
+</section>
+
+<section id="managed">
+<h2>Координатор как API</h2>
+<p>В Claude Managed Agents та же схема «координатор и исполнители» доступна как API. Функция в бете, заголовок <code>managed-agents-2026-04-01</code>, и координатор создаётся одним запросом<a class="cite" href="#src-34">34</a>:</p>
+<script type="text/plain" class="code" data-lang="bash" data-title="Создание координатора (из документации Managed Agents)" data-hl="4,16-22">
+coordinator=$(curl -fsS https://api.anthropic.com/v1/agents \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "anthropic-beta: managed-agents-2026-04-01" \
+  -H "content-type: application/json" \
+  -d @- <<EOF
+{
+  "name": "Engineering Lead",
+  "model": "claude-opus-5-5",
+  "system": "You coordinate engineering work. Delegate code review to the reviewer agent and test writing to the test agent.",
+  "tools": [
+    {
+      "type": "agent_toolset_20260401"
+    }
+  ],
+  "multiagent": {
+    "type": "coordinator",
+    "agents": [
+      {"type": "agent", "id": "$REVIEWER_AGENT_ID"},
+      {"type": "agent", "id": "$TEST_WRITER_AGENT_ID"}
+    ]
+  }
+}
+EOF
+)
+</script>
+<p>Каждый агент в сессии работает в своём треде: «a context-isolated event stream with its own conversation history». Треды живут долго. Координатор может написать агенту повторно, и тот помнит свои прошлые ходы, как тиммейт в agent teams. Ограничения жёсткие: делегировать можно только на один уровень, в ростере до 20 разных агентов, одновременно до 25 тредов. В ростер можно положить <code>{"type": "self"}</code>, чтобы координатор запускал копии себя, и одного советника <code>{"type": "advisor", "model": …}</code>.</p>
+
+<figure class="fig wide" id="fig-managed">
+<script type="text/x-mermaid">
+sequenceDiagram
+  participant Cl as Твой клиент
+  participant P as Основной тред, координатор
+  participant Rv as Тред reviewer
+  participant Tw as Тред test writer
+  Cl->>P: сообщение пользователя в сессию
+  P->>Rv: send_to_agent, задача на ревью
+  P-->>Cl: session.thread_created, agent.thread_message_sent
+  P->>Tw: send_to_agent, задача на тесты
+  Rv-->>P: отчёт ревьюера
+  P-->>Cl: agent.thread_message_received от reviewer
+  Tw-->>P: отчёт по тестам
+  P-->>Cl: agent.thread_message_received от test writer
+  P-->>Cl: session.thread_status_idle со stop_reason
+</script>
+<figcaption>Что видит клиент в потоке основного треда. Разговоры исполнителей идут в их тредах, а в основной поток приходят события о тредах и сообщениях между ними. Поток одного треда читается по адресу <code>/v1/sessions/{session_id}/threads/{thread_id}/stream</code>.</figcaption>
+</figure>
+
+<p>Одна фраза из документации важнее остальных: «All agents share the same sandbox, filesystem, and vault credentials… Tools, MCP servers, and context are not shared». Разделение инструментов здесь не разделяет права: ревьюер без инструмента записи работает в той же файловой системе и с теми же секретами, что и агент, который пишет код. Если один агент физически не должен мочь то, что может другой, разноси их по разным сессиям или сервисам.</p>
+</section>
+
+<section id="durable">
+<h2>Оркестратор, который переживает падение</h2>
+<p>«The loop is a Workflow, each model call and tool call is an Activity, and a crash resumes the conversation instead of restarting it». Так Temporal описывает, как в него ложится агентный цикл<a class="cite" href="#src-44">44</a>. Для мультиагентной системы это важнее, чем для одного агента. Упавший оркестратор теряет план, журнал прогресса и знание о том, какие из двадцати сабагентов уже вернули результат, и запуск с нуля означает повторную оплату всей сделанной работы.</p>
+<p>Anthropic в ресёрч-системе решала это двумя способами. Когда инструмент падает, агент продолжает с места сбоя, а не с начала. А при выкатке нового кода используются «rainbow deployments to avoid disrupting running agents, by gradually shifting traffic»: старая и новая версии работают одновременно, пока не закончатся прогоны на старой<a class="cite" href="#src-2">2</a>. Для бэкендера это знакомая задача о долгих фоновых джобах во время деплоя, только джоба здесь часами разговаривает с моделью.</p>
+<p>Durable execution за 2026 год стало встроенной функцией большинства фреймворков. Pydantic AI поддерживает восемь движков, среди них Temporal, DBOS и Restate, и предупреждает о подвохе: «A tool running in a Temporal activity receives a copy of the run context, so <code>usage=ctx.usage</code> does not carry the delegate's usage back to the parent run»<a class="cite" href="#src-35">35</a>. Лимит токенов на родителе перестаёт видеть траты делегатов, и счётчик надо собирать отдельно. OpenAI Agents SDK в 0.20.0 от 11 августа 2026 года добавил «durable pending input» в <code>RunState</code><a class="cite" href="#src-31">31</a>. Agno 3.0 принёс долговечную фоновую очередь с дедупликацией по заголовку <code>Idempotency-Key</code><a class="cite" href="#src-12">12</a>. В LangGraph чекпойнтер получает только внешний граф, вложенные <code>create_agent</code> наследуют его во время исполнения, а <code>thread_id</code> передаётся во внешний вызов<a class="cite" href="#src-11">11</a>.</p>
+<p>Общий принцип во всех этих системах — детерминизм кода оркестрации. Движок восстанавливает состояние, заново проигрывая код оркестратора и подставляя сохранённые результаты вызовов. Если код между вызовами читает часы, случайные числа или сеть, повтор пойдёт другим путём и сохранённые результаты не сойдутся с новыми вызовами. Поэтому Temporal держит всё недетерминированное в activities, а Claude Code запрещает <code>Date.now()</code> и <code>Math.random()</code> в скрипте workflow. Вызов модели всегда activity, а решение «кого звать дальше» принимается либо в детерминированном коде, либо внутри такого вызова, но не между ними.</p>
+</section>
+
+<section id="observe-cost">
+<h2>Трасса и счёт</h2>
+<p>У мультиагентного прогона трасса — дерево, а не строка. Корень — запуск всей оркестрации, под ним агенты, под агентами их вызовы инструментов и их собственные сабагенты. В OpenTelemetry для этого есть семантические конвенции GenAI: операции <code>create_agent</code>, <code>invoke_agent</code>, <code>invoke_workflow</code> и <code>execute_tool</code>, имена спанов вида <code>invoke_agent {gen_ai.agent.name}</code>, атрибуты <code>gen_ai.agent.id</code>, <code>gen_ai.agent.name</code> и <code>gen_ai.conversation.id</code><a class="cite" href="#src-45">45</a>.</p>
+
+<figure class="fig wide" id="fig-otel">
+<script type="text/x-mermaid">
+flowchart TD
+  wf["invoke_workflow research_run"]:::accent --> lead["invoke_agent lead"]
+  lead --> t0["execute_tool web_search"]
+  lead --> sa["invoke_agent researcher-1"]
+  lead --> sb["invoke_agent researcher-2"]
+  sa --> t1["execute_tool fetch_url"]
+  sa --> t2["execute_tool fetch_url"]
+  sb --> t3["execute_tool fetch_url"]
+  lead --> v["invoke_agent verifier"]:::ok
+  attrs["gen_ai.agent.name, gen_ai.agent.id,<br/>gen_ai.conversation.id на каждом спане"]:::mute -.-> sa
+</script>
+<figcaption>Набросок трассы ресёрч-прогона по конвенциям OTel GenAI. Родительский спан у каждого агента — тот, кто его вызвал, поэтому по дереву видно, какой сабагент какие инструменты вызывал и сколько это стоило. Имена агентов и инструментов условные.</figcaption>
+</figure>
+
+<p>Главная оговорка — статус: всё это Development в отдельном репозитории <code>semantic-conventions-genai</code>, созданном 5 мая 2026 года, и имена атрибутов ещё могут поменяться. Если OTel у тебя нет, дерево собирается и без него: в Managed Agents у каждого треда есть <code>parent_thread_id</code><a class="cite" href="#src-34">34</a>, в Agno 3.0 у каждого прогона — <code>parent_run_id</code><a class="cite" href="#src-12">12</a>, а в Claude Agent SDK сообщения изнутри сабагента несут поле <code>parent_tool_use_id</code><a class="cite" href="#src-18">18</a>.</p>
+<p>Зачем дерево, объяснила Anthropic: «Adding full production tracing let us diagnose why agents failed and fix issues systematically»<a class="cite" href="#src-2">2</a>. Оценку ресёрч-системы там начинали примерно с 20 реалистичных запросов и LLM-судьи с одним промптом, но люди всё равно читали ответы и нашли то, что судья пропускал, например предпочтение SEO-оптимизированных источников авторитетным. Как собирать такие датасеты и калибровать судью, разобрано в <a href="../17-evals/index.html">главе 17</a>. Для мультиагентной системы к этому добавляется одно: проверяй не только итог, но и промежуточные передачи, потому что по одному итогу виноватого, как показал Who&amp;When, находят в половине случаев.</p>
+
+<h3>Из чего складывается счёт</h3>
+<p>Стоимость агента — сумма по всем его ходам: свежий вход, чтение кеша, запись в кеш и выход, каждое по своей цене. У системы — сумма по всем агентам. На Opus 5.5 в сентябре 2026 года это $4 за миллион входных токенов, $20 за миллион выходных и $0,20 за миллион прочитанных из кеша; запись в кеш стоит 1,25 цены входа при TTL 5 минут и 2 цены при TTL в час. В посте Anthropic это сказано одной фразой: «An output token costs 100 times a cache read»<a class="cite" href="#src-46">46</a>.</p>
+
+<figure class="fig" id="fig-tokens">
+<script type="application/json" class="chart">
+{"type": "hbar", "title": "Токены на задачу относительно чата", "unit": "×", "emphasis": ["Мультиагентная система"],
+ "rows": [["Чат", 1], ["Один агент", 4], ["Мультиагентная система", 15]],
+ "note": "Anthropic, «How we built our multi-agent research system», 13 июня 2025, внутренние данные. В январе 2026 года Anthropic оценила мультиагентные системы в 3–10 раз дороже одиночного агента на равных задачах."}
+</script>
+<figcaption>Мультиагентная система тратит примерно в 15 раз больше токенов, чем чат, и примерно в 3,75 раза больше одиночного агента. Это согласуется с оценкой 2026 года в 3–10 раз относительно одиночного агента.</figcaption>
+</figure>
+
+<p>Два множителя в пересказах часто путают. 15× из поста 2025 года посчитаны относительно чата, одиночный агент там сам тратит в 4 раза больше чата. 3–10× из поста 2026 года посчитаны относительно одиночного агента. Фраза «мультиагентные системы тратят в 15 раз больше одиночного агента» неверна.</p>
+<p>Больше всего съедает дублирование контекста: каждый свежий сабагент заново отправляет системный промпт, инструменты и <code>CLAUDE.md</code> и строит свой кеш. К этому добавляются сообщения координации и число ходов, которое у Google росло как <code>(n + 0.5)^1.724</code>. Снижать счёт начинай с модели сабагента. «Every subagent that inherits the main model inherits its price too», поэтому поиск и чтение выноси на Haiku или Sonnet, а модель пиши в определении сабагента: по документации она перекрывает переменную <code>CLAUDE_CODE_SUBAGENT_MODEL</code><a class="cite" href="#src-46">46</a>. Обратный порядок включает <code>CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1</code> (с v2.1.257): тогда переменная побеждает определения, и все делегаты разом садятся на одну модель<a class="cite" href="#src-22">22</a>. Дальше идут жёсткие лимиты в коде: <code>max_budget_usd</code> в Claude Agent SDK, <code>UsageLimits</code> с <code>cost_limit</code> и <code>total_tokens_limit</code> в Pydantic AI<a class="cite" href="#src-35">35</a>, <code>max_round_count</code> и <code>max_stall_count</code> в Magentic. И стабильный префикс, чтобы кеш вообще срабатывал.</p>
+</section>
+
+<section id="rules">
+<h2>Как выбрать топологию</h2>
+<p>Первое правило скучное, и именно его нарушают чаще всего: начни с одного агента с хорошими инструментами и измерь его. Остальные правила имеют смысл только после этого замера.</p>
+<ol class="steps">
+  <li><b>Сначала один агент.</b> Tool Search, компакция и скиллы решают часть проблем, ради которых заводят второго агента<a class="cite" href="#src-3">3</a><a class="cite" href="#src-24">24</a>.</li>
+  <li><b>Режь по контексту, а не по ролям.</b> Граница проходит там, где контекст правда независим: разные направления поиска, компоненты с чистым API, проверка чёрным ящиком<a class="cite" href="#src-3">3</a>.</li>
+  <li><b>Смотри на базовый успех и число инструментов.</b> Одиночный агент решает больше 45% задач при небольшом числе инструментов — при равном бюджете мультиагентность скорее навредит. С полутора десятками инструментов решает eval<a class="cite" href="#src-16">16</a>.</li>
+  <li><b>Читатели параллельно, писатель один.</b> Ресёрч и анализ режутся на воркеров, планирование и большинство правок кода остаются одному агенту. Если параллельные правки неизбежны, давай каждому свою копию репозитория (в Claude Code это <code>isolation: worktree</code>), атомарный захват задач и отдельного агента для слияний<a class="cite" href="#src-4">4</a><a class="cite" href="#src-5">5</a><a class="cite" href="#src-6">6</a><a class="cite" href="#src-18">18</a>.</li>
+  <li><b>Без проверяющего параллельных агентов не запускай.</b> 17,2× против 4,4× усиления ошибок; проверяющему нужны явные критерии и чистый контекст<a class="cite" href="#src-16">16</a><a class="cite" href="#src-9">9</a>.</li>
+  <li><b>Больше трёх-четырёх агентов — план в код.</b> При фиксированном бюджете мысль на агента истончается; десяткам агентов нужен скрипт или граф, а не модель, решающая ход за ходом<a class="cite" href="#src-16">16</a><a class="cite" href="#src-15">15</a>.</li>
+  <li><b>Остановку проектируй как данные.</b> Лимит раундов, счётчик застоя, порог сходимости, выделенный агент, который решает, что готово<a class="cite" href="#src-9">9</a><a class="cite" href="#src-10">10</a>.</li>
+  <li><b>Лимиты — в коде, не в промпте.</b> Новые модели делегируют охотнее, а инструкция лишь направляет модель<a class="cite" href="#src-18">18</a>.</li>
+  <li><b>Выход другого агента — недоверенный ввод.</b> Права ограничивай на уровне агента там, где платформа это позволяет, и помни, что общие секреты сессии общие для всех<a class="cite" href="#src-34">34</a><a class="cite" href="#src-38">38</a>.</li>
+  <li><b>Одинаковые агенты ошибаются одинаково.</b> Там, где нужна независимость мнений, разнообразь модели, промпты или данные<a class="cite" href="#src-28">28</a><a class="cite" href="#src-21">21</a>.</li>
+</ol>
+
+<figure class="fig wide" id="fig-decision">
+<script type="text/x-mermaid">
+flowchart TD
+  q1["Один агент с хорошими<br/>тулами справляется?"]:::plain -- да --> single["Один агент"]:::ok
+  q1 -- нет --> q2["Подзадачи независимы<br/>и в основном читают?"]:::plain
+  q2 -- нет --> q3["Мешает мусор в контексте<br/>или 20+ тулов?"]:::plain
+  q3 -- да --> iso["Tool Search, компакция, скиллы,<br/>сабагент-фильтр"]
+  q3 -- нет --> single
+  q2 -- да --> q4["Одиночный агент<br/>решает больше 45%?"]:::plain
+  q4 -- нет --> q5["Агентов больше 3–4<br/>или десятки элементов?"]:::plain
+  q4 -- да --> q6["У задачи<br/>15+ тулов?"]:::plain
+  q6 -- "да, решает eval" --> q5
+  q6 -- нет --> single2["Один агент"]:::ok
+  q5 -- да --> wf["План в коде:<br/>workflow или граф"]:::accent
+  q5 -- нет --> orch["Оркестратор и воркеры"]:::accent
+  wf --> guard["Проверяющий, один писатель,<br/>лимиты и условия остановки"]:::warn
+  orch --> guard
+</script>
+<figcaption>Порядок вопросов при выборе топологии. Три ветви ведут к одному агенту, и так задумано: мультиагентность остаётся там, где задача режется на независимых читателей и одиночный агент не справляется. Исключение из порога 45% — задачи с большим числом инструментов.</figcaption>
+</figure>
+
+<p>Где это перестаёт работать. Если бюджет не ограничен и важна полнота, как в поиске уязвимостей у Frontier Red Team, широкий рой находит больше одиночных агентов, а правило про 45% получено при равном бюджете и к такой постановке не относится. Если у тебя разные команды отвечают за разных агентов в разных сервисах, топология определяется оргструктурой, и тогда разговор уже о протоколе, <a href="../07-a2a/index.html">глава 7</a>. Во всех остальных случаях второй агент должен сначала показать на твоём eval, что он окупается.</p>
+</section>
+
+<section id="selfcheck" class="quiz">
+<h2>Проверь себя</h2>
+<details><summary>Ресёрч-система Anthropic и клон Flappy Bird из поста Cognition устроены одинаково: ведущий делит задачу между параллельными сабагентами. Почему первая выигрывает, а второй проваливается?</summary><p>Сабагенты ресёрча читают и приносят независимые факты, которые складываются без конфликта. Сабагенты Flappy Bird пишут части одного артефакта и принимают неявные решения о стиле, которые сталкиваются при сборке. Решает не топология, а то, пишут ли параллельные агенты в общее.</p></details>
+<details><summary>Коллега пишет в дизайн-доке: «Мультиагентные системы тратят в 15 раз больше токенов, чем один агент». Что не так?</summary><p>15× у Anthropic посчитаны относительно чата, а одиночный агент сам тратит примерно в 4 раза больше чата. Относительно одиночного агента выходит около 3,75×, и это согласуется с оценкой Anthropic 2026 года: 3–10× на равных задачах.</p></details>
+<details><summary>Одиночный агент решает 60% твоих задач. Стоит ли пробовать оркестратор с тремя воркерами при том же бюджете?</summary><p>Скорее нет. В замере Google при равном бюджете задачи, где одиночный агент решает больше 45%, от дополнительных агентов теряют: на SWE-bench Verified все варианты потеряли от 2,1% до 14,9%. Исключение — задачи с полутора десятками инструментов, для них статья советует Decentralized и при 63% у одиночного агента. В любом случае решает eval, а не ожидание.</p></details>
+<details><summary>Почему Independent усиливает ошибки в 17,2 раза, а Centralized в 4,4, и почему из этого не следует «всегда ставь оркестратор»?</summary><p>В Independent агрегатор склеивает ответы без критического чтения, и ошибка одного агента проходит в итог. В Centralized оркестратор читает результаты и часть ошибок останавливает. Но Centralized платит 285% накладных расходов, проигрывает 50,3% на PlanCraft, а в третьей версии статьи усиление ошибок незначимо после учёта накладных расходов. Проверяющий нужен, оркестратор — не всегда.</p></details>
+<details><summary>После handoff в OpenAI Agents SDK агент возвратов путает детали из начала разговора. Что он видит по умолчанию и чем это настраивается?</summary><p>По умолчанию он видит всю предыдущую историю, как будто сам вёл разговор. Свернуть её в сводку можно опциональной бетой <code>nest_handoff_history</code> или своим <code>handoff_history_mapper</code>, почистить точечно — <code>input_filter</code> у конкретного handoff, например убрать прошлые вызовы инструментов.</p></details>
+<details><summary>Handoff на агента возвратов принимает <code>order_id</code>. Почему проверку «заказ принадлежит пользователю» нельзя делать в <code>is_enabled</code>?</summary><p><code>is_enabled</code> вычисляется, когда SDK готовит список доступных handoff, до того как модель вернула аргументы. Он решает только, показывать ли инструмент. Проверка значения аргумента возможна в начале <code>on_handoff</code>, где аргументы уже известны.</p></details>
+<details><summary>В LangGraph сабагент после handoff просит у пользователя данные, а ответ пользователя попадает стартовому агенту. Что происходит и как это лечится?</summary><p>Каждое новое сообщение пользователя запускает граф заново от <code>START</code>, а то, что активным был сабагент, нигде не сохранено. Нужно явное поле состояния вроде <code>current_step</code> или <code>active_agent</code>, которое переживает ход пользователя, либо пауза через <code>interrupt()</code>.</p></details>
+<details><summary>Чем форк в Claude Code дешевле свежего сабагента, и когда всё равно стоит взять свежего?</summary><p>У форка те же системный промпт и инструменты, что у родителя, поэтому его первый запрос читает кеш родителя. Но форк получает и всю историю с мусором. Если смысл сабагента в изоляции, например он читает шумные результаты поиска, нужен свежий.</p></details>
+<details><summary>Почему в скрипте dynamic workflow <code>Date.now()</code> бросает исключение? Что произойдёт при перезапуске, если из агентов A, B, C, D, запущенных по порядку, упал B?</summary><p>Перезапуск проигрывает скрипт заново и подставляет сохранённые результаты, поэтому скрипт должен вызывать тех же агентов в том же порядке, а часы и случайные числа это ломают. A вернёт сохранённый результат, а B, C и D запустятся заново, потому что стартовали после упавшего, даже если C и D успели закончить.</p></details>
+<details><summary>В Managed Agents ревьюеру не дали инструмента записи. Можно ли считать, что он не прочитает секреты и не испортит файлы?</summary><p>Нет. Все агенты сессии делят сэндбокс, файловую систему и учётные данные из vault; раздельные у них только инструменты, MCP-серверы и контекст. Чтобы права действительно различались, агентов разносят по разным сессиям или сервисам.</p></details>
+<details><summary>Почему голосование пяти одинаковых агентов даёт меньше надёжности, чем кажется?</summary><p>У одинаковых агентов общие контекст, обвязка и модель, поэтому они склонны ошибаться одинаково: в эксперименте Anthropic 18 из 30 агентов выбрали одно имя ветки. Перепроверки дебатов показали, что устойчиво помогает только разнородность моделей, так что независимость голосов создают руками.</p></details>
+<details><summary>Команда предлагает систему из планировщика, программиста, тестировщика и ревьюера. Что ты ответишь?</summary><p>Это нарезка по ролям, а не по контексту: у ролей общий контекст фичи, и каждый переход его теряет. В эксперименте Anthropic такие сабагенты тратили на координацию больше токенов, чем на работу. Лучше агент на фичу, который пишет и код, и тесты, плюс проверяющий с явными критериями, который смотрит на результат как на чёрный ящик.</p></details>
+</section>
+
+<section id="checklist">
+<h2>Чеклист навыков</h2>
+<ul class="checklist">
+  <li>Могу на своей задаче показать, где агенты читают, а где пишут, и оставить писателя одного</li>
+  <li>Раскладываю любую схему из документации фреймворка по двум вопросам: кто выбирает следующий шаг и что видит следующий агент</li>
+  <li>Замерял одиночного агента на своём наборе задач, прежде чем проектировать мультиагентную систему</li>
+  <li>Для каждого из трёх случаев, когда второй агент окупается, знаю более дешёвую альтернативу и пробовал её</li>
+  <li>Писал handoff в OpenAI Agents SDK или LangChain с проверкой прав в <code>on_handoff</code> и явным владельцем разговора в состоянии</li>
+  <li>Выбираю между форком и свежим сабагентом в Claude Code и могу объяснить разницу в кеше и в изоляции</li>
+  <li>Пишу поручение сабагенту с целью, формой ответа, инструментами и границами и вижу по результатам, что сабагенты перестали дублировать друг друга</li>
+  <li>Писал оркестрацию кодом на <code>asyncio</code>: structured output для плана, <code>gather</code> по воркерам, проверяющий и остановка как данные — лимит раундов или счётчик застоя</li>
+  <li>Ставил в Claude Agent SDK лимиты глубины, параллельности и денег и видел, что приходит на каждом из них</li>
+  <li>Запускал dynamic workflow, читал его скрипт в <code>.claude/workflows/</code> и перезапускал прогон после остановки</li>
+  <li>Могу по следу проваленного прогона отнести отказ к категории и режиму MAST</li>
+  <li>Считаю стоимость прогона по каждому агенту: свежий вход, чтение и запись кеша, выход</li>
+  <li>Собирал дерево трассы мультиагентного прогона через спаны <code>invoke_agent</code> и <code>execute_tool</code> или через <code>parent_run_id</code> и <code>parent_thread_id</code></li>
+  <li>Могу по README, CHANGELOG и датам релизов на PyPI проверить, развивается ли мультиагентная библиотека, и назвать ей замену</li>
+</ul>
+</section>
+
+<section id="sources">
+<h2>Источники</h2>
+<ol class="sources">
+  <li id="src-1"><a href="https://cognition.com/blog/dont-build-multi-agents">Don't Build Multi-Agents</a>. Walden Yan, Cognition, 12 июня 2025.</li>
+  <li id="src-2"><a href="https://www.anthropic.com/engineering/multi-agent-research-system">How we built our multi-agent research system</a>. Jeremy Hadfield et al.; Anthropic Engineering, 13 июня 2025.</li>
+  <li id="src-3"><a href="https://claude.com/blog/building-multi-agent-systems-when-and-how-to-use-them">Building multi-agent systems: When and how to use them</a>. Anthropic, Claude blog, 23 января 2026.</li>
+  <li id="src-4"><a href="https://cognition.com/blog/multi-agents-working">Multi-Agents: What's Actually Working</a>. Walden Yan, Cognition, 22 апреля 2026.</li>
+  <li id="src-5">Wilson Lin, <a href="https://cursor.com/blog/scaling-agents">Scaling long-running autonomous coding</a> (14 января 2026) и <a href="https://cursor.com/blog/agent-swarm-model-economics">Agent swarms and the new model economics</a> (20 июля 2026). Блог Cursor.</li>
+  <li id="src-6"><a href="https://www.anthropic.com/engineering/building-c-compiler">Building a C compiler with a team of parallel Claudes</a>. Nicholas Carlini, Anthropic Engineering, 5 февраля 2026.</li>
+  <li id="src-7"><a href="https://news.ycombinator.com/item?id=45096962">Обсуждение «Don't Build Multi-Agents»</a>. Hacker News, 1 сентября 2025, 123 очка, 89 комментариев.</li>
+  <li id="src-8"><a href="https://www.anthropic.com/engineering/building-effective-agents">Building effective agents</a>. Erik Schluntz, Barry Zhang; Anthropic, 19 декабря 2024, с примечанием 2026 года об устаревших инструментах.</li>
+  <li id="src-9"><a href="https://claude.com/blog/multi-agent-coordination-patterns">Multi-agent coordination patterns</a>. Anthropic, Claude blog, 10 апреля 2026.</li>
+  <li id="src-10"><a href="https://learn.microsoft.com/en-us/agent-framework/workflows/orchestrations/">Workflow orchestrations in Agent Framework</a> и <a href="https://learn.microsoft.com/en-us/agent-framework/workflows/orchestrations/magentic">Magentic orchestration</a>. Microsoft Learn, страницы обновлены в августе и сентябре 2026; <a href="https://github.com/microsoft/autogen">README AutoGen</a> с уведомлением о режиме поддержки.</li>
+  <li id="src-11"><a href="https://docs.langchain.com/oss/python/langchain/multi-agent">Multi-agent</a> (Subagents, Handoffs, Skills, Router) и <a href="https://docs.langchain.com/oss/python/migrate/langgraph-supervisor">Migrate from langgraph-supervisor</a>. Документация LangChain, 2026; <a href="https://github.com/langchain-ai/langgraph-supervisor-py">README langgraph-supervisor-py</a>.</li>
+  <li id="src-12"><a href="https://docs.agno.com/teams/overview">Teams</a>, документация Agno, и <a href="https://github.com/agno-agi/agno/releases/tag/v3.0.0">релиз Agno v3.0.0</a>, 24 августа 2026.</li>
+  <li id="src-13"><a href="https://mastra.ai/docs/guides/multi-agent-systems">Multi-agent systems</a>. Документация Mastra, 2026.</li>
+  <li id="src-14"><a href="https://openai.github.io/openai-agents-python/multi_agent/">Orchestrating multiple agents</a> и <a href="https://openai.github.io/openai-agents-python/handoffs/">Handoffs</a>. Документация OpenAI Agents SDK; <a href="https://github.com/openai/swarm">README OpenAI Swarm</a>.</li>
+  <li id="src-15"><a href="https://code.claude.com/docs/en/workflows">Orchestrate subagents at scale with dynamic workflows</a>. Документация Claude Code, Anthropic, на 30 сентября 2026.</li>
+  <li id="src-16"><a href="https://arxiv.org/abs/2512.08296">Towards a Science of Scaling Agent Systems</a>. Yubin Kim, Ken Gu, …, Daniel McDuff, Xin Liu (Google Research, Google DeepMind, MIT); arXiv:2512.08296, v1 9 декабря 2025, v3 8 апреля 2026. Пересказ в <a href="https://research.google/blog/towards-a-science-of-scaling-agent-systems-when-and-why-agent-systems-work/">блоге Google Research</a>, 28 января 2026.</li>
+  <li id="src-17"><a href="https://arxiv.org/abs/2406.07155">Scaling Large Language Model-based Multi-Agent Collaboration</a>. Chen Qian et al.; arXiv:2406.07155, 11 июня 2024.</li>
+  <li id="src-18"><a href="https://code.claude.com/docs/en/sub-agents">Subagents</a> (документация Claude Code) и <a href="https://code.claude.com/docs/en/agent-sdk/subagents">Subagents in the SDK</a> (Claude Agent SDK). Anthropic, на 30 сентября 2026.</li>
+  <li id="src-19"><a href="https://arxiv.org/abs/2305.14325">Improving Factuality and Reasoning in Language Models through Multiagent Debate</a>. Du et al.; arXiv:2305.14325, 23 мая 2023.</li>
+  <li id="src-20"><a href="https://arxiv.org/abs/2508.17536">Debate or Vote: Which Yields Better Decisions in Multi-Agent Large Language Models?</a> Hyeong Kyu Choi, Xiaojin Zhu, Sharon Li; arXiv:2508.17536, 24 августа 2025.</li>
+  <li id="src-21"><a href="https://arxiv.org/abs/2502.08788">Stop Overvaluing Multi-Agent Debate — We Must Rethink Evaluation and Embrace Model Heterogeneity</a>. Hangfan Zhang et al.; arXiv:2502.08788, 12 февраля 2025.</li>
+  <li id="src-22"><a href="https://code.claude.com/docs/en/agent-teams">Orchestrate teams of Claude Code sessions</a>. Документация Claude Code, Anthropic, на 30 сентября 2026.</li>
+  <li id="src-23"><a href="https://claude.dev/blog/a-harness-for-every-task-dynamic-workflows-in-claude-code/">A harness for every task: dynamic workflows in Claude Code</a>. Thariq Shihipar, Sid Bidasaria; 2 июня 2026.</li>
+  <li id="src-24"><a href="https://arxiv.org/abs/2601.04748">When Single-Agent with Skills Replace Multi-Agent Systems and When They Fail</a>. Xiaoxiao Li; arXiv:2601.04748, 8 января 2026.</li>
+  <li id="src-25"><a href="https://arxiv.org/abs/2604.01608">From Multi-Agent to Single-Agent: When Is Skill Distillation Beneficial?</a> Binyan Xu et al.; arXiv:2604.01608, 2 апреля 2026, v5 19 августа 2026.</li>
+  <li id="src-26"><a href="https://arxiv.org/abs/2503.13657">Why Do Multi-Agent LLM Systems Fail?</a> Mert Cemri et al. (UC Berkeley, Intesa Sanpaolo); arXiv:2503.13657, v3 26 октября 2025, NeurIPS 2025 Datasets &amp; Benchmarks.</li>
+  <li id="src-27"><a href="https://arxiv.org/abs/2505.00212">Which Agent Causes Task Failures and When? On Automated Failure Attribution of LLM Multi-Agent Systems</a>. Shaokun Zhang, Ming Yin et al.; arXiv:2505.00212, 30 апреля 2025.</li>
+  <li id="src-28"><a href="https://www.anthropic.com/research/multiagent-systems">Patterns and problems in emerging multiagent systems</a>. Anthropic Frontier Red Team, автор для переписки Carolyn Zou; 13 августа 2026.</li>
+  <li id="src-29"><a href="https://news.ycombinator.com/item?id=49316271">Обсуждение «Patterns and problems in emerging multi-agent systems»</a>. Hacker News, 16 августа 2026, 200 очков, 138 комментариев.</li>
+  <li id="src-30"><a href="https://github.com/langchain-ai/langgraph/issues/6064">Sub Agent sends back to starting agent after handoff even if it is waiting on further responses…</a> Issue №6064, langchain-ai/langgraph, открыт 2 сентября 2025.</li>
+  <li id="src-31"><a href="https://github.com/openai/openai-agents-python/releases">Релизы openai-agents-python</a> v0.19.0–v0.22.3. OpenAI, июль–сентябрь 2026.</li>
+  <li id="src-32"><a href="https://pypi.org/">PyPI</a> и <a href="https://www.npmjs.com/package/@mastra/core">npm</a>: версии и даты релизов langgraph, langchain, openai-agents, google-adk, agent-framework, crewai, pydantic-ai, agno, claude-agent-sdk, langgraph-supervisor, langgraph-swarm, ag2, @mastra/core на 30 сентября 2026.</li>
+  <li id="src-33"><a href="https://adk.dev/2.0/">Welcome to ADK 2.0</a> и <a href="https://adk.dev/workflows/collaboration/">Build collaborative agent teams</a>. Документация Google ADK, 2026.</li>
+  <li id="src-34"><a href="https://platform.claude.com/docs/en/managed-agents/multiagent-orchestration">Multiagent orchestration</a>. Документация Claude Managed Agents, бета <code>managed-agents-2026-04-01</code>, Anthropic.</li>
+  <li id="src-35"><a href="https://github.com/pydantic/pydantic-ai/blob/main/docs/multi-agent-applications.md">Multi-agent Applications</a> и <a href="https://github.com/pydantic/pydantic-ai/blob/main/docs/durable_execution/overview.md">Durable Execution</a>. Документация Pydantic AI, 2026.</li>
+  <li id="src-36"><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool">Advisor tool</a>. Документация Claude Platform, бета <code>advisor-tool-2026-03-01</code>, Anthropic.</li>
+  <li id="src-37"><a href="https://github.com/a2aproject/A2A/blob/main/CHANGELOG.md">CHANGELOG протокола A2A</a> (v1.0.0 от 12 марта 2026) и <a href="https://aaif.io/blog/a2a-joins-aaif">A2A joins AAIF's open agentic stack</a>, Agentic AI Foundation, 17 августа 2026.</li>
+  <li id="src-38"><a href="https://unit42.paloaltonetworks.com/agent-session-smuggling-in-agent2agent-systems/">Agent Session Smuggling in Agent2Agent Systems</a>. Palo Alto Networks Unit 42, 31 октября 2025.</li>
+  <li id="src-39"><a href="https://appomni.com/ao-labs/ai-agent-to-agent-discovery-prompt-injection/">When AI Turns on Its Team: Exploiting Agent-to-Agent Discovery via Prompt Injection</a>. AppOmni AO Labs, 19 ноября 2025.</li>
+  <li id="src-40"><a href="https://arxiv.org/abs/2510.01285">LLM-Based Multi-Agent Blackboard System for Information Discovery in Data Science</a>. Alireza Salemi et al.; arXiv:2510.01285, 30 сентября 2025.</li>
+  <li id="src-41"><a href="https://arxiv.org/abs/2411.04468">Magentic-One: A Generalist Multi-Agent System for Solving Complex Tasks</a>. Adam Fourney et al. (Microsoft); arXiv:2411.04468, ноябрь 2024.</li>
+  <li id="src-42"><a href="https://docs.crewai.com/en/concepts/processes">Processes</a>. Документация CrewAI, 2026.</li>
+  <li id="src-43"><a href="https://habr.com/ru/companies/sberbank/articles/1083832/">Мы пытались оптимизировать граф агентов в LangGraph — и в итоге написали gMAS</a>. Виталий Белов (FrontierAI), блог Сбера на Хабре, 18 сентября 2026.</li>
+  <li id="src-44"><a href="https://docs.temporal.io/evaluate/use-cases-design-patterns">Use cases and design patterns</a> и <a href="https://docs.temporal.io/ai/cookbook/multi-agent-adk-python">Multi-Agent Orchestration — Google ADK + Temporal</a>. Документация Temporal, 2026.</li>
+  <li id="src-45"><a href="https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-agent-spans.md">Semantic Conventions for GenAI agent and framework spans</a>. OpenTelemetry, статус Development, репозиторий создан 5 мая 2026.</li>
+  <li id="src-46"><a href="https://claude.dev/blog/what-a-task-costs-on-opus-5-5/">What a task costs on Opus 5.5</a>. Anthropic, claude.dev, 25 сентября 2026.</li>
+</ol>
+</section>
+
+</main>
+</body>
+</html>
